@@ -8,9 +8,9 @@ on:
         type: boolean
         default: true
       llvm_version:
-        description: "LLVM/clang-cl 版本"
+        description: "LLVM/clang-cl 版本（MSVC 14.51 要求 ≥ 20）"
         type: string
-        default: "18.1.8"
+        default: "20.1.8"
       vulkan_sdk_version:
         description: "Vulkan SDK 版本（必须带 .0 后缀）"
         type: string
@@ -28,7 +28,7 @@ jobs:
 
     env:
       TOOLCHAIN_ROOT: ${{ github.workspace }}\toolchain
-      LLVM_VERSION: ${{ inputs.llvm_version || '18.1.8' }}
+      LLVM_VERSION: ${{ inputs.llvm_version || '20.1.8' }}
       VULKAN_SDK_VERSION: ${{ inputs.vulkan_sdk_version || '1.4.363.0' }}
       ASTC2BC7: ${{ inputs.astc2bc7 == false && 'OFF' || 'ON' }}
       RETENTION_DAYS: ${{ inputs.retention_days || 7 }}
@@ -51,10 +51,8 @@ jobs:
       - name: Install build prerequisites (winflexbison3 / ninja)
         shell: pwsh
         run: |
-          # gnuwin32 在 Chocolatey 已下架，改用 winflexbison3
           choco install winflexbison3 ninja -y --no-progress --limitoutput
 
-          # 确保 bison / flex 命令可用（winflexbison3 默认提供的是 win_bison / win_flex）
           $chocoBin = "C:\ProgramData\chocolatey\bin"
           if (Test-Path "$chocoBin\win_bison.exe") {
             Copy-Item "$chocoBin\win_bison.exe" "$chocoBin\bison.exe" -Force
@@ -63,7 +61,6 @@ jobs:
             Copy-Item "$chocoBin\win_flex.exe" "$chocoBin\flex.exe" -Force
           }
 
-          # 验证
           bison --version
           flex --version
           ninja --version
@@ -150,7 +147,9 @@ jobs:
                 -DNXRT_BUILD_TESTS=OFF `
                 @astcFlag `
                 -DCMAKE_C_COMPILER=clang-cl `
-                -DCMAKE_CXX_COMPILER=clang-cl
+                -DCMAKE_CXX_COMPILER=clang-cl `
+                -DCMAKE_C_FLAGS="-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" `
+                -DCMAKE_CXX_FLAGS="-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 
       - name: Build runtime
         shell: pwsh
