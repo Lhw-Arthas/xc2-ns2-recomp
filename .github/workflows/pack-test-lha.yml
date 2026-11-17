@@ -1,0 +1,125 @@
+name: Build & Package Self-Contained Toolchain Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      # 所有工具链都会放在 workspace 内的 toolchain/ 下，方便整体打包
+      TOOLCHAIN_ROOT: ${{ github.workspace }}\toolchain
+      # 仓库要求的特定版本
+      LLVM_VERSION: "18.1.8"
+      VULKAN_SDK_VERSION: "1.4.363"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # 如果 third_party/nxrecomp 用 Git LFS 存二进制，取消下行注释
+          # lfs: true
+
+      # ---------- 1. 准备 MSVC (Build Tools) ----------
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ---------- 2. 下载并解压 LLVM/clang-cl 到 toolchain/llvm ----------
+      - name: Download LLVM ${{ env.LLVM_VERSION }}
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-win64.exe"
+          $out = "$env:RUNNER_TEMP\llvm-installer.exe"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Start-Process -FilePath $out -ArgumentList "/S", "/D=$env:TOOLCHAIN_ROOT\llvm" -Wait
+          echo "$env:TOOLCHAIN_ROOT\llvm\bin" >> $env:GITHUB_PATH
+
+      # ---------- 3. 下载并解压 Vulkan SDK 到 toolchain/vulkan ----------
+      - name: Download Vulkan SDK ${{ env.VULKAN_SDK_VERSION }}
+        shell: pwsh
+        run: |
+          $url = "https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_SDK_VERSION }}/windows/VulkanSDK-${{ env.VULKAN_SDK_VERSION }}-Installer.exe"
+          $out = "$env:RUNNER_TEMP\vulkan-installer.exe"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Start-Process -FilePath $out -ArgumentList "/S", "/D=$env:TOOLCHAIN_ROOT\vulkan" -Wait
+          echo "$env:TOOLCHAIN_ROOT\vulkan\Bin" >> $env:GITHUB_PATH
+          echo "VULKAN_SDK=$env:TOOLCHAIN_ROOT\vulkan" >> $env:GITHUB_ENV
+
+      # ---------- 4. 安装 .NET 10 SDK ----------
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      # ---------- 5. 安装 Python 3.12 + lz4/capstone ----------
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install lz4 capstone==5.0.9
+
+      # ---------- 6. 配置并构建 runtime ----------
+      - name: Configure runtime
+        shell: pwsh
+        run: |
+          cmake -S third_party/fefw-recomp/runtime `
+                -B third_party/fefw-recomp/build/runtime-gfx `
+                -G Ninja `
+                -DCMAKE_BUILD_TYPE=Release `
+                -DNXRT_BUILD_GFX=ON `
+                -DNXRT_BUILD_GAMES=OFF `
+                -DNXRT_BUILD_TESTS=OFF `
+                -DCMAKE_C_COMPILER=clang-cl `
+                -DCMAKE_CXX_COMPILER=clang-cl
+
+      - name: Build runtime
+        shell: pwsh
+        run: |
+          cmake --build third_party/fefw-recomp/build/runtime-gfx --target nxrt nxrt_gfx
+
+      # ---------- 7. 组装自包含包 ----------
+      - name: Assemble self-contained package
+        shell: pwsh
+        run: |
+          $stage = "$env:RUNNER_TEMP\xc2-package"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # 1) 复制工具链
+          Copy-Item -Recurse -Path "$env:TOOLCHAIN_ROOT\*" -Destination "$stage\toolchain"
+
+          # 2) 复制仓库源码与构建产物（third_party 内已含 nxrecomp）
+          Copy-Item -Recurse -Path "third_party" -Destination "$stage\src"
+          Copy-Item -Recurse -Path "docs" -Destination "$stage\src"
+          Copy-Item -Recurse -Path "xc2" -Destination "$stage\src"
+          Copy-Item -Path "*.md" -Destination "$stage\src"
+          Copy-Item -Recurse -Path "third_party\fefw-recomp\build\runtime-gfx" -Destination "$stage\src\build"
+
+          # 3) 生成环境激活脚本
+          @"
+          `$env:PATH = "$stage\toolchain\llvm\bin;$stage\toolchain\vulkan\Bin;`$env:PATH"
+          `$env:VULKAN_SDK = "$stage\toolchain\vulkan"
+          `$env:XC2_ENV = "$stage\src\toolchain\env.ps1"
+          Write-Host "Toolchain activated. LLVM: `$(clang-cl --version | Select-Object -First 1)"
+          "@ | Out-File -FilePath "$stage\activate.ps1" -Encoding utf8
+
+          # 4) 打包为 zip
+          Compress-Archive -Path "$stage\*" -DestinationPath "$env:RUNNER_TEMP\xc2-ns2-recomp-selfcontained.zip" -Force
+
+      # ---------- 8. 上传产物 ----------
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xc2-ns2-recomp-selfcontained
+          path: ${{ runner.temp }}\xc2-ns2-recomp-selfcontained.zip
+          retention-days: 7
