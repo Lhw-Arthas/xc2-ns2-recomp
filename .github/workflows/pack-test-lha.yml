@@ -1,4 +1,4 @@
-name: Build & Package Self-Contained Toolchain Test
+name: Build & Package Self-Contained Toolchain
 
 on:
   workflow_dispatch:
@@ -14,7 +14,8 @@ jobs:
       TOOLCHAIN_ROOT: ${{ github.workspace }}\toolchain
       # 仓库要求的特定版本
       LLVM_VERSION: "18.1.8"
-      VULKAN_SDK_VERSION: "1.4.363"
+      # 注意：Vulkan SDK 版本号需要带 .0 后缀（如 1.4.363.0）
+      VULKAN_SDK_VERSION: "1.4.363.0"
 
     steps:
       - name: Checkout repository
@@ -37,6 +38,7 @@ jobs:
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-win64.exe"
           $out = "$env:RUNNER_TEMP\llvm-installer.exe"
           Invoke-WebRequest -Uri $url -OutFile $out
+          # LLVM 官方 Windows 安装包支持 /S /D=... 静默解压
           Start-Process -FilePath $out -ArgumentList "/S", "/D=$env:TOOLCHAIN_ROOT\llvm" -Wait
           echo "$env:TOOLCHAIN_ROOT\llvm\bin" >> $env:GITHUB_PATH
 
@@ -44,10 +46,14 @@ jobs:
       - name: Download Vulkan SDK ${{ env.VULKAN_SDK_VERSION }}
         shell: pwsh
         run: |
-          $url = "https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_SDK_VERSION }}/windows/VulkanSDK-${{ env.VULKAN_SDK_VERSION }}-Installer.exe"
+          $ver = "${{ env.VULKAN_SDK_VERSION }}"
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
           $out = "$env:RUNNER_TEMP\vulkan-installer.exe"
           Invoke-WebRequest -Uri $url -OutFile $out
-          Start-Process -FilePath $out -ArgumentList "/S", "/D=$env:TOOLCHAIN_ROOT\vulkan" -Wait
+          # Vulkan SDK 使用 Qt Installer Framework 参数进行静默安装
+          Start-Process -FilePath $out -ArgumentList `
+            "--accept-licenses", "--default-answer", "--confirm-command", "install", `
+            "--root", "$env:TOOLCHAIN_ROOT\vulkan" -Wait
           echo "$env:TOOLCHAIN_ROOT\vulkan\Bin" >> $env:GITHUB_PATH
           echo "VULKAN_SDK=$env:TOOLCHAIN_ROOT\vulkan" >> $env:GITHUB_ENV
 
