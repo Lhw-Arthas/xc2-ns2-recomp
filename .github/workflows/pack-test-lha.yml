@@ -27,9 +27,7 @@ jobs:
     runs-on: windows-latest
 
     env:
-      # 所有工具链都会放在 workspace 内的 toolchain/ 下，方便整体打包
       TOOLCHAIN_ROOT: ${{ github.workspace }}\toolchain
-      # 手动触发时使用 inputs，push 触发时回退到默认值
       LLVM_VERSION: ${{ inputs.llvm_version || '18.1.8' }}
       VULKAN_SDK_VERSION: ${{ inputs.vulkan_sdk_version || '1.4.363.0' }}
       ASTC2BC7: ${{ inputs.astc2bc7 == false && 'OFF' || 'ON' }}
@@ -49,21 +47,26 @@ jobs:
         with:
           arch: x64
 
-      # ---------- 2. 安装构建前置工具（bison/flex/ninja，缺失时安装） ----------
-      - name: Install build prerequisites (GnuWin32 / Ninja) if missing
+      # ---------- 2. 安装构建前置工具（winflexbison3 + ninja） ----------
+      - name: Install build prerequisites (winflexbison3 / ninja)
         shell: pwsh
         run: |
-          $missing = @()
-          if (-not (Get-Command bison -ErrorAction SilentlyContinue)) { $missing += "gnuwin32" }
-          if (-not (Get-Command flex  -ErrorAction SilentlyContinue)) { $missing += "gnuwin32" }
-          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { $missing += "ninja" }
-          $missing = $missing | Select-Object -Unique
-          if ($missing.Count -gt 0) {
-            Write-Host "Installing: $($missing -join ', ')"
-            choco install $missing -y --no-progress
-          } else {
-            Write-Host "bison / flex / ninja 均已存在"
+          # gnuwin32 在 Chocolatey 已下架，改用 winflexbison3
+          choco install winflexbison3 ninja -y --no-progress --limitoutput
+
+          # 确保 bison / flex 命令可用（winflexbison3 默认提供的是 win_bison / win_flex）
+          $chocoBin = "C:\ProgramData\chocolatey\bin"
+          if (Test-Path "$chocoBin\win_bison.exe") {
+            Copy-Item "$chocoBin\win_bison.exe" "$chocoBin\bison.exe" -Force
           }
+          if (Test-Path "$chocoBin\win_flex.exe") {
+            Copy-Item "$chocoBin\win_flex.exe" "$chocoBin\flex.exe" -Force
+          }
+
+          # 验证
+          bison --version
+          flex --version
+          ninja --version
 
       # ---------- 3. 下载并解压 LLVM/clang-cl 到 toolchain/llvm ----------
       - name: Download LLVM ${{ env.LLVM_VERSION }}
@@ -72,7 +75,6 @@ jobs:
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-win64.exe"
           $out = "$env:RUNNER_TEMP\llvm-installer.exe"
           Invoke-WebRequest -Uri $url -OutFile $out
-          # LLVM 官方 Windows 安装包支持 /S /D=... 静默解压
           Start-Process -FilePath $out -ArgumentList "/S", "/D=$env:TOOLCHAIN_ROOT\llvm" -Wait
           echo "$env:TOOLCHAIN_ROOT\llvm\bin" >> $env:GITHUB_PATH
 
@@ -84,7 +86,6 @@ jobs:
           $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
           $out = "$env:RUNNER_TEMP\vulkan-installer.exe"
           Invoke-WebRequest -Uri $url -OutFile $out
-          # Vulkan SDK 使用 Qt Installer Framework 参数进行静默安装
           Start-Process -FilePath $out -ArgumentList `
             "--accept-licenses", "--default-answer", "--confirm-command", "install", `
             "--root", "$env:TOOLCHAIN_ROOT\vulkan" -Wait
@@ -119,14 +120,12 @@ jobs:
           if (-not (Test-Path $script)) {
             throw "未找到 $script，请检查仓库目录结构是否完整"
           }
-          # 脚本通常以仓库根为工作目录，若其内部使用相对路径请在 $repo 下执行
           Push-Location $repo
           try {
             & "tools\textures\scripts\fetch_third_party.ps1"
           } finally {
             Pop-Location
           }
-          # 打印产物目录，便于排查
           $outDir = Join-Path $repo "tools\textures\build\release"
           if (Test-Path $outDir) {
             Write-Host "ASTC transcoder 输出目录内容："
@@ -165,17 +164,13 @@ jobs:
           $stage = "$env:RUNNER_TEMP\xc2-package"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          # 1) 复制工具链
           Copy-Item -Recurse -Path "$env:TOOLCHAIN_ROOT\*" -Destination "$stage\toolchain"
-
-          # 2) 复制仓库源码与构建产物（third_party 内已含 nxrecomp）
           Copy-Item -Recurse -Path "third_party" -Destination "$stage\src"
           Copy-Item -Recurse -Path "docs" -Destination "$stage\src"
           Copy-Item -Recurse -Path "xc2" -Destination "$stage\src"
           Copy-Item -Path "*.md" -Destination "$stage\src"
           Copy-Item -Recurse -Path "third_party\fefw-recomp\build\runtime-gfx" -Destination "$stage\src\build"
 
-          # 3) 生成环境激活脚本
           @"
           `$env:PATH = "$stage\toolchain\llvm\bin;$stage\toolchain\vulkan\Bin;`$env:PATH"
           `$env:VULKAN_SDK = "$stage\toolchain\vulkan"
@@ -183,7 +178,6 @@ jobs:
           Write-Host "Toolchain activated. LLVM: `$(clang-cl --version | Select-Object -First 1)"
           "@ | Out-File -FilePath "$stage\activate.ps1" -Encoding utf8
 
-          # 4) 打包为 zip
           Compress-Archive -Path "$stage\*" -DestinationPath "$env:RUNNER_TEMP\xc2-ns2-recomp-selfcontained.zip" -Force
 
       # ---------- 10. 上传产物 ----------
