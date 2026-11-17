@@ -40,18 +40,15 @@ jobs:
           submodules: recursive
           # lfs: true
 
-      # ---------- 1. 准备 MSVC (Build Tools) ----------
       - name: Setup MSVC Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ---------- 2. 安装构建前置工具 ----------
       - name: Install build prerequisites (winflexbison3 / ninja)
         shell: pwsh
         run: |
           choco install winflexbison3 ninja -y --no-progress --limitoutput
-
           $chocoBin = "C:\ProgramData\chocolatey\bin"
           if (Test-Path "$chocoBin\win_bison.exe") {
             Copy-Item "$chocoBin\win_bison.exe" "$chocoBin\bison.exe" -Force
@@ -59,12 +56,10 @@ jobs:
           if (Test-Path "$chocoBin\win_flex.exe") {
             Copy-Item "$chocoBin\win_flex.exe" "$chocoBin\flex.exe" -Force
           }
-
           bison --version
           flex --version
           ninja --version
 
-      # ---------- 3. 下载并解压 LLVM/clang-cl ----------
       - name: Download LLVM ${{ env.LLVM_VERSION }}
         shell: pwsh
         run: |
@@ -74,7 +69,6 @@ jobs:
           Start-Process -FilePath $out -ArgumentList "/S", "/D=$env:TOOLCHAIN_ROOT\llvm" -Wait
           echo "$env:TOOLCHAIN_ROOT\llvm\bin" >> $env:GITHUB_PATH
 
-      # ---------- 4. 下载并解压 Vulkan SDK ----------
       - name: Download Vulkan SDK ${{ env.VULKAN_SDK_VERSION }}
         shell: pwsh
         run: |
@@ -88,13 +82,11 @@ jobs:
           echo "$env:TOOLCHAIN_ROOT\vulkan\Bin" >> $env:GITHUB_PATH
           echo "VULKAN_SDK=$env:TOOLCHAIN_ROOT\vulkan" >> $env:GITHUB_ENV
 
-      # ---------- 5. 安装 .NET 10 SDK ----------
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
 
-      # ---------- 6. 安装 Python 3.12 + lz4/capstone ----------
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -106,7 +98,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install lz4 capstone==5.0.9
 
-      # ---------- 7. 获取并构建 ASTC 转码器 ----------
       - name: Fetch and build ASTC transcoder (ISPC)
         if: ${{ env.ASTC2BC7 == 'ON' }}
         shell: pwsh
@@ -130,7 +121,6 @@ jobs:
             Write-Warning "未找到 $outDir，CMake 可能仍会报 no ASTC transcoder"
           }
 
-      # ---------- 8. 配置并构建 runtime ----------
       - name: Configure runtime
         shell: pwsh
         run: |
@@ -155,19 +145,27 @@ jobs:
         run: |
           cmake --build third_party/fefw-recomp/build/runtime-gfx --target nxrt nxrt_gfx
 
-      # ---------- 9. 组装自包含包 ----------
       - name: Assemble self-contained package
         shell: pwsh
         run: |
           $stage = "$env:RUNNER_TEMP\xc2-package"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Force -Path "$stage\toolchain" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage\src" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage\src\build" | Out-Null
+
+          if (-not (Test-Path $env:TOOLCHAIN_ROOT)) {
+            throw "TOOLCHAIN_ROOT 不存在: $env:TOOLCHAIN_ROOT"
+          }
 
           Copy-Item -Recurse -Path "$env:TOOLCHAIN_ROOT\*" -Destination "$stage\toolchain"
+
           Copy-Item -Recurse -Path "third_party" -Destination "$stage\src"
-          Copy-Item -Recurse -Path "docs" -Destination "$stage\src"
-          Copy-Item -Recurse -Path "xc2" -Destination "$stage\src"
-          Copy-Item -Path "*.md" -Destination "$stage\src"
-          Copy-Item -Recurse -Path "third_party\fefw-recomp\build\runtime-gfx" -Destination "$stage\src\build"
+          Copy-Item -Recurse -Path "docs"      -Destination "$stage\src"
+          Copy-Item -Recurse -Path "xc2"       -Destination "$stage\src"
+          Copy-Item -Path "*.md"               -Destination "$stage\src"
+
+          Copy-Item -Recurse -Path "third_party\fefw-recomp\build\runtime-gfx\*" -Destination "$stage\src\build"
 
           @"
           `$env:PATH = "$stage\toolchain\llvm\bin;$stage\toolchain\vulkan\Bin;`$env:PATH"
@@ -178,7 +176,6 @@ jobs:
 
           Compress-Archive -Path "$stage\*" -DestinationPath "$env:RUNNER_TEMP\xc2-ns2-recomp-selfcontained.zip" -Force
 
-      # ---------- 10. 上传产物 ----------
       - name: Upload zip artifact
         uses: actions/upload-artifact@v4
         with:
