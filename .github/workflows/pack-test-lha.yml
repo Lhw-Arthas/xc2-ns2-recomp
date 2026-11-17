@@ -2,6 +2,23 @@ name: Build & Package Self-Contained Toolchain
 
 on:
   workflow_dispatch:
+    inputs:
+      astc2bc7:
+        description: "构建 ASTC→BC7 转码器（取消勾选则传 -DNXRT_ASTC2BC7=OFF 跳过）"
+        type: boolean
+        default: true
+      llvm_version:
+        description: "LLVM/clang-cl 版本"
+        type: string
+        default: "18.1.8"
+      vulkan_sdk_version:
+        description: "Vulkan SDK 版本（必须带 .0 后缀）"
+        type: string
+        default: "1.4.363.0"
+      retention_days:
+        description: "Artifact 保留天数"
+        type: number
+        default: 7
   push:
     branches: [main]
 
@@ -12,10 +29,11 @@ jobs:
     env:
       # 所有工具链都会放在 workspace 内的 toolchain/ 下，方便整体打包
       TOOLCHAIN_ROOT: ${{ github.workspace }}\toolchain
-      # 仓库要求的特定版本
-      LLVM_VERSION: "18.1.8"
-      # 注意：Vulkan SDK 版本号需要带 .0 后缀（如 1.4.363.0）
-      VULKAN_SDK_VERSION: "1.4.363.0"
+      # 手动触发时使用 inputs，push 触发时回退到默认值
+      LLVM_VERSION: ${{ inputs.llvm_version || '18.1.8' }}
+      VULKAN_SDK_VERSION: ${{ inputs.vulkan_sdk_version || '1.4.363.0' }}
+      ASTC2BC7: ${{ inputs.astc2bc7 == false && 'OFF' || 'ON' }}
+      RETENTION_DAYS: ${{ inputs.retention_days || 7 }}
 
     steps:
       - name: Checkout repository
@@ -31,7 +49,23 @@ jobs:
         with:
           arch: x64
 
-      # ---------- 2. 下载并解压 LLVM/clang-cl 到 toolchain/llvm ----------
+      # ---------- 2. 安装构建前置工具（bison/flex/ninja，缺失时安装） ----------
+      - name: Install build prerequisites (GnuWin32 / Ninja) if missing
+        shell: pwsh
+        run: |
+          $missing = @()
+          if (-not (Get-Command bison -ErrorAction SilentlyContinue)) { $missing += "gnuwin32" }
+          if (-not (Get-Command flex  -ErrorAction SilentlyContinue)) { $missing += "gnuwin32" }
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { $missing += "ninja" }
+          $missing = $missing | Select-Object -Unique
+          if ($missing.Count -gt 0) {
+            Write-Host "Installing: $($missing -join ', ')"
+            choco install $missing -y --no-progress
+          } else {
+            Write-Host "bison / flex / ninja 均已存在"
+          }
+
+      # ---------- 3. 下载并解压 LLVM/clang-cl 到 toolchain/llvm ----------
       - name: Download LLVM ${{ env.LLVM_VERSION }}
         shell: pwsh
         run: |
@@ -42,7 +76,7 @@ jobs:
           Start-Process -FilePath $out -ArgumentList "/S", "/D=$env:TOOLCHAIN_ROOT\llvm" -Wait
           echo "$env:TOOLCHAIN_ROOT\llvm\bin" >> $env:GITHUB_PATH
 
-      # ---------- 3. 下载并解压 Vulkan SDK 到 toolchain/vulkan ----------
+      # ---------- 4. 下载并解压 Vulkan SDK 到 toolchain/vulkan ----------
       - name: Download Vulkan SDK ${{ env.VULKAN_SDK_VERSION }}
         shell: pwsh
         run: |
@@ -57,13 +91,13 @@ jobs:
           echo "$env:TOOLCHAIN_ROOT\vulkan\Bin" >> $env:GITHUB_PATH
           echo "VULKAN_SDK=$env:TOOLCHAIN_ROOT\vulkan" >> $env:GITHUB_ENV
 
-      # ---------- 4. 安装 .NET 10 SDK ----------
+      # ---------- 5. 安装 .NET 10 SDK ----------
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
 
-      # ---------- 5. 安装 Python 3.12 + lz4/capstone ----------
+      # ---------- 6. 安装 Python 3.12 + lz4/capstone ----------
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -75,10 +109,39 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install lz4 capstone==5.0.9
 
-      # ---------- 6. 配置并构建 runtime ----------
+      # ---------- 7. 获取并构建 ASTC 转码器（ISPC） ----------
+      - name: Fetch and build ASTC transcoder (ISPC)
+        if: ${{ env.ASTC2BC7 == 'ON' }}
+        shell: pwsh
+        run: |
+          $repo   = "third_party\fefw-recomp"
+          $script = Join-Path $repo "tools\textures\scripts\fetch_third_party.ps1"
+          if (-not (Test-Path $script)) {
+            throw "未找到 $script，请检查仓库目录结构是否完整"
+          }
+          # 脚本通常以仓库根为工作目录，若其内部使用相对路径请在 $repo 下执行
+          Push-Location $repo
+          try {
+            & "tools\textures\scripts\fetch_third_party.ps1"
+          } finally {
+            Pop-Location
+          }
+          # 打印产物目录，便于排查
+          $outDir = Join-Path $repo "tools\textures\build\release"
+          if (Test-Path $outDir) {
+            Write-Host "ASTC transcoder 输出目录内容："
+            Get-ChildItem -Recurse -File $outDir | Select-Object -First 20 | ForEach-Object { Write-Host $_.FullName }
+          } else {
+            Write-Warning "未找到 $outDir，CMake 可能仍会报 no ASTC transcoder"
+          }
+
+      # ---------- 8. 配置并构建 runtime ----------
       - name: Configure runtime
         shell: pwsh
         run: |
+          $astcFlag = @()
+          if ("${{ env.ASTC2BC7 }}" -eq "OFF") { $astcFlag += "-DNXRT_ASTC2BC7=OFF" }
+
           cmake -S third_party/fefw-recomp/runtime `
                 -B third_party/fefw-recomp/build/runtime-gfx `
                 -G Ninja `
@@ -86,6 +149,7 @@ jobs:
                 -DNXRT_BUILD_GFX=ON `
                 -DNXRT_BUILD_GAMES=OFF `
                 -DNXRT_BUILD_TESTS=OFF `
+                @astcFlag `
                 -DCMAKE_C_COMPILER=clang-cl `
                 -DCMAKE_CXX_COMPILER=clang-cl
 
@@ -94,7 +158,7 @@ jobs:
         run: |
           cmake --build third_party/fefw-recomp/build/runtime-gfx --target nxrt nxrt_gfx
 
-      # ---------- 7. 组装自包含包 ----------
+      # ---------- 9. 组装自包含包 ----------
       - name: Assemble self-contained package
         shell: pwsh
         run: |
@@ -122,10 +186,10 @@ jobs:
           # 4) 打包为 zip
           Compress-Archive -Path "$stage\*" -DestinationPath "$env:RUNNER_TEMP\xc2-ns2-recomp-selfcontained.zip" -Force
 
-      # ---------- 8. 上传产物 ----------
+      # ---------- 10. 上传产物 ----------
       - name: Upload zip artifact
         uses: actions/upload-artifact@v4
         with:
           name: xc2-ns2-recomp-selfcontained
           path: ${{ runner.temp }}\xc2-ns2-recomp-selfcontained.zip
-          retention-days: 7
+          retention-days: ${{ env.RETENTION_DAYS }}
