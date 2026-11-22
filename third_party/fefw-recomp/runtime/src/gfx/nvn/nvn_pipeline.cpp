@@ -895,6 +895,8 @@ VkPipeline build_graphics_pipeline(const GraphicsKey& key, const ProgLayout& lay
     ri.stencilAttachmentFormat = static_cast<VkFormat>(key.stencil_format);
 
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri};
+    if (device().features().attachment_feedback_loop_layout)
+        gi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     gi.stageCount = ns;
     gi.pStages = stages;
     gi.pVertexInputState = &vi;

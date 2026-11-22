@@ -634,7 +634,11 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
     };
     add(VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     add(VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    if (!g->depth && !is_block_format(chosen)) add(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (!g->depth && !is_block_format(chosen)) {
+        add(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        if (device().features().attachment_feedback_loop_layout)
+            add(VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+    }
     if (g->depth) add(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     // The console reads and writes any colour texture through an image handle; the builder's IMAGE flag is a hint the game does not always
     // set (the froxel volume of the fog is written by a vertex shader without it). Every uncompressed colour image therefore keeps the
@@ -2167,6 +2171,11 @@ VkFormat tex_attachment_format(Texture* t, VkFormat view_format, bool keep_forma
 bool tex_has_storage(Texture* t) {
     TexGpu* g = tex_or_null(t);
     return g && (g->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+}
+
+bool tex_has_feedback_loop(Texture* t) {
+    TexGpu* g = tex_or_null(t);
+    return g && (g->usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) != 0;
 }
 
 VkFormat tex_storage_format(Texture* t, VkFormat requested) {

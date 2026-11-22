@@ -283,6 +283,8 @@ VkImageView tex_attachment_view(Texture* t, uint32_t level, uint32_t layer, uint
 VkFormat tex_attachment_format(Texture* t, VkFormat view_format, bool keep_format = false);
 // The image can be bound as a storage image (created with NVN_TEXTURE_FLAGS_IMAGE).
 bool tex_has_storage(Texture* t);
+// The image was created with VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT (can be sampled in-place while bound as a colour attachment).
+bool tex_has_feedback_loop(Texture* t);
 VkFormat tex_storage_format(Texture* t, VkFormat requested);   // the view format a storage binding uses: the UNORM partner of an sRGB image
 // The layout a texture is sampled in: SHADER_READ_ONLY_OPTIMAL, or DEPTH_STENCIL_READ_ONLY_OPTIMAL for depth and stencil formats (so
 // the same layout serves a depth texture that is also the read-only depth attachment of the pass).
