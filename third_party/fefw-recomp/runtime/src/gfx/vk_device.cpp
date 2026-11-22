@@ -715,6 +715,9 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     const bool x_ll2 = x_pid && has_dext(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     if (x_ll2) dev_exts.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     const bool x_aal = !headless && add_ext(VK_AMD_ANTI_LAG_EXTENSION_NAME, &aal);
+    VkPhysicalDeviceShaderEarlyAndLateFragmentTestsFeaturesAMD aeal = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_FEATURES_AMD};
+    const bool x_eal = add_ext(VK_AMD_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_EXTENSION_NAME, &aeal);
     // VK_EXT_device_fault: when the GPU drops the device, the driver can say what it was executing and at which address,
     // instead of only the -4 the submit returned (nvn_gpu.cpp device_fault_text). The feature struct goes into the
     // availability chain with the others, so nothing is enabled that the physical device does not report (issue 10).
@@ -780,6 +783,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.descriptor_indexing = a12.descriptorIndexing && a12.shaderSampledImageArrayNonUniformIndexing;
     features_.host_query_reset = a12.hostQueryReset;
     features_.fragment_shader_interlock = x_fsi && afsi.fragmentShaderPixelInterlock;
+    features_.early_and_late_fragment_tests_amd = x_eal && aeal.shaderEarlyAndLateFragmentTests;
     features_.depth_clip_control = x_dcc && adcc.depthClipControl;
     features_.depth_clip_enable = x_dce && adce.depthClipEnable;
     features_.custom_border_color = x_cbc && acbc.customBorderColors && acbc.customBorderColorWithoutFormat;

@@ -22,6 +22,7 @@
 #include <tuple>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <intrin.h>
 
 #include "nxrt/config.h"
@@ -1377,6 +1378,7 @@ struct FbClone {
 };
 std::unordered_map<Texture*, FbClone> g_fb_clone;          // attachment -> its copy (same shape, no storage in game memory)
 std::unordered_map<Texture*, Texture*> g_fb_use;           // attachment -> the copy the current draw samples
+std::unordered_set<Texture*> g_fb_valid;                   // attachments whose FbClone snapshot is reusable across consecutive barrier-free feedback draws
 bool g_fb_seen = false;                                    // the last check found a feedback binding: check every draw until it goes away
 // [nvn] fb_memo (round 45): the scan below is the replay's largest remaining cost (~2.2 us/draw, 31% of setup) because the engine
 // rebinds the program between draws, which sets kDesc and therefore runs the scan again for the same layout and the same bindings.
@@ -1410,8 +1412,10 @@ Texture* feedback_clone(Texture* t) {
     Ref<Texture>& c = fe.tex;
     g_fb_clone_n.store(static_cast<int64_t>(g_fb_clone.size()), std::memory_order_relaxed);
     if (c && (c->b.width != t->b.width || c->b.height != t->b.height || c->b.depth != t->b.depth || c->fmt != t->fmt || c->levels != t->levels || c->layers != t->layers ||
-              (c->gpu && tex_scale(c.get()) != tex_scale(t))))
+              (c->gpu && tex_scale(c.get()) != tex_scale(t)))) {
         c = Ref<Texture>();                                 // the game made another texture at this address
+        g_fb_valid.erase(t);
+    }
     if (!c) {
         Texture* n = new Texture();
         n->b = t->b;
@@ -1480,6 +1484,15 @@ void feedback_prepare(const ProgLayout& pl) {
         any = true;
         Texture* c = feedback_clone(r.tex);
         if (!c) continue;
+        // [nvn] fb_reuse (default 1): consecutive self-sampling draws (e.g. 96 ground decals sampling G-buffer t286/t288)
+        // in the same render-target set without an intervening barrier, clear, copy, dispatch or non-feedback write reuse
+        // the snapshot taken before the first draw — matching console texture-cache semantics and avoiding ~96 full-screen
+        // 1440p copies and 5-MRT pass breaks per frame (~30 ms GPU saved in Uraya).
+        static const bool fb_reuse = nxrt::config_get_bool("nvn", "fb_reuse", true);
+        if (fb_reuse && g_fb_valid.count(r.tex)) {
+            g_fb_use[r.tex] = c;
+            continue;
+        }
         end_pass();
         tex_ensure_current(r.tex, *F);                                    // storage the game wrote since the image was made reaches the copy too
         tex_transition(r.tex, *F, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);   // the next pass moves it back to the attachment layout and loads it
@@ -1496,6 +1509,7 @@ void feedback_prepare(const ProgLayout& pl) {
         vkCmdCopyImage(F->cb, tex_image(r.tex), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tex_image(c), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(regions.size()), regions.data());
         tex_mark_gpu_written(c);
         tex_transition(c, *F, tex_sampled_layout(c));
+        g_fb_valid.insert(r.tex);
         g_fb_use[r.tex] = c;
         {   // one line per fragment shader that samples its own colour attachment (HANDOVER 51: which draws the copy covers)
             static std::set<std::string> told;
@@ -3598,6 +3612,12 @@ void earlyz_mask_plan(const ProgLayout& pl) {
                     S.stage[kFragment]->hash.c_str());
         return;
     }
+    if (early_fragment_tests_patched(S.stage[kFragment]->hash)) {
+        if (first_time_key("earlyz_mask hw " + S.stage[kFragment]->hash))
+            NXLOG_I(kTag, "earlyz_mask: fs %s uses hardware early fragment tests — skipping per-draw mask rebuild",
+                    S.stage[kFragment]->hash.c_str());
+        return;
+    }
     g_earlyz_mask_tex = Ref<Texture>::share(img);
     g_earlyz_mask_ready = true;
     if (first_time_key("earlyz_mask " + S.stage[kFragment]->hash))
@@ -3640,13 +3660,27 @@ void earlyz_mask_rebuild() {
     }
     vkUpdateDescriptorSets(vkdev(), 2, w, 0, nullptr);
     const VkExtent3D e = tex_image_extent(list, 0);
+    if (first_time_key("earlyz_mask extent"))
+        NXLOG_I(kTag, "earlyz_mask: rebuild dispatch extent %ux%u", e.width, e.height);
     vkCmdBindPipeline(F->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ezm.pipe);
     vkCmdBindDescriptorSets(F->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ezm.layout, 0, 1, &ds, 0, nullptr);
     const uint32_t ext[2] = {e.width, e.height};
     vkCmdPushConstants(F->cb, g_ezm.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof ext, ext);
     vkCmdDispatch(F->cb, (e.width + 7) / 8, (e.height + 7) / 8, 1);
     tex_mark_gpu_written(mask);
-    memory_barrier(F->cb);                          // visible to the next draw's imageLoad
+    // Narrow barrier: only make the compute shader's writes to `mask` visible to the next fragment draw's storage image reads/writes
+    // (instead of an ALL_COMMANDS -> ALL_COMMANDS global GPU stall).
+    {
+        VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1;
+        di.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(F->cb, &di);
+    }
     ++g_earlyz_mask_draws;
     static uint64_t logged = 0;
     if (g_earlyz_mask_draws - logged >= 2000) {
@@ -4007,6 +4041,12 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
         fg_hudless_capture(*F, S.color_tex[0].get());
     }
     if (g_fb_seen || (g_dirty & (kDesc | kPipe))) feedback_prepare(*pl);
+    if (!g_fb_valid.empty()) {
+        for (uint32_t i = 0; i < S.ncolor; ++i) {
+            Texture* t = S.color_tex[i].get();
+            if (t && !g_fb_use.count(t)) g_fb_valid.erase(t);
+        }
+    }
     rs_mark(kRsFb);
     if (!ensure_pass(g_want_depth_ro, g_prog_writes, g_depth_general, g_color_general)) {
         // which draw, and what its targets are (the first of each vertex/fragment shader pair)
@@ -5996,6 +6036,16 @@ void run_list(const CmdList& list, int depth) {
             case Op::SetCoverageModulationTable: case Op::SetConservativeRaster: break;
             case Op::SetRenderTargets: {
                 const auto& p = r.payload<P_RenderTargets>();
+                bool color_changed = (S.ncolor != p.count);
+                for (uint32_t i = 0; !color_changed && i < p.count && i < 8; ++i) {
+                    const TextureViewInfo& v = p.color[i].view;
+                    const bool hv = p.color[i].has_view != 0;
+                    const uint32_t lv = hv && v.has_levels ? static_cast<uint32_t>(v.min_level) : 0;
+                    const uint32_t la = hv && v.has_layers ? static_cast<uint32_t>(v.min_layer) : 0;
+                    if (S.color_tex[i].get() != p.color[i].tex || S.color_level[i] != lv || S.color_layer[i] != la)
+                        color_changed = true;
+                }
+                if (color_changed) g_fb_valid.clear();
                 S.ncolor = p.count;
                 for (uint32_t i = 0; i < 8; ++i) {
                     S.color_tex[i] = i < p.count ? Ref<Texture>::share(p.color[i].tex) : Ref<Texture>();
@@ -6028,9 +6078,9 @@ void run_list(const CmdList& list, int depth) {
                 if (g_dbg_depth > 0 && vkCmdEndDebugUtilsLabelEXT) { vkCmdEndDebugUtilsLabelEXT(F->cb); --g_dbg_depth; }   // a pop whose push was in an earlier submission has nothing to close
                 break;
             case Op::DrawTexture: note_unsupported("DrawTexture"); break;
-            case Op::ClearColor: do_clear_color(r.payload<P_ClearColor>()); break;
+            case Op::ClearColor: g_fb_valid.clear(); do_clear_color(r.payload<P_ClearColor>()); break;
             case Op::ClearDepthStencil: do_clear_depth_stencil(r.payload<P_ClearDepthStencil>()); break;
-            case Op::ClearTexture: do_clear_texture(r.payload<P_ClearTexture>()); break;
+            case Op::ClearTexture: g_fb_valid.clear(); do_clear_texture(r.payload<P_ClearTexture>()); break;
             case Op::ClearBuffer: {
                 const auto& p = r.payload<P_ClearBuffer>();
                 end_pass();
@@ -6063,10 +6113,10 @@ void run_list(const CmdList& list, int depth) {
                 gstamp("copy buffer");
                 break;
             }
-            case Op::CopyBufferToTexture: do_copy_buffer_texture(r.payload<P_CopyBufTex>(), true); break;
+            case Op::CopyBufferToTexture: g_fb_valid.clear(); do_copy_buffer_texture(r.payload<P_CopyBufTex>(), true); break;
             case Op::CopyTextureToBuffer: do_copy_buffer_texture(r.payload<P_CopyBufTex>(), false); break;
-            case Op::CopyTextureToTexture: do_copy_texture_texture(r.payload<P_CopyTexTex>()); break;
-            case Op::Downsample: do_downsample(r.payload<P_Downsample>()); break;
+            case Op::CopyTextureToTexture: g_fb_valid.clear(); do_copy_texture_texture(r.payload<P_CopyTexTex>()); break;
+            case Op::Downsample: g_fb_valid.clear(); do_downsample(r.payload<P_Downsample>()); break;
             case Op::UpdateUniformBuffer: {
                 const auto& p = r.payload<P_UpdateUniformBuffer>();
                 const uint8_t* data = r.blob<P_UpdateUniformBuffer>();
@@ -6096,8 +6146,8 @@ void run_list(const CmdList& list, int depth) {
                 g_dirty |= kDesc;
                 break;
             }
-            case Op::Dispatch: { RsScope rs(kRsDispatch); ++g_rs.dispatches; const auto& p = r.payload<P_Dispatch>(); do_dispatch(p.x, p.y, p.z, 0); break; }
-            case Op::DispatchIndirect: { RsScope rs(kRsDispatch); ++g_rs.dispatches; do_dispatch(0, 0, 0, r.payload<P_DispatchIndirect>().address); break; }
+            case Op::Dispatch: { RsScope rs(kRsDispatch); ++g_rs.dispatches; g_fb_valid.clear(); const auto& p = r.payload<P_Dispatch>(); do_dispatch(p.x, p.y, p.z, 0); break; }
+            case Op::DispatchIndirect: { RsScope rs(kRsDispatch); ++g_rs.dispatches; g_fb_valid.clear(); do_dispatch(0, 0, 0, r.payload<P_DispatchIndirect>().address); break; }
             case Op::ReportCounter: {
                 const auto& p = r.payload<P_Counter>();
                 struct { uint64_t counter, timestamp; } rep = {1, timestamp_ns()};   // counters other than the ones handled below are reported as non-zero
@@ -6173,6 +6223,7 @@ void run_list(const CmdList& list, int depth) {
             case Op::Barrier: {
                 const auto& pb = r.payload<P_Barrier>();
                 TRACE("barrier bits %x", pb.bits);
+                g_fb_valid.clear();
                 if (!barrier_keeps_pass()) end_pass();
                 memory_barrier(F->cb);
                 break;
@@ -6431,6 +6482,7 @@ void replay_begin_submit(Frame& f) {
     g_depth_general = false;
     g_color_general = 0;
     g_fb_use.clear();
+    g_fb_valid.clear();
     g_fb_seen = false;
     g_key_dummy_binding = 0;
     for (UploadAlloc& u : g_push_buf) u = UploadAlloc();   // the upload memory of the last submission
@@ -6561,6 +6613,7 @@ void trace_dump_targets() {
 constexpr uint64_t kFbIdleSubmits = 600;
 void fb_sweep(uint64_t serial) {
     g_fb_use.clear();       // raw pointers into the copies: none is in use between two submissions
+    g_fb_valid.clear();
     for (auto it = g_fb_clone.begin(); it != g_fb_clone.end();) {
         if (serial > it->second.last + kFbIdleSubmits) it = g_fb_clone.erase(it);
         else ++it;
@@ -6607,6 +6660,7 @@ void replay_abort_submit() {
     for (int k = 0; k < 2; ++k) g_cw[k].active = -1;
     g_dbg_depth = 0;
     g_fb_use.clear();
+    g_fb_valid.clear();
     F = nullptr;
 }
 
@@ -6647,6 +6701,7 @@ void replay_shutdown() {
     g_shadows.clear();
     g_set_cache.clear();
     g_fb_use.clear();
+    g_fb_valid.clear();
     g_fb_clone.clear();
     g_vol3d_use.clear();
     g_vol3d.clear();

@@ -244,6 +244,11 @@ struct G {
     bool was_in_game = false;
     float mouse_x = 0, mouse_y = 0;
     bool mouse1 = false;
+    uint64_t last_mouse_activity_ns = 0;
+    float last_cursor_x = -1.f, last_cursor_y = -1.f;
+    bool have_cursor_pos = false;
+    bool was_cursor_autohide_eligible = false;
+    bool cursor_auto_hidden = false;
     uint32_t jc2_buttons = 0;            // host mouse buttons as nn::hid::MouseButton bits, for the Joy-Con 2 mouse (hid jc2_mouse.h)
     float jc2_wheel_x = 0, jc2_wheel_y = 0;   // wheel notches since the last feed
     uint64_t last_status_ns = 0;
@@ -606,10 +611,61 @@ bool jc2_owns_clicks() {
     return device_only && st.engine && ctx_in_play(st.engine->context()) && hid::jc2_mouse_active();
 }
 
+constexpr uint64_t kCursorIdleHideNs = 3000ull * kMs;
+
+void note_mouse_activity(uint64_t now) {
+    G& st = g();
+    st.last_mouse_activity_ns = now;
+    if (st.cursor_auto_hidden && st.window && !platform::relative_mouse()) {
+        st.cursor_auto_hidden = false;
+        platform::set_cursor_visible(true);
+    }
+}
+
+bool should_autohide_fullscreen_cursor(uint64_t now, bool overlay_blocks) {
+    G& st = g();
+    if (!st.window || platform::relative_mouse()) {
+        st.was_cursor_autohide_eligible = false;
+        st.cursor_auto_hidden = false;
+        return false;
+    }
+    const bool full = platform::fullscreen_mode() != platform::FullscreenMode::Windowed;
+    const bool eligible = full && platform::focused() && !platform::minimized() && !overlay_blocks;
+    if (!eligible) {
+        st.was_cursor_autohide_eligible = false;
+        st.cursor_auto_hidden = false;
+        return false;
+    }
+    if (!st.was_cursor_autohide_eligible || st.last_mouse_activity_ns == 0) {
+        st.was_cursor_autohide_eligible = true;
+        st.last_mouse_activity_ns = now;
+        st.cursor_auto_hidden = false;
+        return false;
+    }
+    const bool hide = (now >= st.last_mouse_activity_ns) && (now - st.last_mouse_activity_ns >= kCursorIdleHideNs);
+    st.cursor_auto_hidden = hide;
+    return hide;
+}
+
 void handle_event(const input::Event& e, uint64_t now) {
     G& st = g();
     using input::EventType;
     st.events++;
+    if (e.type == EventType::MouseMotion && !(e.flags & input::kFlagRelative)) {
+        const float mx = e.u.motion.x;
+        const float my = e.u.motion.y;
+        if (!st.have_cursor_pos) {
+            st.last_cursor_x = mx;
+            st.last_cursor_y = my;
+            st.have_cursor_pos = true;
+        } else if (std::fabs(mx - st.last_cursor_x) >= 1.f || std::fabs(my - st.last_cursor_y) >= 1.f) {
+            st.last_cursor_x = mx;
+            st.last_cursor_y = my;
+            note_mouse_activity(now);
+        }
+    } else if (e.type == EventType::MouseButtonDown || e.type == EventType::MouseButtonUp || e.type == EventType::MouseWheel) {
+        note_mouse_activity(now);
+    }
     // rebinding capture comes first: the page asked for the next input
     if (st.capture_state.load() == 1) {
         InputId id;
@@ -1007,8 +1063,9 @@ int update_hook(::Ctx*, uint64_t, void*) {
         if (st.overlay && st.pointer_draw) st.overlay->set_pointer(menu_up && ptr.enabled() && ptr.cursor_visible(menu_up), ptr.x(), ptr.y(), true);
         // In play with the Joy-Con 2 mouse on its surface the game draws its own cursor: the OS cursor is hidden (unless the overlay is up).
         const bool game_cursor = playing && !overlay_visible && hid::jc2_mouse_active();
+        const bool auto_hide = should_autohide_fullscreen_cursor(now, overlay_visible);
         if (st.window && !platform::relative_mouse())
-            platform::set_cursor_visible(!game_cursor && (overlay_visible || !(ptr.enabled() && menu_up) || ptr.cursor_visible(menu_up)));
+            platform::set_cursor_visible(!auto_hide && !game_cursor && (overlay_visible || !(ptr.enabled() && menu_up) || ptr.cursor_visible(menu_up)));
         if (st.window) {   // the Joy-Con 2 mouse (hid): the pointer on the picture, the buttons and the wheel
             hid::HostMouse hm;
             bool inside = false;
@@ -1077,6 +1134,10 @@ void keyboard_service() {
         const size_t got = input::queue_drain(buf, 64);
         if (!got) break;
         for (size_t i = 0; i < got; ++i) handle_event(buf[i], now);
+    }
+    if (st.window && !platform::relative_mouse()) {
+        const bool overlay_blocks = swkbd || (st.overlay && st.overlay->blocks_game());
+        platform::set_cursor_visible(!should_autohide_fullscreen_cursor(now, overlay_blocks));
     }
     if (swkbd) {
         poll_pads(now);

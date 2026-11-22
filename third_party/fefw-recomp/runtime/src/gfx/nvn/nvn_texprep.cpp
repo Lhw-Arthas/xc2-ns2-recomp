@@ -194,6 +194,7 @@ void debounce_locked(Texture* t) {
 
 void worker_main() {
     log_set_thread_name("nvn-texprep");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     State& s = S();
     std::unique_lock<std::mutex> lk(s.mu);
     for (;;) {

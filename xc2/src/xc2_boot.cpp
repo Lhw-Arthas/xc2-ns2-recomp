@@ -14,6 +14,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include "nxrt/dispatch.h"
 #include "nxrt/fiber.h"
 #include "nxrt/frame_limiter.h"
+#include "nxrt/gauge.h"
 #include "nxrt/hooks.h"
 #include "nxrt/input.h"
 #include "nxrt/input_source.h"
@@ -705,6 +707,13 @@ static void arm_frame_rate(uint64_t main_base) {
     }
     float old = 0.0f;
     std::memcpy(&old, reinterpret_cast<const void*>(period_addr), 4);
+    // 0xf65a44 is the 3.0.0 rodata address of 1/60 (0x3C888889); on 3.0.1 it falls inside .bss (0.0f) and the game already
+    // runs natively at 60 fps (present interval 1). Skip patching and the fps_follow thread when the slot does not hold 1/60.
+    if (std::fabs(old - (1.0f / 60.0f)) > 1e-4f) {
+        NXLOG_I("xc2", "frame rate: main+0xf65a44 holds %.6f (expected 1/60); skipping 3.0.0 vsync-period patch",
+                static_cast<double>(old));
+        return;
+    }
     // [xc2] fps_interval (default 2): the game's "vsyncs per frame". 2 with period 1/(2 fps) is the shipping arrangement;
     // 1 makes the period 1/fps itself, as the NS1 patch page does (frame_rate.c interval_store), which also changes what
     // the code that counts vsyncs (present requests, lip sync) sees.
@@ -740,24 +749,40 @@ static void arm_frame_rate(uint64_t main_base) {
         }).detach();
     }
     // [xc2] fps_follow (default on): the step follows the *measured* display interval, never below the target - the game's own limiter waits
-    // interval x period x 0.997, so a frame that misses the target shows up in the limiter's mean and raises the step: the game keeps real
+    // interval x period x 0.997, so a frame that misses the target shows up in the recent average and raises the step: the game keeps real
     // time instead of running slow (NS1's xc2_rate_store does the same with a 5-frame average, at most 1/15 s).
+    // Uses lock-free frame_times_recent (last 8 frames, ignoring loading stalls > 250 ms) instead of FrameLimiter::stats() (which locked and
+    // sorted an 8192-frame ring 250 times/s), and only re-applies RW protection when the loader actually restored RO on that page.
     if (!nxrt::config_get_bool("xc2", "fps_follow", true) || !g_frame_limiter) return;
     const double target = 1.0 / static_cast<double>(fps);
     std::thread([period_addr, target, nvsync] {
-        double last = 0.0;
+        float last = static_cast<float>(target / static_cast<double>(nvsync));
         for (;;) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(4));
-            const nxrt::FrameLimiter::Stats st = g_frame_limiter->stats();
-            if (st.frames < 2 || st.mean_ms <= 0.0) continue;
-            double step = (std::max)(target, st.mean_ms / 1000.0);   // a late frame raises the step; a faster one does not lower it below the target
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            float recent[8];
+            const size_t n = nxrt::frame_times_recent(recent, 8);
+            if (n < 2) continue;
+            double sum = 0.0;
+            size_t cnt = 0;
+            for (size_t i = 0; i < n; ++i) {
+                if (recent[i] > 0.0f && recent[i] < 250.0f) {
+                    sum += static_cast<double>(recent[i]);
+                    ++cnt;
+                }
+            }
+            if (cnt == 0) continue;
+            double step = (std::max)(target, (sum / static_cast<double>(cnt)) / 1000.0);
             step = (std::min)(step, 1.0 / 15.0);
             const float p = static_cast<float>(step / static_cast<double>(nvsync));
-            if (p != last) {
-                last = p;
-                nxrt::mem::protect(period_addr, 4, nxrt::mem::Prot::RW);   // the loader restores the image's own protection after boot
-                std::memcpy(reinterpret_cast<void*>(period_addr), &p, 4);
+            if (std::fabs(p - last) <= 1e-5f) continue;
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<const void*>(period_addr), &mbi, sizeof mbi) != sizeof mbi || mbi.State != MEM_COMMIT) continue;
+            const DWORD prot = mbi.Protect & 0xFF;
+            if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE) {
+                if (!nxrt::mem::protect(period_addr, 4, nxrt::mem::Prot::RW)) continue;
             }
+            std::memcpy(reinterpret_cast<void*>(period_addr), &p, 4);
+            last = p;
         }
     }).detach();
 }
@@ -2020,10 +2045,48 @@ int main(int argc, char **argv) {
         wd.height = win_h;
         NXLOG_I("boot", "window %dx%d (%s)", win_w, win_h, play_disp.window_mode.c_str());
         if (!nxrt::platform::create_window(wd)) die("cannot create the window");
-        // Paint the window background black immediately and enter fullscreen before creating the first swapchain,
-        // preventing the unpainted white 1440p client-rect flash during the ~5 s guest boot.
+        // Paint the window background black immediately and apply a custom local .ico (if present) for the
+        // taskbar, Alt+Tab switcher and title bar before entering fullscreen and creating the swapchain.
         if (HWND hwnd = static_cast<HWND>(nxrt::platform::native_hwnd())) {
             ::SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, reinterpret_cast<LONG_PTR>(::GetStockObject(BLACK_BRUSH)));
+            const int big_cx = ::GetSystemMetrics(SM_CXICON);
+            const int big_cy = ::GetSystemMetrics(SM_CYICON);
+            const int sm_cx = ::GetSystemMetrics(SM_CXSMICON);
+            const int sm_cy = ::GetSystemMetrics(SM_CYSMICON);
+            HINSTANCE hInst = ::GetModuleHandleW(nullptr);
+            HICON hBig = static_cast<HICON>(::LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, big_cx, big_cy, LR_DEFAULTCOLOR));
+            HICON hSm = static_cast<HICON>(::LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, sm_cx, sm_cy, LR_DEFAULTCOLOR));
+            std::string icon_src = (hBig || hSm) ? "embedded PE resource #1" : "";
+            if (!hBig && !hSm) {
+                static const char* kIconNames[] = {"xc2_icon.ico", "mythra_ns2_301.ico", "mythra_icon.ico"};
+                char exe_path[MAX_PATH] = {};
+                std::string exe_dir;
+                if (::GetModuleFileNameA(nullptr, exe_path, MAX_PATH) > 0) {
+                    exe_dir = exe_path;
+                    const size_t sl = exe_dir.find_last_of("\\/");
+                    if (sl != std::string::npos) exe_dir.resize(sl + 1);
+                    else exe_dir.clear();
+                }
+                for (const char* nm : kIconNames) {
+                    if (file_exists(nm)) { icon_src = nm; break; }
+                    if (!exe_dir.empty() && file_exists(exe_dir + nm)) { icon_src = exe_dir + nm; break; }
+                }
+                if (!icon_src.empty()) {
+                    hBig = static_cast<HICON>(::LoadImageA(nullptr, icon_src.c_str(), IMAGE_ICON, big_cx, big_cy, LR_LOADFROMFILE));
+                    hSm = static_cast<HICON>(::LoadImageA(nullptr, icon_src.c_str(), IMAGE_ICON, sm_cx, sm_cy, LR_LOADFROMFILE));
+                }
+            }
+            if (hBig) {
+                ::SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hBig));
+                ::SetClassLongPtrW(hwnd, GCLP_HICON, reinterpret_cast<LONG_PTR>(hBig));
+            }
+            if (hSm) {
+                ::SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hSm));
+                ::SetClassLongPtrW(hwnd, GCLP_HICONSM, reinterpret_cast<LONG_PTR>(hSm));
+            }
+            if (!icon_src.empty()) {
+                NXLOG_I("boot", "window icon loaded from %s", icon_src.c_str());
+            }
             if (HDC hdc = ::GetDC(hwnd)) {
                 RECT rc{};
                 ::GetClientRect(hwnd, &rc);

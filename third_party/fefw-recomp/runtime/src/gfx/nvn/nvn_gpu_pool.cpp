@@ -1456,6 +1456,33 @@ bool note_gpu_write(uint64_t gpu_address, uint64_t size, int use) {
     g_wr_pages[use % 6] += static_cast<int64_t>(last - first + 1);
     // word by word (page by page this was ~3.5 % of the render thread: draws note their storage buffers, MiBs each; notes/rt.md)
     const bool stale = mem::ww::any_valid(m.ww, first, last - first + 1);
+    if (stale && !mirror_capture_on()) {
+        // Pages repeatedly invalidated by GPU writes (e.g. per-frame skinning / dynamic storage outputs) cool off via the same
+        // hot-page hold as CPU-written rings, instead of re-arming, barrier-flushing and copying hundreds of KiB every frame forever.
+        const uint32_t now = presents_now();
+        for (uint64_t p = first; p <= last;) {
+            const uint64_t block = std::min<uint64_t>(64, last + 1 - p);
+            if (!mem::ww::any_valid(m.ww, p, block)) { p += block; continue; }
+            for (uint64_t q = p; q < p + block; ++q) {
+                if (!page_valid(m, q)) continue;
+                const size_t i = static_cast<size_t>(q);
+                if (m.copied_at[i] == 0) continue;
+                const bool soon = hot_used_on() && now - m.copied_at[i] <= kHotWindow;
+                if (bit_get(m.used, q) && !soon) {
+                    m.score[i] = 0;
+                    m.backoff[i] = 0;
+                    continue;
+                }
+                if (++m.score[i] >= kHotHits) {
+                    if (m.hot_until[i] <= now) g_st_hot.fetch_add(1, std::memory_order_relaxed);
+                    m.hot_until[i] = now + (kHotHold << m.backoff[i]);
+                    if (m.backoff[i] < kHotMaxShift) ++m.backoff[i];
+                    m.score[i] = 0;
+                }
+            }
+            p += block;
+        }
+    }
     mem::ww::invalidate(m.ww, first, last - first + 1);
     {
         const uint64_t ser = current_serial();

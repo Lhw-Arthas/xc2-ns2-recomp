@@ -113,6 +113,9 @@ void gpass_stamp(Frame& f, const char* label, uint32_t arg = 0);
 // ---- barriers ---------------------------------------------------------------------------------------------------------------
 void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to, VkImageAspectFlags aspect,
                    uint32_t base_level, uint32_t level_count, uint32_t base_layer, uint32_t layer_count);
+// True when [nvn] early_fragment_tests patched this fragment shader with hardware EarlyFragmentTests / EarlyAndLateFragmentTestsAMD.
+bool early_fragment_tests_patched(const std::string& fs_hash);
+
 // All commands before, all commands after, all memory (used after passes, dispatches, copies and fills).
 void memory_barrier(VkCommandBuffer cb);
 // [nvn] pass_barriers = tracked (S38): image_barrier derives its stage and access masks from the two layouts instead of all commands and
