@@ -1,0 +1,162 @@
+name: Build dist package
+
+on:
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install lz4 capstone
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26
+
+      - name: Setup Rust (for Tauri)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Install ISPC
+        uses: ispc/install-ispc-action@main
+        with:
+          version: 1.32.0
+          platform: windows
+          
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.363.1
+          cache: true
+
+      - name: Setup CMake and Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: Install LLVM
+        shell: pwsh
+        run: |
+          $version = "23.1.5"
+          $installer = "$env:RUNNER_TEMP\LLVM-$version-win64.msi"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.msi"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$installer`" /qn /norestart" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "MSI installation failed with exit code $($proc.ExitCode)"
+          }
+          $llvmRoot = "C:\Program Files\LLVM"
+          $llvmBin = "$llvmRoot\bin"
+          "LLVM_PATH=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$llvmBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$llvmBin\clang-cl.exe" --version
+          
+      - name: Unpack nxrecomp (release asset)
+        working-directory: ./third_party
+        shell: pwsh
+        run: |
+          $tar = "nxrecomp-e7a5a54-xc2.tar.gz"
+          $url = "https://github.com/weile10000/xc2-ns2-recomp/releases/download/v0.1.0/nxrecomp-e7a5a54-xc2.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile $tar
+          tar -xzf $tar -C .
+          if (-not (Test-Path "./nxrecomp")) {
+            throw "third_party/nxrecomp not found after extraction."
+          }
+          Write-Host "nxrecomp unpacked successfully."
+
+      - name: Setup Ryujinx shader translator
+        shell: pwsh
+        run: |
+          & ".\third_party\fefw-recomp\tools\shaders\scripts\setup_ryujinx.ps1"
+          dotnet build ".\third_party\fefw-recomp\tools\shaders\harness\SpirvHarness.csproj" -c Release
+
+      - name: Setup vcpkg (libvpx)
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat
+          C:\vcpkg\vcpkg install libvpx:x64-windows-static
+          echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
+
+      - name: Download and Setup FFmpeg (BtbN shared build)
+        shell: pwsh
+        run: |
+          $ffmpegDir = "C:\ffmpeg-shared"
+          $zipPath = "C:\ffmpeg.zip"
+          $downloadUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $ffmpegDir -Force
+          $actualRoot = Get-ChildItem $ffmpegDir -Directory | Select-Object -First 1
+          $ffmpegRoot = $actualRoot.FullName
+          if (-not (Test-Path (Join-Path $ffmpegRoot "lib\avcodec.lib"))) {
+            throw "avcodec.lib not found at $ffmpegRoot"
+          }
+          echo "NXRT_FFMPEG_DIR=$ffmpegRoot" >> $env:GITHUB_ENV
+
+      - name: Fetch ASTC transcoder
+        shell: pwsh
+        run: |
+          & ".\third_party\fefw-recomp\tools\textures\scripts\fetch_third_party.ps1"
+          Write-Host "ASTC third-party sources fetched."
+
+      - name: Install frontend dependencies
+        working-directory: ./launcher
+        run: npm install
+
+      - name: Build launcher (Tauri)
+        working-directory: ./launcher
+        run: npm run tauri build -- --no-bundle
+
+      - name: Build runtime DLL
+        shell: pwsh
+        run: |
+          $zigPath = (Get-Command zig).Source
+          Write-Host "Using Zig: $zigPath"
+          zig version
+
+          & "./tools/build/build-release.ps1" `
+            -Zig $zigPath `
+            -VcpkgRoot $env:VCPKG_ROOT `
+            -SkipExe
+
+      - name: Run make-package.ps1
+        shell: pwsh
+        run: |
+          $outDir = Join-Path $env:RUNNER_TEMP "XC2-package"
+          $zigExe = (Get-Command zig).Source
+          $zigDir = Split-Path -Path $zigExe -Parent
+          $params = @{ Out = $outDir; Zig = $zigDir }
+          & "./tools/build/make-package.ps1" @params
+          echo "PACKAGE_OUT=$outDir" >> $env:GITHUB_ENV
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XC2-package-dist-${{ github.sha }}
+          path: ${{ env.PACKAGE_OUT }}
+          if-no-files-found: error
+          retention-days: 14
