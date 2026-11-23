@@ -14,10 +14,10 @@ struct MirrorCap {
 
 constexpr uint64_t kMirrorCapMax = 8192ull << 20;      // the default cap on a large card
 constexpr uint64_t kMirrorMinVram = 4ull << 30;        // below this much video memory there are no copies by default
-// [nvn] mirror_capture = auto: the capture needs a whole-pool copy of every pool it serves (XC2 NS2: ~2.6 GiB, mesh pools of 500-640
-// MiB); a pool without one is read live, and with the guest a frame ahead that is the flicker the capture exists to remove. Below this
-// budget auto leaves the capture off. 3.5 GiB: a 16 GB card reports a ~15.6 GiB heap (budget ~3.9 GiB), a 12 GB card ~2.9 GiB.
-constexpr uint64_t kCaptureMinBudget = 3584ull << 20;
+// [nvn] mirror_capture = auto: the capture needs a whole-pool copy of every pool it serves (XC2 NS2: mesh pools of 500-640 MiB);
+// pools past the copy budget stay in host memory (and OOM allocations fall back cleanly). Lowered from 3584 to 1536 MiB so 8 GB
+// discrete cards (~1989 MiB budget) enable capture by default while 4 GB cards (1024 MiB) and integrated GPUs (0 MiB) stay off.
+constexpr uint64_t kCaptureMinBudget = 1536ull << 20;
 
 // vram_bytes: the largest device-local heap (0 when unknown). explicit_mb >= 0: [nvn] pool_mirror_mb was set in the ini or the
 // environment, and that value wins; -1: not set, the cap follows the card: min(kMirrorCapMax, a quarter of the heap), none below 4 GiB.

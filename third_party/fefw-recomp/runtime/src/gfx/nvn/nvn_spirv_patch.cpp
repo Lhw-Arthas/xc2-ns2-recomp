@@ -1194,7 +1194,8 @@ namespace nxrt::nvn::be::gpu {
 // the tests run before the fragment shader, which is the console's order.
 bool spirv_add_early_fragment_tests(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, bool amd) {
     enum : uint32_t {
-        OpExtensionOp = 10, OpEntryPointOp = 15, OpExecutionModeOp = 16, OpCapabilityOp = 17, OpDecorateOp = 71, OpImageWriteOp = 99,
+        OpExtensionOp = 10, OpEntryPointOp = 15, OpExecutionModeOp = 16, OpCapabilityOp = 17, OpDecorateOp = 71,
+        OpImageTexelPointerOp = 60, OpImageWriteOp = 99,
         ModelFragment = 4, ExecutionModeEarlyFragmentTests = 9, ExecutionModeDepthReplacing = 10, DecorationBuiltIn = 11, BuiltInFragDepth = 22,
         ExecutionModeEarlyAndLateFragmentTestsAMD = 5017,
     };
@@ -1215,7 +1216,7 @@ bool spirv_add_early_fragment_tests(const std::vector<uint32_t>& in, std::vector
             if (s == "SPV_AMD_shader_early_and_late_fragment_tests") has_amd_ext = true;
         }
         if (op == OpEntryPointOp && in[i + 1] == ModelFragment) { fragment = true; main_id = in[i + 2]; entry_at = i; }
-        if (op == OpImageWriteOp) image_write = true;
+        if (op == OpImageWriteOp || op == OpImageTexelPointerOp) image_write = true;
         if (op == OpExecutionModeOp && main_id && in[i + 1] == main_id &&
             (in[i + 2] == ExecutionModeEarlyFragmentTests || in[i + 2] == ExecutionModeEarlyAndLateFragmentTestsAMD || in[i + 2] == ExecutionModeDepthReplacing))
             already = true;

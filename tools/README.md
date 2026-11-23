@@ -30,7 +30,6 @@ All scripts resolve their paths relative to themselves (`os.path.dirname(__file_
 | file | what |
 |---|---|
 | `spv_rename.py` | renames the UBO instance names a glslang round-trip produces back to `fp_c3`/`fp_c4`/`support_buffer`; NVN binds by name, so a shader installed without this does nothing |
-| `install_shaders.ps1` | the early manual installer; `tools\build\patch-shaders.ps1` supersedes it |
 | `patch_ds_samplers.py` | retypes the depth-stencil samplers the console leaves implicit (see `PATCHES.md`) |
 | `cache\` | the archive scan and the cache builder: `ard_index.py`, `extract_embedded.py`, `build_cache.py`, `pack.py`; `cache/README.md` has the numbers |
 

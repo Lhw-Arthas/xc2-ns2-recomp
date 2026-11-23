@@ -73,6 +73,17 @@ struct DlssLiveInfo {
 };
 DlssLiveInfo dlss_live_info();
 
+// Live device VRAM & pool-copy/capture allocation info (nvn_gpu_pool.cpp) for F1 status UI and periodic logging.
+struct VramLiveInfo {
+    uint64_t vram_used_mb = 0;
+    uint64_t vram_total_mb = 0;
+    uint64_t pool_copy_mb = 0;
+    uint64_t pool_cap_mb = 0;
+    bool capture_on = false;
+    bool budget_live = false;
+};
+VramLiveInfo vram_live_info();
+
 // The size and NVNmemoryPoolFlags of the initialized memory pool behind a guest NVNmemoryPool object. False when `guest_pool` is not a live
 // pool of the back end. For game modules that look after a game's own pool allocators: a texture the game places past the end of a pool the
 // CPU cannot access (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) gets GPU memory of its own instead of failing (nvnTextureInitialize).

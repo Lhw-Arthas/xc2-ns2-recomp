@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "nxrt/config.h"
+#include "nxrt/render_quality.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/gfx_tuning.h"
 #include "nxrt/gauge.h"
@@ -210,7 +211,27 @@ VkFormat sint_alias(VkFormat f) {
         default: return VK_FORMAT_UNDEFINED;
     }
 }
-bool bit_alias_class(VkFormat f) { return float_alias(f) != VK_FORMAT_UNDEFINED || uint_alias(f) != VK_FORMAT_UNDEFINED; }
+// Same-width UNORM partner for integer colour formats under [nvn] view_reinterpret: Vulkan guarantees all formats with the same block
+// size and component layout belong to one compatibility class when VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT is set.
+VkFormat unorm_alias(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: return VK_FORMAT_R8_UNORM;
+        case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: return VK_FORMAT_R8G8_UNORM;
+        case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: return VK_FORMAT_R16_UNORM;
+        case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: return VK_FORMAT_R16G16_UNORM;
+        case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT: return VK_FORMAT_R16G16B16A16_UNORM;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+bool view_reinterpret_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "view_reinterpret", false);
+    return on;
+}
+bool bit_alias_class(VkFormat f) {
+    return float_alias(f) != VK_FORMAT_UNDEFINED || uint_alias(f) != VK_FORMAT_UNDEFINED ||
+           (view_reinterpret_on() && unorm_alias(f) != VK_FORMAT_UNDEFINED);
+}
 
 // The integer formats a float-declared shader is allowed to sample under [nvn] int_tex_as_float: the 8 and 16-bit masks the
 // game uses (32-bit ones already have a float alias above).
@@ -229,6 +250,7 @@ bool format_view_ok(const TexGpu& g, VkFormat fmt) {
     if (fmt == g.format) return true;
     if (!g.mutable_fmt) return false;
     if (srgb_partner(g.format) == fmt) return true;
+    if (view_reinterpret_on() && unorm_alias(g.format) == fmt) return true;
     return bit_alias_class(g.format) && (fmt == float_alias(g.format) || fmt == uint_alias(g.format) || fmt == sint_alias(g.format));
 }
 
@@ -634,7 +656,11 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
     };
     add(VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     add(VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    if (!g->depth && !is_block_format(chosen)) add(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (!g->depth && !is_block_format(chosen)) {
+        add(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        if (device().features().attachment_feedback_loop_layout)
+            add(VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+    }
     if (g->depth) add(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     // The console reads and writes any colour texture through an image handle; the builder's IMAGE flag is a hint the game does not always
     // set (the froxel volume of the fog is written by a vertex shader without it). Every uncompressed colour image therefore keeps the
@@ -710,12 +736,40 @@ TexGpu* tex_or_null(Texture* t, float want_scale = 1.0f) {
 // The resolution scale: the game's play settings ([display] render_scale, turned into a factor by the game module and handed over in
 // gfx::tuning) or, for tests, [gfx] render_scale (a number, NXRT_GFX_RENDER_SCALE), which wins. Fixed once known: images keep their size.
 // Stays 1 (not fixed) until one of them is there.
+// [upscale] render_quality, when set, decides both scales from [am] resolution's height.
+struct QualityScales { bool set = false; float scene = 1.0f, out = 1.0f; const char* key = ""; int out_h = 0; };
+const QualityScales& quality_scales() {
+    static const QualityScales q = [] {
+        QualityScales r;
+        const std::string key = nxrt::config_get_str("upscale", "render_quality", "");
+        const nxrt::RenderQualityMode* m = nxrt::render_quality_mode(key.c_str());
+        if (!m) return r;
+        r.set = true;
+        r.key = m->key;
+        const std::string am = nxrt::config_get_str("am", "resolution", "");
+        const size_t x = am.find_first_of("xX");
+        const int h = x == std::string::npos ? 0 : std::atoi(am.c_str() + x + 1);
+        r.out_h = h >= 720 && h <= 4320 ? h : 1080;
+        double scene = 1.0, out = 1.0;
+        if (nxrt::render_quality_scales(*m, r.out_h, &scene, &out)) {
+            r.scene = static_cast<float>(scene);
+            r.out = static_cast<float>(out);
+        }
+        NXLOG_I(kTag, "render quality %s at a %dp output: scene scale %.3f, output scale %.3f ([upscale] render_quality)", r.key, r.out_h,
+                static_cast<double>(r.scene), static_cast<double>(r.out));
+        return r;
+    }();
+    return q;
+}
+
 float g_render_scale = 0.0f;
 float render_scale_now() {
     if (g_render_scale > 0.0f) return g_render_scale;
     static const std::string v = nxrt::config_get_str("gfx", "render_scale", "");   // once: every draw asks (support_for_draw), and a lookup is a getenv
     float sc = 1.0f;
-    if (!v.empty()) {
+    if (quality_scales().set) {
+        sc = quality_scales().scene;
+    } else if (!v.empty()) {
         sc = static_cast<float>(std::atof(v.c_str()));
     } else {
         sc = nxrt::gfx::tuning().render_scale.load();
@@ -726,15 +780,49 @@ float render_scale_now() {
     sc = std::round(sc * 1080.0f) / 1080.0f;   // a whole number of lines at 1080 (1.333 -> 4/3: 1440, not 1439)
     if (std::fabs(sc - 1.0f) < 0.01f) sc = 1.0f;
     g_render_scale = sc;
-    NXLOG_I(kTag, "render scale %.3f (%s)", sc, v.empty() ? "play settings" : "[gfx] render_scale");
+    NXLOG_I(kTag, "render scale %.3f (%s)", sc, quality_scales().set ? "[upscale] render_quality" : v.empty() ? "play settings" : "[gfx] render_scale");
     return sc;
+}
+
+// [gfx] output_scale (default: render_scale): scale of targets at least output_min_width wide (the output side); narrower ones keep
+// render_scale, so the upscaler's input and output sizes can differ. Fixed once read.
+float output_scale_now() {
+    static const float out = [] {
+        if (quality_scales().set) {   // [upscale] render_quality decides it (the console mode: 1)
+            const float q = quality_scales().out;
+            return std::fabs(q - 1.0f) < 0.01f ? 1.0f : std::round(q * 1080.0f) / 1080.0f;
+        }
+        const std::string v = nxrt::config_get_str("gfx", "output_scale", "");
+        if (v.empty()) return 0.0f;   // follows render_scale
+        float s = static_cast<float>(std::atof(v.c_str()));
+        if (!(s > 0.0f)) return 0.0f;
+        s = std::clamp(s, 0.25f, 4.0f);
+        s = std::round(s * 1080.0f) / 1080.0f;
+        if (std::fabs(s - 1.0f) < 0.01f) s = 1.0f;
+        NXLOG_I(kTag, "output scale %.3f ([gfx] output_scale, targets from %lld wide)", s,
+                static_cast<long long>(nxrt::config_get_int("gfx", "output_min_width", 1920)));
+        return s;
+    }();
+    return out > 0.0f ? out : render_scale_now();
 }
 
 // The scale a texture gets when its image is made for a render target (after Ryujinx's TextureScaling rules): 2D colour or depth targets
 // of at least 32x32, not block-compressed, not pitch-linear, and not square powers of two (shadow
 // maps, LUTs). Everything else, and every texture first used another way, keeps the NVN size.
 float attachment_scale(const Texture& t) {
-    const float sc = render_scale_now();
+    const float scene = render_scale_now(), out = output_scale_now();
+    if (scene == 1.0f && out == 1.0f) return 1.0f;
+    static const int out_min = static_cast<int>(nxrt::config_get_int("gfx", "output_min_width", 1920));
+    float sc = t.b.width >= out_min ? out : scene;
+    // Output-side targets taller than 1080 lines (XC2's own 4K set) are drawn at the output height, not scaled past it.
+    if (t.b.width >= out_min && t.b.height > 1080) {
+        const float h = static_cast<float>(t.b.height);
+        if (quality_scales().set)
+            sc = static_cast<float>(quality_scales().out_h) / h;
+        else if (sc > 1.0f)
+            sc = std::max(1.0f, std::min(sc, std::round(out * 1080.0f) / h));
+        if (std::fabs(sc - 1.0f) < 0.01f) sc = 1.0f;
+    }
     if (sc == 1.0f) return 1.0f;
     const TextureBuilderInfo& b = t.b;
     if (!t.fmt || t.fmt->compressed || t.fmt->block_w != 1 || t.fmt->block_h != 1) return 1.0f;
@@ -1457,7 +1545,11 @@ TexGpu* tex_gpu_attachment(Texture* t) {
 
 TexGpu* tex_gpu_scaled(Texture* t, float scale) { return tex_or_null(t, scale); }
 
-float render_scale() { return render_scale_now(); }
+// Not 1 while any target scales (the scene set or, with [gfx] output_scale, only the output side): the callers ask "is scaling on".
+float render_scale() {
+    const float s = render_scale_now();
+    return s != 1.0f ? s : output_scale_now();
+}
 
 float tex_scale(Texture* t) {
     return (t && t->gpu && !t->gpu->failed) ? t->gpu->scale : 1.0f;
@@ -2059,7 +2151,8 @@ VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
         // The shader's sampled type decides how the bits read: float shaders over an integer texture (and the reverse) see the raw bits.
         // Apply this to explicit NVN views too. A UINT view of float storage is compatible with
         // the image, but not with the pool's float OpTypeImage (VUID-format-07753).
-        const VkFormat a = req.component == 1 ? float_alias(fmt) : req.component == 2 ? sint_alias(fmt) : uint_alias(fmt);
+        VkFormat a = req.component == 1 ? float_alias(fmt) : req.component == 2 ? sint_alias(fmt) : uint_alias(fmt);
+        if (a == VK_FORMAT_UNDEFINED && req.component == 1 && view_reinterpret_on()) a = unorm_alias(fmt);
         if (a != VK_FORMAT_UNDEFINED && format_view_ok(*g, a)) fmt = a;
     }
     if (!format_view_ok(*g, fmt)) {
@@ -2167,6 +2260,11 @@ VkFormat tex_attachment_format(Texture* t, VkFormat view_format, bool keep_forma
 bool tex_has_storage(Texture* t) {
     TexGpu* g = tex_or_null(t);
     return g && (g->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+}
+
+bool tex_has_feedback_loop(Texture* t) {
+    TexGpu* g = tex_or_null(t);
+    return g && (g->usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) != 0;
 }
 
 VkFormat tex_storage_format(Texture* t, VkFormat requested) {

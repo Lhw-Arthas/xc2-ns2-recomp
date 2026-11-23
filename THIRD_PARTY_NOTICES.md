@@ -53,6 +53,8 @@ The tools under `third_party/fefw-recomp/tools/` keep their licence copies next 
 |---|---|---|
 | fefw-recomp 0.2.0 reference snapshot | `work/ref/fefw-recomp-ref-0.2.0` (git-ignored; 558 files kept because upstream may be deleted — see `UPSTREAM.md`) | **GPL-3.0** |
 | Ryujinx shader translator (`Spv.Generator`, `Ryujinx.Graphics.Shader`) | staged by `third_party/fefw-recomp/tools/shaders/scripts/setup_ryujinx.ps1`, not checked in | **MIT** |
+| NVIDIA Streamline (`v2.14.16`) & DLSS (`nvngx_dlss.dll`) | Not in repository or release package; optional user-confirmed direct download from NVIDIA GitHub in launcher settings (`upscalers/streamline/`) | Streamline: MIT; `nvngx_dlss.dll`: NVIDIA RTX SDKs LICENSE (see `runtime/THIRD_PARTY_NOTICES.md`) |
+| AMD FidelityFX FSR prebuilt DLLs (`v2.4.0` + `v1.1.4`) | Not in repository or release package; optional user-confirmed direct download from GPUOpen GitHub in launcher settings (`upscalers/fsr3/`) | `v2.4.0` signedbin: AMD binary EULA; `v1.1.4`: MIT (see `runtime/THIRD_PARTY_NOTICES.md`) |
 
 ## Read for reference only, no code copied
 

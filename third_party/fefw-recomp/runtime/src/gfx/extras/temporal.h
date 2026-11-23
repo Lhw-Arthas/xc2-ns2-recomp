@@ -73,6 +73,9 @@ TemporalBackend* temporal_dlss(void* gfx_device, bool dlaa);
 bool temporal_ffx_available();
 bool temporal_dlss_available();
 bool temporal_dlss_started();   // Streamline was initialised before the Vulkan instance (needed for DLSS; set by streamline_preinit)
+// [dlss] preset: the DLSS model ("default", "J", "K", "L", "M") for every mode; the live call applies on the next evaluation.
+void set_dlss_preset_live(const char* preset);
+std::string dlss_preset_current();
 // Live FSR version override (e.g. "3.1", "4.1", "2.3"): tears down and rebuilds the FidelityFX context on the next evaluation.
 void set_ffx_version_live(const char* version);
 std::string temporal_ffx_active_version();   // e.g. "FSR 3.1.6" / "FSR 4.1.2" once a context has been created

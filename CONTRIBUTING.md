@@ -33,6 +33,10 @@ See [docs/BUILD.md](docs/BUILD.md). In short: a Windows toolchain (MSVC + LLVM c
 - If you change a shader patch, run `tools\build\patch-shaders.ps1 -Check` and make sure it exits 0.
 - If you change a file under `third_party/fefw-recomp/`, add the change to that directory's
   `MODIFICATIONS.md` (GPL-3.0 requires a modification notice).
+- If you add or change runtime config keys (`config_get_*`), F1 settings (`play_config.cpp`), or `config/nxrt.ini.in`,
+  update `config/keys.tsv`, regenerate `CONFIG.md` with `python tools/ci/config_table.py --emit`, and run the local CI
+  checks (`check_invariants.py`, `check_links.py`, `config_table.py --check`, `check_play_settings.py`,
+  `check_install_template.py`).
 - Say which build you tested on, and what you measured. Numbers with a scene and a build are worth more than
   "it feels faster".
 

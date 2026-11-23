@@ -715,6 +715,12 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     const bool x_ll2 = x_pid && has_dext(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     if (x_ll2) dev_exts.push_back(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     const bool x_aal = !headless && add_ext(VK_AMD_ANTI_LAG_EXTENSION_NAME, &aal);
+    VkPhysicalDeviceShaderEarlyAndLateFragmentTestsFeaturesAMD aeal = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_FEATURES_AMD};
+    const bool x_eal = add_ext(VK_AMD_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_EXTENSION_NAME, &aeal);
+    VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT afbl = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
+    const bool x_fbl = add_ext(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME, &afbl);
     // VK_EXT_device_fault: when the GPU drops the device, the driver can say what it was executing and at which address,
     // instead of only the -4 the submit returned (nvn_gpu.cpp device_fault_text). The feature struct goes into the
     // availability chain with the others, so nothing is enabled that the physical device does not report (issue 10).
@@ -722,6 +728,8 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     add_ext(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &adf);
     features_.external_memory_host = has_dext(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (features_.external_memory_host) dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    features_.memory_budget = has_dext(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (features_.memory_budget) dev_exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (has_dext(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) { dev_exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME); features_.push_descriptor = true; }
     // robust access per pipeline, for the translated shaders' uniform buffers only (nvn_pipeline.cpp ubo_robustness); robustness2 is
     // enabled for its pipeline behaviour, not its device-wide features (left off: they cost speed)
@@ -780,6 +788,8 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.descriptor_indexing = a12.descriptorIndexing && a12.shaderSampledImageArrayNonUniformIndexing;
     features_.host_query_reset = a12.hostQueryReset;
     features_.fragment_shader_interlock = x_fsi && afsi.fragmentShaderPixelInterlock;
+    features_.early_and_late_fragment_tests_amd = x_eal && aeal.shaderEarlyAndLateFragmentTests;
+    features_.attachment_feedback_loop_layout = x_fbl && afbl.attachmentFeedbackLoopLayout;
     features_.depth_clip_control = x_dcc && adcc.depthClipControl;
     features_.depth_clip_enable = x_dce && adce.depthClipEnable;
     features_.custom_border_color = x_cbc && acbc.customBorderColors && acbc.customBorderColorWithoutFormat;

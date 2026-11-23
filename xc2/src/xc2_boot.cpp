@@ -14,6 +14,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,9 +22,11 @@
 #include <string>
 
 #include "nxrt/config.h"
+#include "nxrt/render_quality.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/fiber.h"
 #include "nxrt/frame_limiter.h"
+#include "nxrt/gauge.h"
 #include "nxrt/hooks.h"
 #include "nxrt/input.h"
 #include "nxrt/input_source.h"
@@ -705,6 +708,13 @@ static void arm_frame_rate(uint64_t main_base) {
     }
     float old = 0.0f;
     std::memcpy(&old, reinterpret_cast<const void*>(period_addr), 4);
+    // 0xf65a44 is the 3.0.0 rodata address of 1/60 (0x3C888889); on 3.0.1 it falls inside .bss (0.0f) and the game already
+    // runs natively at 60 fps (present interval 1). Skip patching and the fps_follow thread when the slot does not hold 1/60.
+    if (std::fabs(old - (1.0f / 60.0f)) > 1e-4f) {
+        NXLOG_I("xc2", "frame rate: main+0xf65a44 holds %.6f (expected 1/60); skipping 3.0.0 vsync-period patch",
+                static_cast<double>(old));
+        return;
+    }
     // [xc2] fps_interval (default 2): the game's "vsyncs per frame". 2 with period 1/(2 fps) is the shipping arrangement;
     // 1 makes the period 1/fps itself, as the NS1 patch page does (frame_rate.c interval_store), which also changes what
     // the code that counts vsyncs (present requests, lip sync) sees.
@@ -740,26 +750,52 @@ static void arm_frame_rate(uint64_t main_base) {
         }).detach();
     }
     // [xc2] fps_follow (default on): the step follows the *measured* display interval, never below the target - the game's own limiter waits
-    // interval x period x 0.997, so a frame that misses the target shows up in the limiter's mean and raises the step: the game keeps real
+    // interval x period x 0.997, so a frame that misses the target shows up in the recent average and raises the step: the game keeps real
     // time instead of running slow (NS1's xc2_rate_store does the same with a 5-frame average, at most 1/15 s).
+    // Uses lock-free frame_times_recent (last 8 frames, ignoring loading stalls > 250 ms) instead of FrameLimiter::stats() (which locked and
+    // sorted an 8192-frame ring 250 times/s), and only re-applies RW protection when the loader actually restored RO on that page.
     if (!nxrt::config_get_bool("xc2", "fps_follow", true) || !g_frame_limiter) return;
     const double target = 1.0 / static_cast<double>(fps);
     std::thread([period_addr, target, nvsync] {
-        double last = 0.0;
+        float last = static_cast<float>(target / static_cast<double>(nvsync));
         for (;;) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(4));
-            const nxrt::FrameLimiter::Stats st = g_frame_limiter->stats();
-            if (st.frames < 2 || st.mean_ms <= 0.0) continue;
-            double step = (std::max)(target, st.mean_ms / 1000.0);   // a late frame raises the step; a faster one does not lower it below the target
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            float recent[8];
+            const size_t n = nxrt::frame_times_recent(recent, 8);
+            if (n < 2) continue;
+            double sum = 0.0;
+            size_t cnt = 0;
+            for (size_t i = 0; i < n; ++i) {
+                if (recent[i] > 0.0f && recent[i] < 250.0f) {
+                    sum += static_cast<double>(recent[i]);
+                    ++cnt;
+                }
+            }
+            if (cnt == 0) continue;
+            double step = (std::max)(target, (sum / static_cast<double>(cnt)) / 1000.0);
             step = (std::min)(step, 1.0 / 15.0);
             const float p = static_cast<float>(step / static_cast<double>(nvsync));
-            if (p != last) {
-                last = p;
-                nxrt::mem::protect(period_addr, 4, nxrt::mem::Prot::RW);   // the loader restores the image's own protection after boot
-                std::memcpy(reinterpret_cast<void*>(period_addr), &p, 4);
+            if (std::fabs(p - last) <= 1e-5f) continue;
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<const void*>(period_addr), &mbi, sizeof mbi) != sizeof mbi || mbi.State != MEM_COMMIT) continue;
+            const DWORD prot = mbi.Protect & 0xFF;
+            if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE) {
+                if (!nxrt::mem::protect(period_addr, 4, nxrt::mem::Prot::RW)) continue;
             }
+            std::memcpy(reinterpret_cast<void*>(period_addr), &p, 4);
+            last = p;
         }
     }).detach();
+}
+
+// The dynamic-resolution lock: any render quality but the console's implies it; otherwise [upscale] lock_render_size decides.
+static bool xc2_lock_render_size() {
+    static const bool on = [] {
+        const nxrt::RenderQualityMode* m = nxrt::render_quality_mode(nxrt::config_get_str("upscale", "render_quality", "").c_str());
+        if (m && m->share > 0.0) return true;
+        return nxrt::config_get_bool("upscale", "lock_render_size", false);
+    }();
+    return on;
 }
 
 // ---- native resolution override (3.0.1) -------------------------------------------------------------------------------------
@@ -1555,7 +1591,7 @@ static void arm_ns1_probe(uint64_t main_base) {
     static const bool rs_probe = std::getenv("XC2_RENDER_SIZE_PROBE") != nullptr;   // static: the hook is a plain fn pointer
     static const bool rs_watch = std::getenv("XC2_RENDER_SIZE_WATCH") != nullptr ||
                                  std::getenv("XC2_RENDER_SIZE_WRITE_PIN") != nullptr;
-    const bool rs_lock = nxrt::config_get_bool("upscale", "lock_render_size", false);
+    const bool rs_lock = xc2_lock_render_size();
     if (rs_probe || rs_lock || rs_watch) {
         static int shown = 0;
         static uint32_t last0 = 0xFFFFFFFFu, last1 = 0xFFFFFFFFu;
@@ -1583,7 +1619,7 @@ static void arm_ns1_probe(uint64_t main_base) {
                     if (std::sscanf(s, "%ux%u", &a, &b) == 2 && a && b) { pin_w = a; pin_h = b; }
                 }
                 // The launcher's Picture page writes this: lock the ladder at its top rung (the game's fixed 1280x720).
-                if (!pin_w && nxrt::config_get_bool("upscale", "lock_render_size", false)) { pin_w = 1280; pin_h = 720; }
+                if (!pin_w && xc2_lock_render_size()) { pin_w = 1280; pin_h = 720; }
             }
             if (pin_w && v[0] <= 1920 && v[1] <= 1080 && (v[0] < pin_w || v[1] < pin_h)) {
                 const uint32_t pinned[2] = {pin_w, pin_h};
@@ -1998,42 +2034,80 @@ int main(int argc, char **argv) {
     std::unique_ptr<nxrt::gfx::Device> gfx_device;
     std::unique_ptr<nxrt::gfx::Renderer> gfx_renderer;
     nxrt::nvn::install();
+    bool start_borderless = false;
+    bool start_exclusive = false;
     if (!headless) {
         nxrt::platform::init();
         nxrt::platform::WindowDesc wd;
         wd.title = nxrt::game::info().title;
-        const bool start_borderless = (play_disp.window_mode == "borderless");
-        const bool start_exclusive = (play_disp.window_mode == "exclusive");
+        start_borderless = (play_disp.window_mode == "borderless");
+        start_exclusive = (play_disp.window_mode == "exclusive");
         const bool start_fullscreen = start_borderless || start_exclusive;
         int win_w = static_cast<int>(nxrt::config_get_int("gfx", "window_width", 0));
         int win_h = static_cast<int>(nxrt::config_get_int("gfx", "window_height", 0));
-        if (!start_fullscreen && play_disp.width >= 320 && play_disp.height >= 240) {
+        const char* size_src = "[gfx] window_width/height";
+        if (!start_fullscreen && (win_w <= 0 || win_h <= 0) && play_disp.width >= 320 && play_disp.height >= 240) {
             win_w = play_disp.width;
             win_h = play_disp.height;
+            size_src = "controls.ini";
         }
         if (start_fullscreen || win_w <= 0 || win_h <= 0) {
             win_w = ::GetSystemMetrics(SM_CXSCREEN);
             win_h = ::GetSystemMetrics(SM_CYSCREEN);
             if (win_w < 320 || win_h < 240) { win_w = 1280; win_h = 720; }   // no desktop mode to ask (session 0)
+            // Cap default windowed size at 1440p preserving aspect ratio so 4K desktops stay sharp without blowing VRAM at first boot.
+            if (!start_fullscreen && win_h > 1440) {
+                win_w = (std::max)(320, static_cast<int>(static_cast<long long>(win_w) * 1440 / win_h));
+                win_h = 1440;
+            }
+            size_src = "auto display";
         }
         wd.width = win_w;
         wd.height = win_h;
-        NXLOG_I("boot", "window %dx%d (%s)", win_w, win_h, play_disp.window_mode.c_str());
+        NXLOG_I("boot", "window %dx%d (%s, %s)", win_w, win_h, play_disp.window_mode.c_str(), size_src);
         if (!nxrt::platform::create_window(wd)) die("cannot create the window");
-        // Paint the window background black immediately and enter fullscreen before creating the first swapchain,
-        // preventing the unpainted white 1440p client-rect flash during the ~5 s guest boot.
+        // Paint the window background black immediately and apply a custom local .ico (if present) for the
+        // taskbar, Alt+Tab switcher and title bar before entering fullscreen and creating the swapchain.
         if (HWND hwnd = static_cast<HWND>(nxrt::platform::native_hwnd())) {
             ::SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, reinterpret_cast<LONG_PTR>(::GetStockObject(BLACK_BRUSH)));
-            if (HDC hdc = ::GetDC(hwnd)) {
-                RECT rc{};
-                ::GetClientRect(hwnd, &rc);
-                ::FillRect(hdc, &rc, static_cast<HBRUSH>(::GetStockObject(BLACK_BRUSH)));
-                ::ReleaseDC(hwnd, hdc);
+            const int big_cx = ::GetSystemMetrics(SM_CXICON);
+            const int big_cy = ::GetSystemMetrics(SM_CYICON);
+            const int sm_cx = ::GetSystemMetrics(SM_CXSMICON);
+            const int sm_cy = ::GetSystemMetrics(SM_CYSMICON);
+            HINSTANCE hInst = ::GetModuleHandleW(nullptr);
+            HICON hBig = static_cast<HICON>(::LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, big_cx, big_cy, LR_DEFAULTCOLOR));
+            HICON hSm = static_cast<HICON>(::LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, sm_cx, sm_cy, LR_DEFAULTCOLOR));
+            std::string icon_src = (hBig || hSm) ? "embedded PE resource #1" : "";
+            if (!hBig && !hSm) {
+                static const char* kIconNames[] = {"xc2_icon.ico", "mythra_ns2_301.ico", "mythra_icon.ico"};
+                char exe_path[MAX_PATH] = {};
+                std::string exe_dir;
+                if (::GetModuleFileNameA(nullptr, exe_path, MAX_PATH) > 0) {
+                    exe_dir = exe_path;
+                    const size_t sl = exe_dir.find_last_of("\\/");
+                    if (sl != std::string::npos) exe_dir.resize(sl + 1);
+                    else exe_dir.clear();
+                }
+                for (const char* nm : kIconNames) {
+                    if (file_exists(nm)) { icon_src = nm; break; }
+                    if (!exe_dir.empty() && file_exists(exe_dir + nm)) { icon_src = exe_dir + nm; break; }
+                }
+                if (!icon_src.empty()) {
+                    hBig = static_cast<HICON>(::LoadImageA(nullptr, icon_src.c_str(), IMAGE_ICON, big_cx, big_cy, LR_LOADFROMFILE));
+                    hSm = static_cast<HICON>(::LoadImageA(nullptr, icon_src.c_str(), IMAGE_ICON, sm_cx, sm_cy, LR_LOADFROMFILE));
+                }
             }
-        }
-        if (start_borderless) nxrt::platform::set_fullscreen(nxrt::platform::FullscreenMode::Borderless);
-        else if (start_exclusive) nxrt::platform::set_fullscreen(nxrt::platform::FullscreenMode::Exclusive);
-        if (HWND hwnd = static_cast<HWND>(nxrt::platform::native_hwnd())) {
+            if (hBig) {
+                ::SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hBig));
+                ::SetClassLongPtrW(hwnd, GCLP_HICON, reinterpret_cast<LONG_PTR>(hBig));
+            }
+            if (hSm) {
+                ::SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hSm));
+                ::SetClassLongPtrW(hwnd, GCLP_HICONSM, reinterpret_cast<LONG_PTR>(hSm));
+            }
+            if (!icon_src.empty()) {
+                NXLOG_I("boot", "window icon loaded from %s", icon_src.c_str());
+            }
             if (HDC hdc = ::GetDC(hwnd)) {
                 RECT rc{};
                 ::GetClientRect(hwnd, &rc);
@@ -2052,6 +2126,12 @@ int main(int argc, char **argv) {
         rd.headless_width = 1280; rd.headless_height = 720;
         gfx_renderer = nxrt::gfx::Renderer::create(*gfx_device, rd, &err);
         if (!gfx_renderer) die("renderer: %s", err.c_str());
+        // Enter borderless/exclusive fullscreen only after the Vulkan device and initial swapchain exist so Windows
+        // display/driver hooks cannot deadlock on an un-pumped borderless HWND before Vulkan enumeration (issue #18).
+        if (!headless) {
+            if (start_borderless) nxrt::platform::set_fullscreen(nxrt::platform::FullscreenMode::Borderless);
+            else if (start_exclusive) nxrt::platform::set_fullscreen(nxrt::platform::FullscreenMode::Exclusive);
+        }
         g_renderer = gfx_renderer.get();   // the F12 hotkey writes the next presented frame through it
         // Use play mode's shared FrameLimiter so the F1 overlay, corner FPS counter, present-mode switches and
         // arm_frame_rate all observe the same presented frames.
@@ -2177,6 +2257,8 @@ int main(int argc, char **argv) {
     // the frame limiter (above) holds it. NXRT_NVN_PRESENT_INTERVAL_HZ=0 turns pacing off, =60 asks for 60.
     if (!nxrt::config_has("nvn", "present_interval_hz")) nxrt::config_set("nvn", "present_interval_hz", "30");
     nxrt::config_set("system", "language", "AmericanEnglish");   // Monolith dev_setting refuses the zh-Hans the host reports
+    // The game's own languages (an older launch.env listed American English, which crashes the Event Theater); env wins over config_set.
+    _putenv_s("NXRT_TITLE_SUPPORTED_LANGUAGES", "Japanese,BritishEnglish,French,German,Italian,Spanish,Chinese,Taiwanese,Korean,SimplifiedChinese,TraditionalChinese");
     nxrt::config_set("system", "region", "USA");
     // F11 (see LiveInput) traces the next frame; with this default the trace also writes every sampled texture's prepared
     // bytes next to the render target dumps (texdump_f11\t<id>.bin/.txt/.raw), so a hands-on bug report carries its own

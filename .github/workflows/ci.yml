@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
       - name: No game data, keys or builds in the tree
         run: |
           set -eu
@@ -36,13 +38,33 @@ jobs:
       - name: No personal paths
         run: |
           set -eu
-          # a real user profile, anywhere, docs included
-          if git grep -n -I -E '[A-Za-z]:\\Users\\[A-Za-z0-9._-]+' -- .; then
-            echo "a personal path is in the tree"; exit 1
-          fi
-          # the maintainer's own checkout, hardcoded into a script or a source file
-          if git grep -n -I -F 'Xenoblade 2 Switch 2 Edition recomp' -- . ':!.github/workflows/ci.yml'; then
-            echo "the maintainer's absolute checkout path is in the tree"; exit 1
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if git rev-parse --verify -q HEAD^1 >/dev/null; then
+              base=HEAD^1
+            else
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+              base=FETCH_HEAD
+            fi
+            mapfile -d '' -t files < <(git diff --name-only -z --diff-filter=ACMRT "$base" HEAD -- . ':!.github/workflows/ci.yml')
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "ok: no personal paths (no added or modified files in PR)"
+              exit 0
+            fi
+            if git grep -n -I -E '[A-Za-z]:\\Users\\[A-Za-z0-9._-]+' -- "${files[@]}"; then
+              echo "a personal path is in the PR"; exit 1
+            fi
+            if git grep -n -I -F 'Xenoblade 2 Switch 2 Edition recomp' -- "${files[@]}"; then
+              echo "the maintainer's absolute checkout path is in the PR"; exit 1
+            fi
+          else
+            # a real user profile, anywhere, docs included
+            if git grep -n -I -E '[A-Za-z]:\\Users\\[A-Za-z0-9._-]+' -- .; then
+              echo "a personal path is in the tree"; exit 1
+            fi
+            # the maintainer's own checkout, hardcoded into a script or a source file
+            if git grep -n -I -F 'Xenoblade 2 Switch 2 Edition recomp' -- . ':!.github/workflows/ci.yml'; then
+              echo "the maintainer's absolute checkout path is in the tree"; exit 1
+            fi
           fi
           echo "ok: no personal paths"
       - name: Markdown links resolve

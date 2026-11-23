@@ -222,6 +222,6 @@ Logs go to `work/logs/play-301-<time>.log`.
 * Never commit `xc2/game/**`, `xc2/build/**` or `work/**`: they hold game data and multi-GB build products
   (`.gitignore` already covers them).
 * The shader cache is keyed by shader hash: do not delete it. If a translation changes, translate the affected
-  hashes and let `install_shaders.ps1` replace those entries.
+  hashes and let `tools/build/patch-shaders.ps1` (or `tools/shader/cache/build_cache.py`) replace those entries.
 * The single-instance rule: `xc2_boot.exe` maps its data files exclusively — after killing it, wait ~25 s before
   starting it again, and close the game before linking.

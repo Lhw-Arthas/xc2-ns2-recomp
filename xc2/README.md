@@ -21,9 +21,10 @@ The stub link at the end of `build.ps1` always fails; that is expected. See `../
 
 | path | what |
 |---|---|
-| `src/` | boot harness (`xc2_boot.cpp`), the Opus and `nn::audio` shims, ABI stubs, a smoke test |
+| `src/` | boot harness (`xc2_boot.cpp`), the Opus and `nn::audio` shims, ABI stubs (`xc2_stub.cpp`), and smoke stubs (`stub_main.cpp`, `rt_stub.cpp`) |
+| `sites/` | hook/patch/inline site tables (`sites-main.txt`, `sites-sdk.txt`, `sites-rtld.txt`) |
+| `release/` | CMake build & `.def` exports for the split `xc2_rt.dll` package runtime |
 | `recomp/xc2ns2/config.py` | the module table and build ids the lifter reads |
-| `docs/` | fork plan and build notes |
 | `tests/` | input scripts for the smoke test |
 
 ## Input

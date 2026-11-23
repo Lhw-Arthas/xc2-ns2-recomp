@@ -30,7 +30,10 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $playScript = Join-Path $root 'tools\run\play.ps1'
 if (-not (Test-Path -LiteralPath $playScript)) { throw "no play.ps1 at $playScript" }
-$env:XC2_PYTHON = 'C:\Users\weile\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
+if (-not $env:XC2_PYTHON) {
+    $pyCmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($pyCmd) { $env:XC2_PYTHON = $pyCmd.Source }
+}
 
 function Clear-RouteEnv {
     foreach ($k in 'XC2_ROUTE', 'XC2_ROUTE_OUT', 'XC2_ROUTE_DELAY', 'XC2_PRESS') {

@@ -110,7 +110,7 @@ TOP_LEVEL_DIRS = {".github", "config", "docs", "launcher", "licenses", "third_pa
 TOP_LEVEL_FILES = {
     ".editorconfig", ".gitattributes", ".gitignore", "AGENTS.md", "CHANGELOG.md", "CONTRIBUTING.md", "LICENSE",
     "LICENSE.nxnative.MIT", "README.md", "SECURITY.md", "STATUS.md", "THIRD_PARTY_NOTICES.md", "controls.ini",
-    "deepseek.md",
+    "deepseek.md", "gemini.md",
 }
 
 

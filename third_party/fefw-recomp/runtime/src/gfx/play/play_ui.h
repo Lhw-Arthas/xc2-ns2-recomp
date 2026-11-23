@@ -50,6 +50,8 @@ public:
     virtual void cancel_capture() = 0;
     // An input the page must not let the player bind (the key that opens this menu). The page keeps waiting for another one.
     virtual bool reserved_key(const InputId& id) const { (void)id; return false; }
+    // Cleanly exits the application (e.g. Exit Game button in the bottom bar of the F1 settings overlay).
+    virtual void request_exit() {}
 };
 
 // Draws the settings menu: pages Display, Graphics, Controls (mouse, keyboard bindings, gamepad, Switch layout, status), Audio and About, plus

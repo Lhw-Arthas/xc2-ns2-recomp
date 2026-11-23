@@ -23,6 +23,7 @@
 #include "nxrt/log.h"
 #include "nxrt/gauge.h"
 #include "nxrt/memory.h"
+#include "nxrt/nvn_backend.h"
 #include "nxrt/write_watch.h"
 #include "vk_gauges.h"
 #include "nvn_gpu_internal.h"
@@ -686,7 +687,8 @@ Mirror* mirror_for(PoolGpu* pg, MemoryPool* mp) {
     // big vertex/index pools) gets a copy too. Its pages are tracked by their write-watch record (write_watch.cpp), never by protection.
     static const bool vamm = config_get_bool("nvn", "pool_mirror_vamm", true);
     const uint64_t b0 = reinterpret_cast<uint64_t>(pg->base);
-    const bool in_alias = b0 >= mem::kAliasBase && b0 + pg->size <= mem::kAliasBase + mem::kAliasSize;
+    const uint64_t ab = mem::alias_base();
+    const bool in_alias = b0 >= ab && b0 + pg->size <= ab + mem::kAliasSize;
     if (!pg->viewed && !(vamm && in_alias)) return nullptr;
     const uint64_t budget = mirror_cap_bytes();
     if (budget == 0) return nullptr;
@@ -887,8 +889,8 @@ bool mirror_capture_on() {
         if (is_auto)
             NXLOG_I(kTag, "mirror_capture: %s (auto: the copies may take %llu MiB, %llu needed)", v ? "on" : "off",
                     static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(kCaptureMinBudget >> 20));
-        // A player on an 8 GB NVIDIA card reads "off" as "the fix is applied": the flicker this exists for stays, and the frame
-        // time it costs stays with it (measured 2026-11-22: a 4060 Laptop offered 1989 MiB of 3584 and ran the opening at 14 fps).
+        // Lowering kCaptureMinBudget to 1536 MiB lets 8 GB NVIDIA cards (~1989 MiB quarter-VRAM budget) enable capture by default;
+        // 4060 Laptop testing (2026-11-22) passed all cutscenes with capture on and no OOM.
         if (is_auto && !v)
             NXLOG_W(kTag, "mirror_capture: off - this device offers %llu MiB and the copies need %llu, so the flicker fix is not active;"
                           " [nvn] mirror_capture = 1 forces it (it may then run out of memory)",
@@ -1456,6 +1458,33 @@ bool note_gpu_write(uint64_t gpu_address, uint64_t size, int use) {
     g_wr_pages[use % 6] += static_cast<int64_t>(last - first + 1);
     // word by word (page by page this was ~3.5 % of the render thread: draws note their storage buffers, MiBs each; notes/rt.md)
     const bool stale = mem::ww::any_valid(m.ww, first, last - first + 1);
+    if (stale && !mirror_capture_on()) {
+        // Pages repeatedly invalidated by GPU writes (e.g. per-frame skinning / dynamic storage outputs) cool off via the same
+        // hot-page hold as CPU-written rings, instead of re-arming, barrier-flushing and copying hundreds of KiB every frame forever.
+        const uint32_t now = presents_now();
+        for (uint64_t p = first; p <= last;) {
+            const uint64_t block = std::min<uint64_t>(64, last + 1 - p);
+            if (!mem::ww::any_valid(m.ww, p, block)) { p += block; continue; }
+            for (uint64_t q = p; q < p + block; ++q) {
+                if (!page_valid(m, q)) continue;
+                const size_t i = static_cast<size_t>(q);
+                if (m.copied_at[i] == 0) continue;
+                const bool soon = hot_used_on() && now - m.copied_at[i] <= kHotWindow;
+                if (bit_get(m.used, q) && !soon) {
+                    m.score[i] = 0;
+                    m.backoff[i] = 0;
+                    continue;
+                }
+                if (++m.score[i] >= kHotHits) {
+                    if (m.hot_until[i] <= now) g_st_hot.fetch_add(1, std::memory_order_relaxed);
+                    m.hot_until[i] = now + (kHotHold << m.backoff[i]);
+                    if (m.backoff[i] < kHotMaxShift) ++m.backoff[i];
+                    m.score[i] = 0;
+                }
+            }
+            p += block;
+        }
+    }
     mem::ww::invalidate(m.ww, first, last - first + 1);
     {
         const uint64_t ser = current_serial();
@@ -2158,10 +2187,70 @@ void out_log() {
     p_end = end; p_gpu = gpu; p_fault = fault; p_inval = inval; pn_fault = nf; pn_inval = ni; pn_def = nd; pn_read = nr; pn_ng = ng; pn_gf = ngf; p_gfaults = gfaults;
 }
 
+VramLiveInfo vram_live_info_impl() {
+    VramLiveInfo out;
+    if (!counters_if()) return out;
+    const gfx::Device& dev = device();
+    out.pool_copy_mb = static_cast<uint64_t>(std::max<int64_t>(0, g_st_live_bytes.load(std::memory_order_relaxed))) >> 20;
+    out.pool_cap_mb = mirror_cap_bytes() >> 20;
+    out.capture_on = mirror_capture_on();
+    if (VkPhysicalDevice pd = dev.physical()) {
+        if (dev.features().memory_budget) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+            props.pNext = &budget;
+            vkGetPhysicalDeviceMemoryProperties2(pd, &props);
+            uint64_t total = 0, used = 0;
+            for (uint32_t i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+                if (props.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                    total += props.memoryProperties.memoryHeaps[i].size;
+                    used += budget.heapUsage[i];
+                }
+            }
+            if (total > 0) {
+                out.vram_total_mb = total >> 20;
+                out.vram_used_mb = used >> 20;
+                out.budget_live = true;
+            }
+        }
+        if (out.vram_total_mb == 0) {
+            out.vram_total_mb = dev.gpu().vram_bytes >> 20;
+        }
+    }
+    return out;
+}
+
+void vram_log_periodic() {
+    if (!counters_if()) return;
+    static std::atomic<int64_t> next_log_ns{0};
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    int64_t due = next_log_ns.load(std::memory_order_relaxed);
+    if (due == 0) {
+        // First report 30 s after first present (after startup allocations settle), then every 60 s.
+        int64_t expected = 0;
+        next_log_ns.compare_exchange_strong(expected, now_ns + 30'000'000'000LL, std::memory_order_relaxed);
+        return;
+    }
+    if (now_ns < due) return;
+    if (!next_log_ns.compare_exchange_strong(due, now_ns + 60'000'000'000LL, std::memory_order_relaxed)) return;
+    const VramLiveInfo vi = vram_live_info_impl();
+    NXLOG_I(kTag, "vram: %s%llu / %llu MiB (pool copies %llu / %llu MiB, capture %s)",
+            vi.budget_live ? "" : "heap ",
+            static_cast<unsigned long long>(vi.vram_used_mb),
+            static_cast<unsigned long long>(vi.vram_total_mb),
+            static_cast<unsigned long long>(vi.pool_copy_mb),
+            static_cast<unsigned long long>(vi.pool_cap_mb),
+            vi.capture_on ? "on" : "off");
+}
+
 }  // namespace gpu
 }  // namespace nxrt::nvn::be
 
 namespace nxrt::nvn {
 // The UI's view of the device's video memory (nvn_mirror_cap.h): the same number the capture budget is sized from.
 uint64_t mirror_device_vram() { return be::gpu::device_vram_cached(); }
+
+VramLiveInfo vram_live_info() { return be::gpu::vram_live_info_impl(); }
 }  // namespace nxrt::nvn

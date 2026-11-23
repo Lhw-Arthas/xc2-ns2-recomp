@@ -10,6 +10,7 @@
 // The commit/recovery design is smo-recomp runtime/fs/nnfs.c (GPL-3.0), see fs_volume.h.
 #define _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -258,10 +259,18 @@ std::shared_ptr<Service> make_file(std::shared_ptr<fs::VFile> f, const std::stri
         });
         s.add_cmd(2, "Flush", [f](Request&, Response&) -> uint32_t { return f->flush(); });
         s.add_cmd(3, "SetSize", [f](Request& req, Response&) -> uint32_t { return f->set_size(req.arg<int64_t>(0)); });
-        s.add_cmd(4, "GetSize", [f](Request&, Response& rsp) -> uint32_t {
+        s.add_cmd(4, "GetSize", [f, path](Request&, Response& rsp) -> uint32_t {
             int64_t sz = 0;
             const uint32_t r = f->get_size(&sz);
             if (r) return r;
+            // M2b probe: the size the game reads for the archive, and the path it asked about. The patched index entry is
+            // accepted only while its offset is below this number, which is how we found out that a synthesized image and the
+            // folder view can disagree about a file's size.
+            static std::atomic<uint32_t> n{0};
+            if (n.load(std::memory_order_relaxed) < 40) {
+                const uint32_t k = n.fetch_add(1, std::memory_order_relaxed);
+                if (k < 40) NXLOG_D("fs", "getsize #%u %s = %lld", k, path.c_str(), static_cast<long long>(sz));
+            }
             rsp.push<int64_t>(sz);
             return 0;
         });

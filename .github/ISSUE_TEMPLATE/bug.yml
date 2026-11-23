@@ -5,6 +5,13 @@ body:
   - type: markdown
     attributes:
       value: |
+        **If you are on an older build, update first.** Releases before 0.2.0 have problems that are already fixed
+        (720p internal render, the add-on `0/romfs` layout, the film hand-back, F1 not opening the settings page); a
+        report from one of them costs a round trip. Latest: <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>
+
+        **请先确认版本是 0.2.0 或更新。** 0.2.0 之前有已修掉的问题（内部 720p 渲染、附加内容 `0/romfs` 布局、影片交还、
+        F1 打不开设置页），旧版本的报告会白跑一轮。最新版本见上面的链接。
+
         Before you open this: please read [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) —
         the known issues are listed there, and the three project invariants are in
         [docs/INVARIANTS.md](docs/INVARIANTS.md).

@@ -52,6 +52,7 @@
 #include "nxrt/runtime.h"
 #include "nxrt/timestep.h"
 #include "nxrt/tt.h"
+#include "extras/temporal.h"
 #include "menu_mouse.h"
 #include "play_engine.h"
 #include "play_game.h"
@@ -244,6 +245,11 @@ struct G {
     bool was_in_game = false;
     float mouse_x = 0, mouse_y = 0;
     bool mouse1 = false;
+    uint64_t last_mouse_activity_ns = 0;
+    float last_cursor_x = -1.f, last_cursor_y = -1.f;
+    bool have_cursor_pos = false;
+    bool was_cursor_autohide_eligible = false;
+    bool cursor_auto_hidden = false;
     uint32_t jc2_buttons = 0;            // host mouse buttons as nn::hid::MouseButton bits, for the Joy-Con 2 mouse (hid jc2_mouse.h)
     float jc2_wheel_x = 0, jc2_wheel_y = 0;   // wheel notches since the last feed
     uint64_t last_status_ns = 0;
@@ -343,24 +349,42 @@ void publish_live_pad_config(const PadSettings& p) {
     st.pad_cfg_rumble_scale.store(static_cast<float>(std::clamp(p.rumble_scale, 0.0, 1.0)), std::memory_order_relaxed);
 }
 
+// The F1 render quality: the upscaler's input as a share of the output height (table in nxrt/render_quality.h).
+}  // namespace
+
+// The output height the quality is a share of: [am] resolution (the console mode the game renders for, the window's size), else 1080.
+int render_output_height() {
+    const std::string am = config_get_str("am", "resolution", "");
+    const size_t x = am.find_first_of("xX");
+    const int h = x == std::string::npos ? 0 : std::atoi(am.c_str() + x + 1);
+    return h >= 720 && h <= 4320 ? h : 1080;
+}
+
+namespace {
+
 Game3dSettings hydrate_game3d_from_config() {
     Game3dSettings r;
-    const int64_t nat_res = config_get_int("xc2", "native_res", 0);
-    const int64_t res_cls = config_get_int("xc2", "res_class", 0);
-    const int64_t nat_w = config_get_int("xc2", "native_w", 3840);
-    if (nat_res <= 0) r.res_preset = 7;
-    else if (res_cls == 3) r.res_preset = 2;                       // 1080p native (no 4K upscale)
-    else if (res_cls == 2 && nat_w <= 1920) r.res_preset = 3;      // 1080p -> 1440p upscale
-    else if (res_cls == 2) r.res_preset = 1;                       // 1440p native (no 4K upscale)
-    else if (nat_w <= 1600) r.res_preset = 6;                      // 900p -> 4K upscale
-    else if (nat_w <= 1920) r.res_preset = 5;                      // 1080p -> 4K upscale
-    else if (nat_w <= 2560) r.res_preset = 4;                      // 1440p -> 4K upscale
-    else r.res_preset = 0;                                         // 4K true native
+    const std::string q = config_get_str("upscale", "render_quality", "");
+    r.res_preset = kRenderQualityCount - 1;   // console default
+    for (int i = 0; i < kRenderQualityCount; ++i)
+        if (q == kRenderQuality[i].key) r.res_preset = i;
+    if (q.empty() && config_get_bool("upscale", "lock_render_size", false)) {   // set by hand: the nearest quality to the ini's scales
+        const double scene = config_get_double("gfx", "render_scale", 1.0);
+        const double out = config_get_double("gfx", "output_scale", scene);
+        const double share = out > 0.0 ? (scene * 720.0) / (out * 1080.0) : 0.0;
+        double best = 1e9;
+        for (int i = 0; i + 1 < kRenderQualityCount; ++i) {
+            const double d = std::fabs(std::log(share / kRenderQuality[i].share));
+            if (share > 0.0 && d < best) { best = d; r.res_preset = i; }
+        }
+    }
 
     std::string up = config_get_str("dlss", "upscaler", "fsr3");
     for (char& c : up) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (up != "fsr3" && up != "taau" && up != "bilinear") up = (up == "fsr" || up == "auto") ? "fsr3" : "taau";
+    if (up == "auto") up = extras::temporal_dlss_started() ? "dlss" : "fsr3";
+    if (up != "dlss" && up != "fsr3" && up != "taau" && up != "bilinear") up = up == "fsr" ? "fsr3" : "taau";
     r.upscaler = up;
+    r.dlss_preset = extras::dlss_preset_current();
 
     std::string fv = config_get_str("upscale", "fsr_version", "3.1");
     if (fv.rfind("4", 0) == 0) fv = "4.1";
@@ -368,6 +392,10 @@ Game3dSettings hydrate_game3d_from_config() {
     else fv = "3.1";
     r.fsr_version = fv;
     r.sharpness = std::clamp(config_get_double("dlss", "sharpness", 0.5), 0.0, 1.0);
+    r.out_height = render_output_height();
+    std::string cap = config_get_str("nvn", "mirror_capture", "auto");
+    for (char& c : cap) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    r.capture = cap == "auto" ? "auto" : (cap == "1" || cap == "on" || cap == "true" || cap == "yes") ? "on" : "off";
     return r;
 }
 
@@ -385,29 +413,34 @@ void apply_game3d_settings(const Game3dSettings& old_g, const Game3dSettings& g3
         const bool ok4 = config_write("upscale", "fsr_follow_size", (!g3d.fsr_version.empty() && g3d.fsr_version[0] == '4') ? "1" : "0", &err);
         if (!ok1 || !ok2 || !ok3 || !ok4) NXLOG_W(kTag, "cannot persist 3D upscaler settings to nxrt.ini: %s", err.c_str());
     }
-    if (g3d.res_preset != old_g.res_preset) {
-        struct PresetDef { const char* am_res; const char* res_cls; const char* nat_res; const char* nat_w; const char* nat_h; };
-        static constexpr PresetDef kPresets[] = {
-            {"3840x2160", "0", "2", "3840", "2160"},   // 0: 4K true native (docked mode 1: 3840x2160)
-            {"2560x1440", "2", "2", "2560", "1440"},   // 1: 1440p native (docked mode 5: 2560x1440, 1:1)
-            {"1920x1080", "3", "2", "1920", "1080"},   // 2: 1080p native (patched mode 5: 1920x1080, 1:1)
-            {"2560x1440", "2", "2", "1920", "1080"},   // 3: 1080p -> 1440p upscale
-            {"3840x2160", "0", "2", "2560", "1440"},   // 4: 1440p -> 4K upscale
-            {"3840x2160", "0", "2", "1920", "1080"},   // 5: 1080p -> 4K upscale
-            {"3840x2160", "0", "2", "1600", "900"},    // 6: 900p -> 4K upscale
-            {"3840x2160", "0", "0", "0",    "0"},      // 7: console dynamic 4K
-        };
-        const int idx = std::clamp(g3d.res_preset, 0, static_cast<int>(sizeof kPresets / sizeof kPresets[0]) - 1);
-        const PresetDef& pr = kPresets[idx];
+    if (g3d.dlss_preset != old_g.dlss_preset) {   // the DLSS model: live, and kept for the next start
+        extras::set_dlss_preset_live(g3d.dlss_preset.c_str());
         std::string err;
-        const bool ok = config_write("am", "resolution", pr.am_res, &err) &&
-                        config_write("xc2", "res_class", pr.res_cls, &err) &&
-                        config_write("xc2", "native_res", pr.nat_res, &err) &&
-                        config_write("xc2", "native_w", pr.nat_w, &err) &&
-                        config_write("xc2", "native_h", pr.nat_h, &err);
-        if (!ok) NXLOG_W(kTag, "cannot persist 3D resolution preset to nxrt.ini: %s", err.c_str());
-        else NXLOG_I(kTag, "3D resolution preset -> %d (%s, res_class=%s, native_res=%s, %sx%s) saved to nxrt.ini (takes effect on restart)",
-                     idx, pr.am_res, pr.res_cls, pr.nat_res, pr.nat_w, pr.nat_h);
+        if (!config_write("dlss", "preset", g3d.dlss_preset, &err)) NXLOG_W(kTag, "cannot persist [dlss] preset to nxrt.ini: %s", err.c_str());
+    }
+    if (g3d.capture != old_g.capture) {   // [nvn] mirror_capture: decided at start-up (the copies, the frame lead), so it waits for a restart
+        std::string err;
+        if (!config_write("nvn", "mirror_capture", g3d.capture, &err)) NXLOG_W(kTag, "cannot persist [nvn] mirror_capture to nxrt.ini: %s", err.c_str());
+        else NXLOG_I(kTag, "mirror_capture -> %s saved to nxrt.ini (takes effect on restart)", g3d.capture.c_str());
+    }
+    if (g3d.out_height != old_g.out_height && g3d.out_height >= 720) {   // the output resolution: what the game is told its TV is
+        char res[32];
+        std::snprintf(res, sizeof res, "%dx%d", g3d.out_height * 16 / 9, g3d.out_height);
+        std::string err;
+        if (!config_write("am", "resolution", res, &err)) NXLOG_W(kTag, "cannot persist [am] resolution to nxrt.ini: %s", err.c_str());
+        else NXLOG_I(kTag, "output resolution -> %s saved to nxrt.ini (takes effect on restart)", res);
+    }
+    // The mode is stored as intent: the runtime derives the scales and the lock from it and [am] resolution at start-up
+    // (nxrt/render_quality.h), so changing the output resolution here or in the launcher cannot leave the scales of another output.
+    if (g3d.res_preset != old_g.res_preset) {
+        const int idx = std::clamp(g3d.res_preset, 0, kRenderQualityCount - 1);
+        const RenderQuality& rq = kRenderQuality[idx];
+        std::string err;
+        // native_res off: its hooks and these scales would multiply (a 3840x2160 scene scaled again)
+        const bool ok = config_write("upscale", "render_quality", rq.key, &err) && config_write("xc2", "native_res", "0", &err) &&
+                        config_write("xc2", "res_class", "0", &err);
+        if (!ok) NXLOG_W(kTag, "cannot persist the 3D render quality to nxrt.ini: %s", err.c_str());
+        else NXLOG_I(kTag, "3D render quality -> %s saved to nxrt.ini (takes effect on restart)", rq.key);
     }
 }
 
@@ -606,10 +639,61 @@ bool jc2_owns_clicks() {
     return device_only && st.engine && ctx_in_play(st.engine->context()) && hid::jc2_mouse_active();
 }
 
+constexpr uint64_t kCursorIdleHideNs = 3000ull * kMs;
+
+void note_mouse_activity(uint64_t now) {
+    G& st = g();
+    st.last_mouse_activity_ns = now;
+    if (st.cursor_auto_hidden && st.window && !platform::relative_mouse()) {
+        st.cursor_auto_hidden = false;
+        platform::set_cursor_visible(true);
+    }
+}
+
+bool should_autohide_fullscreen_cursor(uint64_t now, bool overlay_blocks) {
+    G& st = g();
+    if (!st.window || platform::relative_mouse()) {
+        st.was_cursor_autohide_eligible = false;
+        st.cursor_auto_hidden = false;
+        return false;
+    }
+    const bool full = platform::fullscreen_mode() != platform::FullscreenMode::Windowed;
+    const bool eligible = full && platform::focused() && !platform::minimized() && !overlay_blocks;
+    if (!eligible) {
+        st.was_cursor_autohide_eligible = false;
+        st.cursor_auto_hidden = false;
+        return false;
+    }
+    if (!st.was_cursor_autohide_eligible || st.last_mouse_activity_ns == 0) {
+        st.was_cursor_autohide_eligible = true;
+        st.last_mouse_activity_ns = now;
+        st.cursor_auto_hidden = false;
+        return false;
+    }
+    const bool hide = (now >= st.last_mouse_activity_ns) && (now - st.last_mouse_activity_ns >= kCursorIdleHideNs);
+    st.cursor_auto_hidden = hide;
+    return hide;
+}
+
 void handle_event(const input::Event& e, uint64_t now) {
     G& st = g();
     using input::EventType;
     st.events++;
+    if (e.type == EventType::MouseMotion && !(e.flags & input::kFlagRelative)) {
+        const float mx = e.u.motion.x;
+        const float my = e.u.motion.y;
+        if (!st.have_cursor_pos) {
+            st.last_cursor_x = mx;
+            st.last_cursor_y = my;
+            st.have_cursor_pos = true;
+        } else if (std::fabs(mx - st.last_cursor_x) >= 1.f || std::fabs(my - st.last_cursor_y) >= 1.f) {
+            st.last_cursor_x = mx;
+            st.last_cursor_y = my;
+            note_mouse_activity(now);
+        }
+    } else if (e.type == EventType::MouseButtonDown || e.type == EventType::MouseButtonUp || e.type == EventType::MouseWheel) {
+        note_mouse_activity(now);
+    }
     // rebinding capture comes first: the page asked for the next input
     if (st.capture_state.load() == 1) {
         InputId id;
@@ -839,7 +923,8 @@ void apply_pending_settings(uint64_t now) {
         apply_frame_cap(s);                        // another window mode can mean another refresh rate (vsync cap)
     }
     // The windowed size is live while the window is windowed; in fullscreen it is the size the window goes back to (the next start).
-    if (st.window && (s.display.width != old_w || s.display.height != old_h) && platform::fullscreen_mode() == platform::FullscreenMode::Windowed)
+    if (st.window && (s.display.width != old_w || s.display.height != old_h) && s.display.width >= 320 && s.display.height >= 240 &&
+        platform::fullscreen_mode() == platform::FullscreenMode::Windowed)
         platform::set_window_size(s.display.width, s.display.height);
     std::string err;
     if (!save_settings(st.path, s, &err)) NXLOG_W(kTag, "cannot save %s: %s", st.path.c_str(), err.c_str());
@@ -1007,8 +1092,9 @@ int update_hook(::Ctx*, uint64_t, void*) {
         if (st.overlay && st.pointer_draw) st.overlay->set_pointer(menu_up && ptr.enabled() && ptr.cursor_visible(menu_up), ptr.x(), ptr.y(), true);
         // In play with the Joy-Con 2 mouse on its surface the game draws its own cursor: the OS cursor is hidden (unless the overlay is up).
         const bool game_cursor = playing && !overlay_visible && hid::jc2_mouse_active();
+        const bool auto_hide = should_autohide_fullscreen_cursor(now, overlay_visible);
         if (st.window && !platform::relative_mouse())
-            platform::set_cursor_visible(!game_cursor && (overlay_visible || !(ptr.enabled() && menu_up) || ptr.cursor_visible(menu_up)));
+            platform::set_cursor_visible(!auto_hide && !game_cursor && (overlay_visible || !(ptr.enabled() && menu_up) || ptr.cursor_visible(menu_up)));
         if (st.window) {   // the Joy-Con 2 mouse (hid): the pointer on the picture, the buttons and the wheel
             hid::HostMouse hm;
             bool inside = false;
@@ -1056,6 +1142,7 @@ void keyboard_service() {
     if (!swkbd && st.hook_update != 0) return;
     const uint64_t now = now_ns();
     platform::pump_events();          // also headless (scripted runs): SDL's virtual pads update here
+    if (st.window && st.quit_on_close && platform::quit_requested()) quit_now("exit requested");
     if (st.window) g_last_pump_ms.store(t, std::memory_order_relaxed);
     apply_pending_settings(now);
     apply_unfocused_mute();
@@ -1077,6 +1164,10 @@ void keyboard_service() {
         const size_t got = input::queue_drain(buf, 64);
         if (!got) break;
         for (size_t i = 0; i < got; ++i) handle_event(buf[i], now);
+    }
+    if (st.window && !platform::relative_mouse()) {
+        const bool overlay_blocks = swkbd || (st.overlay && st.overlay->blocks_game());
+        platform::set_cursor_visible(!should_autohide_fullscreen_cursor(now, overlay_blocks));
     }
     if (swkbd) {
         poll_pads(now);
@@ -1225,6 +1316,10 @@ public:
     bool reserved_key(const InputId& id) const override {
         G& st = g();
         return st.overlay && id.kind == InKind::Key && id.code == st.overlay->toggle_scancode();
+    }
+    void request_exit() override {
+        diag_set_exiting();
+        platform::request_quit();
     }
 };
 Host g_host;
@@ -1469,7 +1564,10 @@ bool start(const StartOptions& opt) {
     {   // display options: the internal resolution comes from the window as it is now (after the window mode change above)
         int ww = 0, wh = 0;                    // no window (headless, test runs): the configured window size, not a made-up one
         if (st.window) platform::pixel_size(&ww, &wh);
-        if (ww <= 0 || wh <= 0) { ww = st.settings.display.width; wh = st.settings.display.height; }
+        if (ww <= 0 || wh <= 0) {
+            ww = st.settings.display.width > 0 ? st.settings.display.width : 1280;
+            wh = st.settings.display.height > 0 ? st.settings.display.height : 720;
+        }
         display_tuning(st.settings.display);
         nvn::set_keep_aspect(st.settings.display.keep_aspect);
         if (gp && gp->install_render) gp->install_render(st.base, st.settings.display, ww, wh);   // the game's display options, tone curve

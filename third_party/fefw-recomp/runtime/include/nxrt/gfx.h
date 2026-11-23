@@ -121,6 +121,8 @@ struct DeviceFeatures {
     bool image_cube_array = false, shader_draw_parameters = false, sampler_mirror_clamp_to_edge = false;
     bool descriptor_indexing = false, host_query_reset = false;
     bool fragment_shader_interlock = false, depth_clip_control = false, depth_clip_enable = false, custom_border_color = false;
+    bool early_and_late_fragment_tests_amd = false;
+    bool attachment_feedback_loop_layout = false;
     bool extended_dynamic_state3 = false, vertex_input_dynamic_state = false;
     bool graphics_pipeline_library = false;   // VK_EXT_graphics_pipeline_library (pipelines linked from separately compiled parts, S24)
     bool external_memory_host = false, push_descriptor = false;
@@ -140,6 +142,7 @@ struct DeviceFeatures {
     bool present_id = false;              // VK_KHR_present_id (feature presentId)
     bool low_latency2 = false;            // VK_NV_low_latency2 (NVIDIA Reflex)
     bool anti_lag = false;                // VK_AMD_anti_lag (AMD Anti-Lag 2)
+    bool memory_budget = false;           // VK_EXT_memory_budget
 };
 
 struct DeviceLimitsExt {

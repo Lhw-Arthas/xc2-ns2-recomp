@@ -126,7 +126,7 @@ bool in_map_region(uint64_t addr, uint64_t size) {
     // sdk asks for MapSharedMemory at a randomly picked address and picked 0x7455cb0000, in the gap between main's image and the
     // SDK base (HANDOVER 90). alias_alloc() still refuses anything the host already has mapped (the images, the heap view, the
     // stacks, the kernel region), so the guard that matters stays.
-    return within(addr, size, kMapRegionBase, mem::kSdkBase - kMapRegionBase) || within(addr, size, mem::kAliasBase, mem::kAliasSize);
+    return within(addr, size, kMapRegionBase, mem::kSdkBase - kMapRegionBase) || within(addr, size, mem::alias_base(), mem::kAliasSize);
 }
 
 std::map<uint64_t, uint64_t> g_reserve_base;   // window address -> base of its host reservation (differs when addr is not 64 KiB aligned)
@@ -396,7 +396,7 @@ void map_memory(::Ctx* c) {
     // The source is heap memory, a module's .data/.bss (CodeData) or - retail 3.0.1 - memory VAMM handed out in the alias region:
     // the game maps its thread stacks out of the region nn::os::AllocateAddressRegion gave it, not out of the heap
     // (MapMemory(0x7c8b9a4000, 0x30c1340000, 0x40000) refused with 0xD401, HANDOVER 90).
-    const bool src_vamm = within(src, size, mem::kAliasBase, mem::kAliasSize);
+    const bool src_vamm = within(src, size, mem::alias_base(), mem::kAliasSize);
     if (!in_stack(dst, size) || !(in_heap(src, size, heap_now()) || src_code_data || src_vamm) || !mem::is_mapped(src, size)) {
         fail(c, "MapMemory (range)", kernel::kInvalidMemoryState, dst, src, size);
         return;
@@ -769,7 +769,16 @@ void map_physical_memory(::Ctx* c) {
             // 90.5c/90.8), and on 2026-11-19 11:00 the title died at 5.4 s on 0x22d5800000 before the first frame.
             const bool host_busy = it == g_phys.end() && !granule_free(g);
             if (host_busy) {
-                NXLOG_W(kTag, "MapPhysicalMemory: %llx is not host-free (asked %llx+%llx)", U(busy_page), U(addr), U(size));
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(reinterpret_cast<const void*>(busy_page), &mbi, sizeof mbi) == sizeof mbi) {
+                    NXLOG_W(kTag,
+                            "MapPhysicalMemory: %llx is not host-free (asked %llx+%llx; host block %p+%llx alloc %p state 0x%lx protect 0x%lx type 0x%lx)",
+                            U(busy_page), U(addr), U(size), mbi.BaseAddress, static_cast<unsigned long long>(mbi.RegionSize),
+                            mbi.AllocationBase, static_cast<unsigned long>(mbi.State), static_cast<unsigned long>(mbi.Protect),
+                            static_cast<unsigned long>(mbi.Type));
+                } else {
+                    NXLOG_W(kTag, "MapPhysicalMemory: %llx is not host-free (asked %llx+%llx)", U(busy_page), U(addr), U(size));
+                }
             } else {
                 const mem::VmInfo why = mem::vm_query(busy_page);
                 NXLOG_W(kTag, "MapPhysicalMemory: %llx is held by a %s block %llx+%llx (asked %llx+%llx)", U(busy_page),

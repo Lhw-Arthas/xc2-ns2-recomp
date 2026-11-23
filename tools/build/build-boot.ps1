@@ -138,12 +138,44 @@ if (Test-Path -LiteralPath $ffCache) {
         }
     }
 }
+# Optional local Windows application icon: if a user places xc2_icon.ico / mythra_ns2_301.ico / mythra_icon.ico
+# in the boot output directory (or xc2\build\boot), compile a tiny .res with llvm-rc/rc and embed it as IDI_ICON1 (1)
+# so the Windows 11 taskbar, Alt+Tab, Task Manager and Explorer show it natively. Never requires committing any art.
+$iconRes = @()
+$iconCandidates = @()
+foreach ($dir in @($bd, (Join-Path $root 'build\boot'))) {
+    foreach ($nm in 'xc2_icon.ico', 'mythra_ns2_301.ico', 'mythra_icon.ico') {
+        $iconCandidates += (Join-Path $dir $nm)
+    }
+}
+$foundIco = $iconCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if ($foundIco) {
+    $rcTool = (Get-Command llvm-rc.exe, rc.exe -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($rcTool) {
+        $rcFile = Join-Path $bd 'xc2_icon.rc'
+        $resFile = Join-Path $bd 'xc2_icon.res'
+        $icoEsc = $foundIco.Replace('\', '\\')
+        Set-Content -LiteralPath $rcFile -Value "1 ICON `"$icoEsc`"" -Encoding Ascii
+        if ($rcTool.Name -ieq 'llvm-rc.exe') {
+            & $rcTool.Source /FO $resFile $rcFile
+        } else {
+            & $rcTool.Source /nologo /fo $resFile $rcFile
+        }
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $resFile)) {
+            $iconRes = @($resFile)
+            Write-Host ('icon      : ' + $foundIco)
+        } else {
+            Write-Warning ("icon resource compile failed for $foundIco (continuing without embedded icon)")
+        }
+    }
+}
+
 $exe = Join-Path $bd 'xc2_boot.exe'
 # A linker map next to the exe: the runtime reads it (diag/symbols.cpp) and names the frames of every thread dump and crash
 # backtrace instead of printing bare offsets. Without it a dump says "xc2_boot+0x8383d" and nothing else - and the PDB of this
 # exe is 492 MB and only exists for the MSVC release build, never for this one (2026-11-22).
 $mapFile = Join-Path $bd 'xc2_boot.map'
-& clang-cl.exe /nologo /MT "/Fe:$exe" $obj $objOpus $objAudio `
+& clang-cl.exe /nologo /MT "/Fe:$exe" $obj $objOpus $objAudio @iconRes `
     "$gfxDir\nxrt_gfx.lib" "$gfxDir\nxrt.lib" "$game\nxrt_game_xc2ns2_core.lib" "$game\nxrt_game_xc2ns2_data.lib" `
     $mainlib (Join-Path $libdir 'sdk.lib') `
     (Join-Path $libdir 'subsdk0.lib') (Join-Path $libdir 'rtld.lib') @extraLibs @vpxLibs @vorbisLibs @ffLibs `

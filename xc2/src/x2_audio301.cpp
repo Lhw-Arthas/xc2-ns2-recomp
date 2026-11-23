@@ -113,7 +113,7 @@ bool open_stream(Ctx* c, uint64_t g, uint64_t fmt_p, int cap, uint64_t event) {
     // release event of a stream is.
     if (event) {
         const uint64_t create = nxrt::nxmodule_find_export("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
-        uint64_t a[3] = {event, 0 /* AutoClear */, 0};
+        uint64_t a[3] = {event, 1 /* EventClearMode_AutoClear */, 0};
         const uint64_t r = call(c, create, 3, a);
         NXLOG_W(kTag, "stream event 0x%llx created (0x%llx)", static_cast<unsigned long long>(event), static_cast<unsigned long long>(r));
     }
@@ -194,7 +194,17 @@ void write_stream(Ctx* c) {   // (g, void* data, int frames)
         std::memcpy(s->pcm.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(data)), n * 2);
     }
     uint32_t wrote = 0;
-    if (auto sink = nxrt::audio::sink()) wrote = sink->write(s->pcm.data(), static_cast<uint32_t>(frames));
+    uint32_t queued = 0;
+    if (auto sink = nxrt::audio::sink()) {
+        wrote = sink->write(s->pcm.data(), static_cast<uint32_t>(frames));
+        queued = sink->queued_frames();
+    }
+    if (wrote > 0) {
+        std::lock_guard lk(g_mu);
+        if (Stream* cur = g_streams.count(c->x[0]) ? g_streams[c->x[0]] : nullptr) {
+            if (queued > cur->last_queued) cur->last_queued = queued;
+        }
+    }
     c->x[0] = wrote;
 }
 
@@ -210,9 +220,10 @@ void watch_loop() {
             std::lock_guard lk(g_mu);
             if (g_streams.empty()) continue;
             for (auto& [g, s] : g_streams) {
-                if (!s->event) continue;
-                if (s->last_queued == 0) s->last_queued = queued;
-                else if (queued < s->last_queued) {
+                if (!s->event || s->state != 2) continue;
+                if (queued > s->last_queued) {
+                    s->last_queued = queued;
+                } else if (queued < s->last_queued) {
                     s->last_queued = queued;
                     wake.push_back(s->event);
                 } else if (queued == 0) {

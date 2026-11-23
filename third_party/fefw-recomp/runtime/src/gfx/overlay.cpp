@@ -545,6 +545,7 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
         c[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.085f, 0.135f, 0.94f);
         c[ImGuiCol_ChildBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
         c[ImGuiCol_PopupBg] = ImVec4(0.06f, 0.10f, 0.16f, 0.97f);
+        c[ImGuiCol_ModalWindowDimBg] = ImVec4(0.02f, 0.035f, 0.06f, 0.60f);   // behind a dialog: the window colour, darker (the default is a light grey veil)
         c[ImGuiCol_Border] = ImVec4(0.22f, 0.46f, 0.54f, 0.45f);
         c[ImGuiCol_Text] = ImVec4(0.94f, 0.96f, 0.98f, 1.0f);
         c[ImGuiCol_TextDisabled] = ImVec4(0.58f, 0.66f, 0.74f, 1.0f);
@@ -1287,21 +1288,24 @@ void Overlay::Impl::refresh_perf_hud(double now_s) {
     // 3. VRAM via Vulkan VK_EXT_memory_budget (fallback: device vram_bytes)
     if (ctx.device && ctx.device->physical() != VK_NULL_HANDLE) {
         constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
-        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-        VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
-        props.pNext = &budget;
-        vkGetPhysicalDeviceMemoryProperties2(ctx.device->physical(), &props);
-        uint64_t total_vram = 0, used_vram = 0;
-        for (uint32_t i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
-            if (props.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-                total_vram += props.memoryProperties.memoryHeaps[i].size;
-                used_vram += budget.heapUsage[i];
+        if (ctx.device->features().memory_budget) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+            props.pNext = &budget;
+            vkGetPhysicalDeviceMemoryProperties2(ctx.device->physical(), &props);
+            uint64_t total_vram = 0, used_vram = 0;
+            for (uint32_t i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+                if (props.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                    total_vram += props.memoryProperties.memoryHeaps[i].size;
+                    used_vram += budget.heapUsage[i];
+                }
+            }
+            if (total_vram > 0) {
+                perf.vram_total_gb = static_cast<double>(total_vram) / kGiB;
+                perf.vram_used_gb = static_cast<double>(used_vram) / kGiB;
             }
         }
-        if (total_vram > 0) {
-            perf.vram_total_gb = static_cast<double>(total_vram) / kGiB;
-            perf.vram_used_gb = static_cast<double>(used_vram) / kGiB;
-        } else {
+        if (perf.vram_total_gb <= 0.0) {
             perf.vram_total_gb = static_cast<double>(ctx.device->gpu().vram_bytes) / kGiB;
         }
     }

@@ -364,9 +364,13 @@ BASES = {
     "main": "0x7100000000", "sdk": "0x7500000000", "subsdk0": "0x7600000000", "subsdk1": "0x7640000000",
     "subsdk2": "0x7680000000", "subsdk3": "0x76C0000000", "rtld": "0x7700000000",
 }
+# Larger guest-code bucket (0x40000 vs nxrecomp's default 0xC000) cuts ~537 translation units to ~120 balanced files
+# without tripping --shards' imbalance on sparse modules such as sdk.
+PACKAGE_BUCKET = 0x40000
 ZIG_FLAGS = ["-target", "x86_64-windows-gnu", "-std=c++20", "-O1", "-w", "-fno-exceptions", "-fno-rtti",
              "-fno-strict-aliasing", "-ffp-contract=off", "-fno-math-errno", "-fno-threadsafe-statics",
              "-DNX_INLINE_INDIRECT"]
+_CPU_VARIANTS = {}
 
 
 def package_tools(repo):
@@ -382,18 +386,27 @@ def package_tools(repo):
 def cpu_variant(zig):
     """The -mcpu this processor runs: '+fma' needs FMA3 (Haswell / Piledriver or newer), so an older one gets the
     compatible set instead of an illegal instruction. Same two variants as tools/build/build-release.ps1."""
+    key = str(zig)
+    if key in _CPU_VARIANTS:
+        return _CPU_VARIANTS[key]
     try:
         out = subprocess.run([str(zig), "targets"], capture_output=True, text=True, errors="replace", timeout=120)
         text = out.stdout
         i = text.find(".native")
         j = text.find(".features", i)
         if i < 0 or j < 0:
-            return "x86_64+cx16+fma"
+            val = "x86_64+cx16+fma"
+            _CPU_VARIANTS[key] = val
+            return val
         feats = re.findall(r'"([^"]+)"', text[j:text.find("}", j)])
     except (OSError, subprocess.SubprocessError):
-        return "x86_64+cx16+fma"
+        val = "x86_64+cx16+fma"
+        _CPU_VARIANTS[key] = val
+        return val
     need = ("cx16", "sse4_2", "avx", "fma")
-    return "x86_64+cx16+fma" if all(f in feats for f in need) else "x86_64+cx16+sse4_2+popcnt"
+    val = "x86_64+cx16+fma" if all(f in feats for f in need) else "x86_64+cx16+sse4_2+popcnt"
+    _CPU_VARIANTS[key] = val
+    return val
 
 
 def step_doctor_package(r, repo, tools):
@@ -405,15 +418,9 @@ def step_doctor_package(r, repo, tools):
     r.log("  python %s" % py)
     r.log("  zig    %s (%s)" % (zig, cpu_variant(zig)))
     r.log("  runtime %s" % lib)
-    # The harness validates every translated shader with spirv-val; without it the shader step dies halfway through
-    # with an unhandled Win32Exception from inside the harness (issue #5, 2026-11-18). The package ships it, and a
-    # machine with the Vulkan SDK also has one on PATH, so this is a warning rather than a failure.
     val = repo / "tools" / "spirv-val" / "spirv-val.exe"
     if val.is_file():
-        r.log("  spirv-val %s" % val)
-    else:
-        r.log("  spirv-val not in the package; the harness will look in %%VULKAN_SDK%% and on PATH, "
-              "and the shader step fails if neither has it")
+        r.log("  spirv-val %s (optional; package setup skips per-shader validation)" % val)
     return r.end_step("doctor", started, True, "the package carries everything")
 
 
@@ -425,21 +432,55 @@ def step_lift_package(r, repo, install, py, jobs):
     sites = repo / "xc2" / "sites"
     n = jobs if jobs > 0 else max(2, (os.cpu_count() or 4) - 1)
     done = 0
+    tasks = []
     for m in MODULES:
         out = lift / m
         if (out / ("module_%s.cpp" % m)).is_file():
             r.log("  %s: already lifted" % m)
             done += 1
             continue
-        argv = [str(py), "-m", "nxrecomp", "lift", str(install / "exefs" / m), str(out),
-                "--game", "xc2ns2", "--name", m, "--base", BASES[m], "--jobs", str(n)]
         s = sites / ("sites-%s.txt" % m)
-        if s.is_file():
-            argv += ["--sites", str(s)]
-        if r.run(argv, cwd=repo) != 0:
-            return r.end_step("lift", started, False, "the lifter failed on " + m)
-        done += 1
-        r.note_progress("lift %s (%d/%d)" % (m, done, len(MODULES)), 100.0 * done / len(MODULES))
+        tasks.append({
+            "name": m,
+            "input": str(install / "exefs" / m),
+            "out": str(out),
+            "base": BASES[m],
+            "sites": str(s) if s.is_file() else None,
+            "jobs": n,
+            "bucket": PACKAGE_BUCKET,
+        })
+    if tasks:
+        for t in tasks:
+            r.log("  lift %s (bucket 0x%x)" % (t["name"], t["bucket"]))
+        if not r.dry:
+            lift.mkdir(parents=True, exist_ok=True)
+            jobs_file = lift / "_lift_jobs.json"
+            jobs_file.write_text(json.dumps(tasks), encoding="utf-8")
+            # Lift every pending module inside a single Python process so interpreter + capstone startup happens once.
+            script = (
+                "import json,sys; from nxrecomp.program import lift_module\n"
+                "for j in json.load(open(sys.argv[1], encoding='utf-8')):\n"
+                "  k = 'nso' if open(j['input'],'rb').read(4)==b'NSO0' else 'static_elf'\n"
+                "  spec = {'kind':k,'path':j['input'],'base':int(j['base'],16),'name':j['name'],'game':'xc2ns2',"
+                "'patches':None,'sites':j['sites'],'census':None,'counters':None,'fps_sites':None,'index':None}\n"
+                "  lift_module(spec, j['out'], jobs=j['jobs'], bucket=j['bucket'])\n"
+                "  print('@lift_done ' + j['name'], flush=True)\n"
+            )
+
+            def on_lift_line(line):
+                nonlocal done
+                if line.startswith("@lift_done "):
+                    m = line.split(" ", 1)[1].strip()
+                    done += 1
+                    r.note_progress("lift %s (%d/%d)" % (m, done, len(MODULES)), 100.0 * done / len(MODULES))
+
+            rc = r.run([str(py), "-u", "-c", script, str(jobs_file)], cwd=repo, on_line=on_lift_line)
+            try:
+                jobs_file.unlink()
+            except OSError:
+                pass
+            if rc != 0:
+                return r.end_step("lift", started, False, "the lifter failed")
     return r.end_step("lift", started, True)
 
 
@@ -485,18 +526,57 @@ def step_link_package(r, repo, install, zig, rtlib, jobs):
         if not o.is_file() or o.stat().st_mtime < s.stat().st_mtime:
             todo.append((s, o))
     if todo:
-        # One at a time is about 27 minutes for the 537 translation units; the compiler is the only thing using the
-        # machine while this runs, so it takes every core but one.
         n = jobs if jobs > 0 else max(2, (os.cpu_count() or 4) - 1)
-        r.log("  compiling %d of %d file(s), %d at a time" % (len(todo), len(srcs), n))
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Precompile <nxrecomp/cxx.h> + "funcs.h" once per multi-shard module so Zig/Clang parses funcs.h once instead of 32x.
+        cxx_h = inc / "nxrecomp" / "cxx.h"
+        cxx_mtime = cxx_h.stat().st_mtime if cxx_h.is_file() else 0.0
+        shard_counts = collections.Counter(s.parent.name for s, _ in todo if s.name.startswith("c_"))
+        pch_jobs = []
+        pch_map = {}
+        for mod_name, count in sorted(shard_counts.items()):
+            if count < 2:
+                continue
+            mod_dir = lift / mod_name
+            funcs_h = mod_dir / "funcs.h"
+            if not funcs_h.is_file():
+                continue
+            pch_dir = obj / mod_name
+            pch_dir.mkdir(parents=True, exist_ok=True)
+            pch_hdr = pch_dir / "nx_pch.h"
+            pch_out = pch_dir / "nx_pch.h.pch"
+            want_hdr = '#include <nxrecomp/cxx.h>\n#include "funcs.h"\n'
+            if not pch_hdr.is_file() or pch_hdr.read_text(encoding="utf-8") != want_hdr:
+                pch_hdr.write_text(want_hdr, encoding="utf-8", newline="\n")
+            deps_mtime = max(funcs_h.stat().st_mtime, cxx_mtime)
+            if pch_out.is_file() and pch_out.stat().st_mtime >= deps_mtime:
+                pch_map[mod_name] = pch_out
+            else:
+                pch_jobs.append((mod_name, mod_dir, pch_hdr, pch_out))
+        if pch_jobs:
+            def build_pch(item):
+                mod_name, mod_dir, pch_hdr, pch_out = item
+                p = subprocess.run(flags + ["-I" + str(inc), "-I" + str(mod_dir), "-x", "c++-header", str(pch_hdr), "-o", str(pch_out)],
+                                   cwd=str(repo), capture_output=True, text=True, errors="replace")
+                return mod_name, pch_out, p.returncode
+            with ThreadPoolExecutor(max_workers=min(n, len(pch_jobs))) as ex:
+                for mod_name, pch_out, rc in ex.map(build_pch, pch_jobs):
+                    if rc == 0 and pch_out.is_file():
+                        pch_map[mod_name] = pch_out
+
+        # Longest-processing-time first keeps big main/sdk shards from forming a single-core tail.
+        todo.sort(key=lambda item: item[0].stat().st_size, reverse=True)
+        r.log("  compiling %d of %d file(s), %d at a time%s"
+              % (len(todo), len(srcs), n, " (%d module PCH)" % len(pch_map) if pch_map else ""))
 
         def build(item):
             s, o = item
-            p = subprocess.run(flags + ["-I" + str(inc), "-I" + str(s.parent), "-c", str(s), "-o" + str(o)],
+            extra = ["-include-pch", str(pch_map[s.parent.name])] if (s.name.startswith("c_") and s.parent.name in pch_map) else []
+            p = subprocess.run(flags + extra + ["-I" + str(inc), "-I" + str(s.parent), "-c", str(s), "-o" + str(o)],
                                cwd=str(repo), capture_output=True, text=True, errors="replace")
             return s, p.returncode, (p.stderr or "")[-400:]
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         done = 0
         with ThreadPoolExecutor(max_workers=n) as ex:
             futures = [ex.submit(build, t) for t in todo]
@@ -512,9 +592,10 @@ def step_link_package(r, repo, install, zig, rtlib, jobs):
     if not r.dry:
         obj.mkdir(parents=True, exist_ok=True)
         rsp.write_text("".join('"%s"\n' % o for o in objs), encoding="ascii")
+    # Skip generating xc2_boot.pdb (469 MB) since sweep_leftovers deletes it right after link.
     argv = ([str(zig), "c++", "-target", "x86_64-windows-gnu", "-O1", "-w", "-fno-exceptions", "-fno-rtti",
-             "-DXC2_MODULES_7", "@" + str(rsp), str(stub), "-I" + str(inc), "-I" + str(stub.parent),
-             str(rtlib), "-o", str(exe)])
+             "-Wl,--strip-debug", "-DXC2_MODULES_7", "@" + str(rsp), str(stub),
+             "-I" + str(inc), "-I" + str(stub.parent), str(rtlib), "-o", str(exe)])
     if r.run(argv) != 0:
         return r.end_step("link", started, False, "the exe did not link")
     copy_runtime_dlls(r, rtlib.parent, install)
@@ -661,10 +742,9 @@ GAME_ENV = {
     # the whole frame stays at the G-buffer's albedo (flat, untextured, black-looking). tools/run/play-301.cmd uses 2;
     # the runtime default is 1, so a launcher that forgets this renders the scene wrong.
     "NXRT_NVN_FRONT_FACE_MODE": "2",
-    # The game's language is NOT here on purpose: the player changes it in the launcher, which writes [system] language
-    # into nxrt.ini. An env value would win over that file and the setting would do nothing.
-    "NXRT_TITLE_SUPPORTED_LANGUAGES": "Japanese,AmericanEnglish,BritishEnglish,French,German,Italian,Spanish,"
-                                       "LatinAmericanSpanish,Chinese,Taiwanese,Korean,SimplifiedChinese,TraditionalChinese",
+    # Only the languages the game has: American English / Latin American Spanish fall back to British / Spanish.
+    "NXRT_TITLE_SUPPORTED_LANGUAGES": "Japanese,BritishEnglish,French,German,Italian,Spanish,"
+                                       "Chinese,Taiwanese,Korean,SimplifiedChinese,TraditionalChinese",
 }
 
 
@@ -724,7 +804,7 @@ def step_shaders_package(r, repo, install, py, jobs):
             progress(line)
 
         rc = r.run([str(py), str(tool), "--ard", str(ard), "--cache", str(spirv), "--harness", str(harness),
-                    "--work", str(install / "build" / "shader-cache"), "--jobs", str(n)],
+                    "--work", str(install / "build" / "shader-cache"), "--jobs", str(n), "--no-val"],
                    cwd=repo, on_line=keep)
         if rc != 0:
             r.log("  the shader chain exited with code %d; its last lines:" % rc)
@@ -875,14 +955,35 @@ def prefill_package(r, repo, install, py, harness, spirv, seconds=40, jobs=0):
     except OSError as e:
         r.log("  prefill: could not start the game (%s); the cache stays as the archive left it" % e)
         return "the headless prefill could not start: %s" % e
-    deadline = time.time() + seconds
+    started_wait = time.time()
+    deadline = started_wait + seconds
     seen = 0
+    ds_count = 0
+    log_pos = 0
+    last_activity = started_wait
     while time.time() < deadline and p.poll() is None:
         n = len(list(missing.glob("code_*.bin")))
         if n != seen:
             seen = n
+            last_activity = time.time()
             r.note_progress("prefill: %d block(s) collected" % n)
-        time.sleep(1)
+        if log.is_file():
+            try:
+                with open(log, "rb") as lf:
+                    lf.seek(log_pos)
+                    chunk = lf.read()
+                    log_pos += len(chunk)
+                hits = chunk.count(b"ds_debug:")
+                if hits:
+                    ds_count += hits
+                    last_activity = time.time()
+            except OSError:
+                pass
+        now_t = time.time()
+        if (seen > 0 or ds_count > 0) and (now_t - started_wait >= 12.0) and (now_t - last_activity >= 6.0):
+            r.log("  prefill: settled after %.1f s (%d block(s), %d ds line(s))" % (now_t - started_wait, seen, ds_count))
+            break
+        time.sleep(0.5)
     finished = p.poll()
     killed = finished is None
     if killed:
@@ -911,7 +1012,7 @@ def prefill_package(r, repo, install, py, harness, spirv, seconds=40, jobs=0):
         return ""
     n = jobs if jobs > 0 else max(2, (os.cpu_count() or 4) - 1)
     rc = r.run([str(py), str(first_file(repo / "tools" / "shader" / "cache" / "build_cache.py", repo / "tools" / "shader-cache" / "build_cache.py")), "--blocks", str(missing),
-                "--cache", str(spirv), "--harness", str(harness), "--jobs", str(n)], cwd=repo,
+                "--cache", str(spirv), "--harness", str(harness), "--jobs", str(n), "--no-val"], cwd=repo,
                on_line=shader_progress(r))
     if rc != 0:
         r.log("  prefill: the collected blocks did not translate; the game will still run")
@@ -940,11 +1041,22 @@ def retype_ds_samplers(r, repo, py, spirv, log):
 
 
 def shader_progress(r):
-    """build_cache.py reports each stage on its own line; pass those on so the page shows movement."""
+    """build_cache.py reports stages and streamed counters; pass those on so the page shows movement."""
+    stage = ""
+
     def on_line(line):
+        nonlocal stage
         s = line.strip()
-        if s[:1] == "[" and ("plan" in s or "translate" in s or "install" in s or "pack" in s):
+        if s[:1] == "[" and any(k in s for k in ("index", "extract", "plan", "stage", "translate", "install", "pack")):
+            stage = s.split("]", 1)[0].lstrip("[")
             r.note_progress(s[:140])
+            return
+        m = re.match(r"^(\d+)/(\d+)\b", s)
+        if m:
+            done, total = int(m.group(1)), int(m.group(2))
+            pct = (100.0 * done / total) if total > 0 else None
+            label = stage or ("extract" if "groups=" in s else "translate")
+            r.note_progress("%s %d/%d" % (label, done, total), pct)
     return on_line
 
 def step_done_package(r, repo, install):

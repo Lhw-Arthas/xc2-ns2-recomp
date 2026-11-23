@@ -37,14 +37,21 @@ Inside a mod's folder the following are found in addition to the plain layout, i
 
 ```
 <mod>\romfs
-<mod>\atmosphere\contents\0100E95004039000\romfs
-<mod>\contents\0100E95004039000\romfs
-<mod>\0100E95004039000\romfs
+<mod>\atmosphere\contents\0100E95004038000\romfs
+<mod>\contents\0100E95004038000\romfs
+<mod>\0100E95004038000\romfs
 ```
 
 and the same places for `exefs` and `cheats`; `atmosphere\exefs_patches\<name>\` is accepted for code patches.
-`0100E95004039000` is the base title id of this game (the add-ons are `0100E95004039001` … `07`); files under
-another title id are ignored, so a mod folder can hold several games' content without us serving the wrong one.
+
+**Which id goes in that folder.** `0100E95004038000` is the application (the same title as the Switch 1 release,
+update 1114112); its Switch 2 program is `0400E95004038001`, and that is what the lift recompiles. An emulator
+layout names the **application id** for base-game content, which is why the three lines above use it. The add-on
+packs are their own titles — `0100E95004039001` … `063` (the retail set is not contiguous) — and a mod that
+replaces a file *inside a pack* is placed under that pack's id instead.
+
+Files under any other title id are ignored, so one mod folder can hold content for several games without us
+serving the wrong one.
 
 ## Order and switches
 
@@ -139,12 +146,69 @@ schema, not an installer.
 No mod, cheat or extracted asset ships with this project or its releases. Mods are the player's own files, exactly
 like the dump the game is built from; the project only provides the loader.
 
+## How the overlay is applied (M1, built)
+
+The game parses the RomFS tables itself, and this runtime synthesises those tables from a host folder. The overlay
+is therefore folded in **when the image is built**, before the tables are laid out: a mod's file replaces the host
+path of the entry at the same logical path, and nothing is looked up at run time.
+
+```
+[fs] mods       = mods          the folder of mod folders
+[mods] order    = A,B           highest priority first; unnamed folders follow alphabetically
+[mods] disabled = C             not loaded; logged as disabled
+```
+
+Only the **game's own** romfs gets the overlay - every add-on pack builds its own image through the same code, and
+laying the mods over those as well would put each file in seven storages. The build log reports each mod:
+
+```
+mods: TestMod: 1 file(s), 1 replaced, 0 added
+mods: 1 enabled, 0 disabled, 0 named in [mods] order
+```
+
+## Files inside the archive (M2, built)
+
+The game reads an archive file as 48 bytes of header at the record offset, then the comp bytes the header states.
+A mod therefore ships a pre-built record instead of a plain file:
+
+    mods/<mod>/.ard/<name>.rec
+
+`tools/mods/ard_pack.py` builds it: the original header with `unc` set to the mod file's size, `comp` and the
+checksum left alone, followed by the zlib stream padded to `comp`. Keeping comp means the game's read lengths
+stay valid; keeping the checksum means an id that the engine may key on does not change.
+
+Two limits of this first version:
+
+* the mod file must compress into the original comp - a 512-to-2048 texture swap will not, and is reported rather
+  than truncated;
+* only the record the game asks for by that name is replaced, one .rec per file.
+
+The next step (M2b) appends oversized records after the archive and repoints an in-memory copy of `bf2.arh`, which
+lifts the size limit.
+
+## The asset catalog (M0, built)
+
+Where a mod can put a file depends on where the game reads it from, and most of this game's assets are inside
+`bf2.ard` rather than loose on the romfs. `tools/mods/asset_index.py` writes one table of every file the game can
+read — loose romfs files, the archive's records, and each add-on pack:
+
+```
+work/mods/assets.tsv        source, path, kind, size, unc, comp, offset, checksum, sha256
+work/mods/assets-summary.json
+```
+
+`source` is `romfs`, `ard` or `dlc:<id>`. The tooling and its contract live in
+[`tools/mods/README.md`](../tools/mods/README.md); the output is derived from the player's dump and is never
+committed.
+
 ## Implementation order
 
 | step | what | state |
 |---|---|---|
-| M1 | `mods\<name>\romfs\` overlay for loose files, load report, order and switches | not started |
-| M1.5 | the emulator layouts above | not started |
-| M2 | the archive index in the runtime: files inside `bf2.ard`, the "not found" check | not started |
+| M0 | the asset catalog: romfs + `bf2.ard` + add-on content → `work/mods/assets.tsv` | **built** (`tools/mods/asset_index.py`) |
+| M0.5 | the porting check: `tools/mods/mod_check.py` says, per file, `same` / `differs` / `only-archive` / `absent` | **built** |
+| M1 | a mod folder's `romfs` laid over the game's, load report, `[mods] order` / `[mods] disabled` | **built** (folded into the image tables, `fs_romfs.cpp`) |
+| M1.5 | the emulator layouts, filtered by application id | **built** (`mod_romfs_root()`) |
+| M2 | files inside `bf2.ard`: a mod file becomes a pre-built record (`tools/mods/ard_pack.py`), served at read time | **built (v1)** |
 | M3 | `.pchtxt` / `.ips` applied at Set up | not started |
 | M4 | the size table, cheats, `mod.json` options | not started |

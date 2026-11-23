@@ -62,8 +62,9 @@ constexpr const char* kWindowModeKeys[kWindowModeCount] = {"windowed", "borderle
 constexpr const char* kWindowModeZh[kWindowModeCount] = {"窗口模式", "无边框全屏", "独占全屏"};
 constexpr const char* kWindowModeEn[kWindowModeCount] = {"Windowed", "Borderless", "Exclusive"};
 
-constexpr int kSizePresets[][2] = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
-constexpr const char* kSizeLabels[] = {"1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
+constexpr int kSizePresets[][2] = {{0, 0}, {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
+constexpr const char* kSizeLabelsZh[] = {"自动 (显示器 / 上限 1440p)", "1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
+constexpr const char* kSizeLabelsEn[] = {"Auto (Display / max 1440p)", "1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
 constexpr int kSizePresetCount = static_cast<int>(sizeof kSizePresets / sizeof kSizePresets[0]);
 
 constexpr int kFpsChoices[] = {-1, 0, 30, 60, 72, 90, 120, 144, 165, 240, 360};
@@ -106,43 +107,48 @@ constexpr const char* kHdrFmtEn[] = {"Auto", "HDR10", "scRGB"};
 constexpr const char* kLatencyZh[] = {"关闭", "自动", "开启", "增强 (Boost)"};
 constexpr const char* kLatencyEn[] = {"Off", "Auto", "On", "Boost"};
 
-constexpr const char* kGameResZh[] = {
-    "4K 真原生 (3840x2160)",
-    "1440p 原生 (2560x1440，不超分)",
-    "1080p 原生 (1920x1080，不超分)",
-    "1080p -> 1440p 超分 (2K 屏推荐)",
-    "1440p -> 4K 超分 (4K 屏推荐)",
-    "1080p -> 4K 超分",
-    "900p -> 4K 超分",
-    "主机原版动态 4K",
-};
-constexpr const char* kGameResEn[] = {
-    "4K Native (3840x2160)",
-    "1440p Native (2560x1440, No Upscale)",
-    "1080p Native (1920x1080, No Upscale)",
-    "1080p -> 1440p Upscale (2K Display)",
-    "1440p -> 4K Upscale (4K Display)",
-    "1080p -> 4K Upscale",
-    "900p -> 4K Upscale",
-    "Console Dynamic 4K",
-};
-constexpr int kGameResCount = static_cast<int>(sizeof kGameResZh / sizeof kGameResZh[0]);
+// The upscaler's mode (kRenderQuality in play_types.h, same order): the share of the output the 3D scene renders at, named the way the
+// chosen upscaler names it - DLSS's top step is DLAA, FSR's and TAAU's is native AA, and without an upscaler the steps are plain shares.
+constexpr const char* kModeDlssZh[] = {"DLAA (100%)", "质量 (67%)", "平衡 (58%)", "性能 (50%)", "超级性能 (33%)", "主机原版 (动态 720p)"};
+constexpr const char* kModeDlssEn[] = {"DLAA (100%)", "Quality (67%)", "Balanced (58%)", "Performance (50%)", "Ultra Performance (33%)",
+                                       "Console (dynamic 720p)"};
+constexpr const char* kModeTemporalZh[] = {"原生抗锯齿 (100%)", "质量 (67%)", "平衡 (58%)", "性能 (50%)", "超级性能 (33%)", "主机原版 (动态 720p)"};
+constexpr const char* kModeTemporalEn[] = {"Native AA (100%)", "Quality (67%)", "Balanced (58%)", "Performance (50%)", "Ultra Performance (33%)",
+                                           "Console (dynamic 720p)"};
+constexpr const char* kModeOffZh[] = {"原生 (100%)", "67%", "58%", "50%", "33%", "主机原版 (动态 720p)"};
+constexpr const char* kModeOffEn[] = {"Native (100%)", "67%", "58%", "50%", "33%", "Console (dynamic 720p)"};
+constexpr int kGameResCount = static_cast<int>(sizeof kModeDlssZh / sizeof kModeDlssZh[0]);
+static_assert(kGameResCount == kRenderQualityCount, "one label per render quality");
 
 constexpr const char* kGame3dUpZh[] = {
+    "DLSS (NVIDIA)",
     "FSR 3.1.6 (推荐 60fps)",
     "FSR 4.1.2 (ML 高画质)",
     "FSR 2.3.4 (经典版)",
     "TAAU (内置时序)",
-    "关闭 / 原生直出 (Bilinear)",
+    "关闭 (不使用 DLSS / FSR)",
 };
 constexpr const char* kGame3dUpEn[] = {
+    "DLSS (NVIDIA)",
     "FSR 3.1.6 (Rec. 60fps)",
     "FSR 4.1.2 (ML High)",
     "FSR 2.3.4 (Classic)",
     "TAAU (Built-in)",
-    "Off / Native (Bilinear)",
+    "Off (no DLSS / FSR)",
 };
 constexpr int kGame3dUpCount = static_cast<int>(sizeof kGame3dUpZh / sizeof kGame3dUpZh[0]);
+
+// DLSS models offered in F1. L / M stay ini-only (Default picks them where they apply; on DLAA they drew black lines).
+constexpr const char* kDlssPresetKeys[] = {"default", "K", "J"};
+constexpr const char* kDlssPresetZh[] = {"默认 (由驱动按模式选择)", "模型 K (Transformer，推荐)", "模型 J (Transformer，拖影更少)"};
+constexpr const char* kDlssPresetEn[] = {"Default (driver picks per mode)", "Model K (transformer, recommended)", "Model J (transformer, less ghosting)"};
+constexpr int kDlssPresetCount = static_cast<int>(sizeof kDlssPresetKeys / sizeof kDlssPresetKeys[0]);
+
+int dlss_preset_index(const std::string& k) {
+    for (int i = 0; i < kDlssPresetCount; ++i)
+        if (k == kDlssPresetKeys[i]) return i;
+    return 0;
+}
 
 constexpr const char* kSpatialUpZh[] = {"关闭", "FSR 1 (空间锐化)", "NIS (空间锐化)"};
 constexpr const char* kSpatialUpEn[] = {"Off", "FSR 1 (spatial)", "NIS (spatial)"};
@@ -154,19 +160,21 @@ constexpr extras::UpscaleMode kSpatialUpModes[] = {
 constexpr int kSpatialUpCount = static_cast<int>(sizeof kSpatialUpModes / sizeof kSpatialUpModes[0]);
 
 int game3d_up_index(const Game3dSettings& g) {
-    if (g.upscaler == "taau") return 3;
-    if (g.upscaler == "bilinear") return 4;
-    if (!g.fsr_version.empty() && g.fsr_version[0] == '4') return 1;
-    if (!g.fsr_version.empty() && g.fsr_version[0] == '2') return 2;
-    return 0;
+    if (g.upscaler == "dlss") return 0;
+    if (g.upscaler == "taau") return 4;
+    if (g.upscaler == "bilinear") return 5;
+    if (!g.fsr_version.empty() && g.fsr_version[0] == '4') return 2;
+    if (!g.fsr_version.empty() && g.fsr_version[0] == '2') return 3;
+    return 1;
 }
 
 void set_game3d_up_index(Game3dSettings& g, int idx) {
     switch (idx) {
-        case 0: g.upscaler = "fsr3"; g.fsr_version = "3.1"; break;
-        case 1: g.upscaler = "fsr3"; g.fsr_version = "4.1"; break;
-        case 2: g.upscaler = "fsr3"; g.fsr_version = "2.3"; break;
-        case 3: g.upscaler = "taau"; break;
+        case 0: g.upscaler = "dlss"; break;
+        case 1: g.upscaler = "fsr3"; g.fsr_version = "3.1"; break;
+        case 2: g.upscaler = "fsr3"; g.fsr_version = "4.1"; break;
+        case 3: g.upscaler = "fsr3"; g.fsr_version = "2.3"; break;
+        case 4: g.upscaler = "taau"; break;
         default: g.upscaler = "bilinear"; break;
     }
 }
@@ -242,8 +250,8 @@ void sanitize(Settings& s) {
     std::vector<Binding>& v = s.bindings;
     v.erase(std::remove_if(v.begin(), v.end(), [](const Binding& b) { return b.in.kind == InKind::None; }), v.end());
     for (Binding& b : v) b.ms = std::clamp(b.ms, 0, 5000);
-    s.display.width = std::clamp(s.display.width, 320, 16384);
-    s.display.height = std::clamp(s.display.height, 320, 16384);
+    s.display.width = s.display.width <= 0 ? 0 : std::clamp(s.display.width, 320, 16384);
+    s.display.height = s.display.height <= 0 ? 0 : std::clamp(s.display.height, 320, 16384);
     s.display.render_width = s.display.render_width <= 0 ? 0 : std::clamp(s.display.render_width, 320, 16384);
     s.display.render_height = s.display.render_height <= 0 ? 0 : std::clamp(s.display.render_height, 320, 16384);
     extras::HdrSettings& h = s.extras.hdr;
@@ -384,6 +392,7 @@ struct PaneState {
     DescInfo shown;
     float bottom_reserve = 0.0f;
     bool held = false;
+    bool focus_first = false;
 };
 
 PaneState g_pane;
@@ -432,7 +441,7 @@ void pane_end(const LiveStatus& live) {
     ImGui::BeginChild("##desc_pane", ImVec2(0.0f, avail.y), 0, ImGuiWindowFlags_NoNav);
 
     // Top: Option explanation card
-    const float status_h = px(155.0f);
+    const float status_h = px(184.0f);
     const float desc_h = std::max(px(100.0f), avail.y - status_h - px(12.0f));
     {
         const ImVec2 cp = ImGui::GetCursorScreenPos();
@@ -492,6 +501,25 @@ void pane_end(const LiveStatus& live) {
         const char* up_txt = !dli.active_name.empty() ? dli.active_name.c_str()
                            : (!dli.upscaler.empty() ? dli.upscaler.c_str() : "-");
         ImGui::Text("%s: %s", tr("3D 超分", "3D Upscaler"), up_txt);
+        const nvn::VramLiveInfo vli = nvn::vram_live_info();
+        if (vli.vram_total_mb > 0) {
+            if (vli.budget_live) {
+                ImGui::Text("VRAM: %llu / %llu MiB  (%s %llu / %llu MiB%s)",
+                            static_cast<unsigned long long>(vli.vram_used_mb),
+                            static_cast<unsigned long long>(vli.vram_total_mb),
+                            tr("拷贝池", "Copies"),
+                            static_cast<unsigned long long>(vli.pool_copy_mb),
+                            static_cast<unsigned long long>(vli.pool_cap_mb),
+                            vli.capture_on ? ", capture" : "");
+            } else {
+                ImGui::Text("VRAM: %llu MiB  (%s %llu / %llu MiB%s)",
+                            static_cast<unsigned long long>(vli.vram_total_mb),
+                            tr("拷贝池", "Copies"),
+                            static_cast<unsigned long long>(vli.pool_copy_mb),
+                            static_cast<unsigned long long>(vli.pool_cap_mb),
+                            vli.capture_on ? ", capture" : "");
+            }
+        }
         const int backlog = gfx::shader_backlog();
         if (backlog > 0) ImGui::TextColored(kOrange, "%s: %d", tr("后台着色器编译剩余", "Shaders left"), backlog);
         else ImGui::TextColored(kDimText, "%s", tr("着色器缓存已就绪", "Shader cache ready"));
@@ -528,20 +556,35 @@ int draw_card_raw(const char* id, const char* label, const char* value, const ch
 
     ImGui::PushID(id);
     const bool clicked = ImGui::InvisibleButton("##card", ImVec2(w, h));
+    const ImGuiID item_id = ImGui::GetItemID();
     const bool hov = ImGui::IsItemHovered();
-    const bool foc = ImGui::IsItemFocused();
+    bool foc = ImGui::IsItemFocused();
     ImGui::PopID();
+
+    if (g_pane.focus_first && !disabled) {
+        ImGui::SetFocusID(item_id, ImGui::GetCurrentWindow());
+        if (ImGuiContext* ctx = ImGui::GetCurrentContext()) ctx->NavCursorVisible = true;
+        g_pane.focus_first = false;
+        foc = true;
+    } else if (clicked && !disabled) {
+        ImGui::SetFocusID(item_id, ImGui::GetCurrentWindow());
+        foc = true;
+    }
 
     int step = (clicked && !disabled) ? 2 : 0;
     g_pane.held = false;
     if (foc && !disabled) {
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft)) step = -1;
-        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight)) step = 1;
         static const ImGuiKey kStepKeys[] = {ImGuiKey_LeftArrow, ImGuiKey_RightArrow, ImGuiKey_GamepadDpadLeft, ImGuiKey_GamepadDpadRight};
         for (ImGuiKey k : kStepKeys) {
+            ImGui::SetKeyOwner(k, item_id, ImGuiInputFlags_LockThisFrame);
             if (ImGui::GetKeyData(k)->DownDuration > 0.7f) g_pane.held = true;
-            ImGui::SetKeyOwner(k, ImGui::GetItemID());
         }
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, ImGuiInputFlags_Repeat, item_id) ||
+            ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, ImGuiInputFlags_Repeat, item_id))
+            step = -1;
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, ImGuiInputFlags_Repeat, item_id) ||
+            ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, ImGuiInputFlags_Repeat, item_id))
+            step = 1;
     }
 
     record_desc(label, desc, restart, live, hov, foc);
@@ -719,31 +762,24 @@ void tab_display(const LiveStatus& live, Page& p, float bottom_h) {
 
     pane_begin("tab_display", bottom_h);
 
-    card_group("窗口与分辨率", "Window & Resolution");
-    if (card_choice("game_res", "游戏 3D 分辨率 / 输出", "Game 3D resolution",
-                    "切换游戏内部 3D 渲染与主机输出分辨率（写入 nxrt.ini，重启生效）。切到 1080p/1440p 原生（不超分）会自动联动关闭超分，切到超分档位会自动联动 FSR 3.1.6；之后仍可在「画质」页自由微调。",
-                    "Sets XC2 internal 3D render and output resolution in nxrt.ini (takes effect on restart). Auto-links Native (No Upscale) to Off and upscale presets to FSR 3.1.6 (still freely adjustable in Graphics).",
-                    &p.edit.game3d.res_preset, kGameResZh, kGameResEn, kGameResCount, true)) {
-        const int rp = p.edit.game3d.res_preset;
-        if (rp == 1 || rp == 2) {
-            p.edit.game3d.upscaler = "bilinear";
-        } else if (rp >= 3 && p.edit.game3d.upscaler == "bilinear") {
-            p.edit.game3d.upscaler = "fsr3";
-            if (p.edit.game3d.fsr_version.empty()) p.edit.game3d.fsr_version = "3.1";
+    card_group("窗口与输出", "Window & Output");
+    {   // the output resolution: what the game renders its final picture at (and is told its TV is, [am] resolution); the upscaler
+        // modes on the Graphics page are shares of it. Not the window: a 4K output in a smaller window is scaled down to it.
+        static constexpr int kOutH[] = {1080, 1440, 2160};
+        static constexpr const char* kOutZh[] = {"1920x1080 (1080p)", "2560x1440 (1440p)", "3840x2160 (4K)"};
+        static constexpr const char* kOutEn[] = {"1920x1080 (1080p)", "2560x1440 (1440p)", "3840x2160 (4K)"};
+        int oi = 0;
+        for (int i = 0; i < 3; ++i)
+            if (std::abs(kOutH[i] - p.edit.game3d.out_height) < std::abs(kOutH[oi] - p.edit.game3d.out_height)) oi = i;
+        if (card_choice("out_res", "输出分辨率", "Output resolution",
+                        "游戏最终画面的分辨率（相当于主机所接电视的分辨率）。「画质」页的超分模式按它的百分比渲染 3D 场景。通常设为显示器的分辨率；它与窗口大小无关，窗口更小时画面会缩小显示。重启后生效。",
+                        "The resolution the game renders its final picture at (the TV resolution the console would be connected to). The "
+                        "upscaler modes on the Graphics page render the 3D scene at a share of it. Usually your monitor's resolution; it is "
+                        "not the window size - a smaller window shows it scaled down. Takes effect after a restart.",
+                        &oi, kOutZh, kOutEn, 3, true)) {
+            p.edit.game3d.out_height = kOutH[oi];
+            mark(p);
         }
-        mark(p);
-    }
-    // A hint, not a gate: 4K in this list means a 3840x2160 render target or a 4K output, and the mirror capture's copies
-    // (up to ~3.5 GiB when it is on) come on top of it. Measured on a 4060 Laptop (8 GB): the capture asked for 1989 of the
-    // 3584 MiB it wanted, so this is the combination that runs out of video memory first, and the DLC scenes are the ones
-    // that get there. The player can still pick it.
-    if ((p.edit.game3d.res_preset == 0 || p.edit.game3d.res_preset == 4) && nvn::mirror_device_vram() < (10ull << 30)) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kGold);
-        ImGui::TextWrapped("%s", tr("注意：这台显卡的显存不到 10 GB，4K 会与 mirror capture 的拷贝（约 3.5 GiB）叠加，"
-                                    "附加内容场景最容易撑不住；1440p 更稳。",
-                                    "This card has under 10 GB of video memory: 4K stacks with the mirror capture's copies "
-                                    "(~3.5 GiB), and the add-on scenes are where it runs out first; 1440p is safer."));
-        ImGui::PopStyleColor();
     }
 
     int wmode = window_mode_index(d.window_mode);
@@ -770,13 +806,13 @@ void tab_display(const LiveStatus& live, Page& p, float bottom_h) {
         }
     }
 
-    int preset = 3;   // default 2560x1440
+    int preset = 0;   // default: Auto (Display / max 1440p)
     for (int i = 0; i < kSizePresetCount; ++i)
         if (kSizePresets[i][0] == d.width && kSizePresets[i][1] == d.height) preset = i;
-    if (card_choice("wsize", "窗口尺寸 (仅窗口模式)", "Window size (windowed)",
-                    "仅控制窗口模式下的窗口边框大小（重启后会记住），不改变上方游戏 3D 分辨率。",
-                    "Windowed-mode client size (remembered on restart); does not change 3D render resolution above.",
-                    &preset, kSizeLabels, kSizeLabels, kSizePresetCount)) {
+    if (card_choice("wsize", "窗口大小 (仅窗口模式)", "Window size (windowed mode only)",
+                    "窗口模式下窗口在桌面上的大小（重启后会记住）；自动模式跟随显示器分辨率（上限 1440p）。全屏时不起作用；不改变游戏的输出分辨率，只改变画面显示的大小。",
+                    "How large the window is on the desktop in windowed mode (remembered on restart); Auto follows display (capped at 1440p). No effect in fullscreen; it does not change the game's output resolution, only how large the picture is shown.",
+                    &preset, kSizeLabelsZh, kSizeLabelsEn, kSizePresetCount)) {
         d.width = kSizePresets[preset][0];
         d.height = kSizePresets[preset][1];
         mark(p);
@@ -869,17 +905,72 @@ void tab_graphics(const LiveStatus& live, Page& p, float bottom_h) {
 
     pane_begin("tab_graphics", bottom_h);
 
-    card_group("3D 超分与抗锯齿 (点击应用实时热切换)", "3D Upscaler & AA (Live Hot-Switch)");
+    card_group("超分与抗锯齿", "Upscaling & Anti-Aliasing");
     {
         int gidx = game3d_up_index(g3d);
-        if (card_choice("dlss_up", "3D 超分器 / FSR 版本", "3D Upscaler / FSR version",
-                        "直接切换 XC2 游戏内 3D 超分引擎，点「应用并保存」后无需重启立即热切换并写入 nxrt.ini。RX 6700 XT 上 4K 原生 FSR 3.1.6 稳 60fps；FSR 4.1.2 已自动开启防崩保护（4K 原生约 35fps，配 1440p->4K 更流畅）。",
-                        "Live hot-switch for XC2's 3D upscaler/AA (saves to nxrt.ini). FSR 3.1.6 runs 60fps at 4K on RX 6700 XT; FSR 4.1.2 auto-enables crash protection.",
+        if (card_choice("dlss_up", "超分器", "Upscaler",
+                        "3D 画面使用的超分 / 抗锯齿技术，点「应用并保存」后实时切换并写入 nxrt.ini。「关闭」不使用 DLSS 或 FSR。",
+                        "The upscaling / anti-aliasing the 3D picture uses. Switches live when applied and is saved to nxrt.ini. Off uses "
+                        "neither DLSS nor FSR.",
                         &gidx, kGame3dUpZh, kGame3dUpEn, kGame3dUpCount, false, true)) {
             set_game3d_up_index(g3d, gidx);
             mark(p);
         }
-        if (card_slider_f("dlss_sharp", "3D 超分锐度 (FSR RCAS)", "3D Upscaler sharpness",
+        // The mode: the share of the output the 3D scene renders at, named after the upscaler (DLSS / FSR modes, plain shares when off)
+        const bool is_dlss = g3d.upscaler == "dlss", is_off = g3d.upscaler == "bilinear";
+        const char* const* mzh = is_dlss ? kModeDlssZh : is_off ? kModeOffZh : kModeTemporalZh;
+        const char* const* men = is_dlss ? kModeDlssEn : is_off ? kModeOffEn : kModeTemporalEn;
+        if (card_choice("game_res", is_dlss ? "DLSS 模式" : is_off ? "渲染分辨率" : "超分模式",
+                        is_dlss ? "DLSS mode" : is_off ? "Render resolution" : "Upscaler mode",
+                        "3D 场景按输出分辨率的百分比渲染，再放大到输出；百分比越低越快、越模糊。分辨率固定，不会动态下降。「主机原版」= 游戏自己的动态 720p。重启后生效。",
+                        "The 3D scene renders at this share of the output and is brought up to it: lower is faster and softer. The resolution "
+                        "stays fixed (no dynamic drops). Console = the game's own dynamic 720p. Takes effect after a restart.",
+                        &g3d.res_preset, mzh, men, kGameResCount, true)) {
+            mark(p);
+        }
+        {   // the size this mode renders at, so the percentages mean something
+            const int out_h = render_output_height(), out_w = out_h * 16 / 9;
+            const double share = kRenderQuality[std::clamp(g3d.res_preset, 0, kRenderQualityCount - 1)].share;
+            char line[160];
+            if (share > 0.0) {
+                const int in_h = static_cast<int>(std::lround(out_h * share)), in_w = static_cast<int>(std::lround(out_w * share));
+                std::snprintf(line, sizeof line, tr("渲染 %dx%d -> 输出 %dx%d（输出分辨率见「显示」页）", "Renders %dx%d -> output %dx%d (output resolution: Display page)"), in_w, in_h, out_w, out_h);
+            } else {
+                std::snprintf(line, sizeof line, "%s", tr("渲染 最高 1280x720（游戏动态分辨率）-> 1920x1080 -> 窗口",
+                                                         "Renders up to 1280x720 (the game's dynamic resolution) -> 1920x1080 -> the window"));
+            }
+            ImGui::TextDisabled("%s", line);
+        }
+        // A hint, not a gate: native 4K plus the capture's copies is what runs out of video memory first on small cards.
+        if (g3d.res_preset == 0 && render_output_height() >= 2160 && nvn::mirror_device_vram() < (10ull << 30)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kGold);
+            ImGui::TextWrapped("%s", tr("注意：这台显卡的显存不到 10 GB，4K 会与 mirror capture 的拷贝（约 2–3.5 GiB）叠加，"
+                                        "附加内容场景最容易撑不住；较低的档位更稳。",
+                                        "This card has under 10 GB of video memory: a 4K scene stacks with the mirror capture's copies "
+                                        "(~2-3.5 GiB), and the add-on scenes are where it runs out first; a lower step is safer."));
+            ImGui::PopStyleColor();
+        }
+        if (g3d.upscaler == "dlss") {
+            // DLSS runs through Streamline, which has to be loaded before the Vulkan device: switching to it live works only when the
+            // game started with it (or with auto and the DLLs there); otherwise the choice is saved and applies at the next start.
+            if (!extras::temporal_dlss_started()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, kGold);
+                ImGui::TextWrapped("%s", extras::temporal_dlss_available()
+                                             ? tr("DLSS 需要在启动时加载：已保存，重启游戏后生效。", "DLSS loads at start-up: saved, it applies after a restart.")
+                                             : tr("找不到 DLSS 文件：可在启动器的「设置 → 超分」中从 NVIDIA 下载。", "The DLSS files are missing: the launcher downloads them from NVIDIA (Settings, under Upscaler)."));
+                ImGui::PopStyleColor();
+            }
+            int pidx = dlss_preset_index(g3d.dlss_preset);
+            if (card_choice("dlss_preset", "DLSS 模型", "DLSS model",
+                            "DLSS 使用的 AI 模型（实时切换）。默认 = 驱动按模式自动选择；K 是 Transformer 模型，画质最好；J 拖影更少但更闪。",
+                            "Which AI model DLSS uses (applies live). Default lets the driver choose per mode; K is the transformer model and "
+                            "looks best; J ghosts less but flickers more.",
+                            &pidx, kDlssPresetZh, kDlssPresetEn, kDlssPresetCount, false, true)) {
+                g3d.dlss_preset = kDlssPresetKeys[pidx];
+                mark(p);
+            }
+        }
+        if (g3d.upscaler != "dlss" && card_slider_f("dlss_sharp", "3D 超分锐度 (FSR RCAS)", "3D Upscaler sharpness",
                           "控制 FSR 3.1.6 / 4.1.2 / 2.3.4 内置锐化强度（0.00 关闭，1.00 最强，推荐 0.40 ~ 0.60），点应用后实时生效且不卡顿。",
                           "FSR RCAS sharpening strength (0.00 off, 1.00 max, 0.40-0.60 recommended). Applies live.",
                           &g3d.sharpness, 0.0, 1.0, 0.05, "%.2f", false, true)) {
@@ -1040,6 +1131,29 @@ void tab_graphics(const LiveStatus& live, Page& p, float bottom_h) {
                       "Expands highlights toward peak brightness.",
                       &hdr.highlight_boost, 0.0, 2.0, 0.10, "%.2f")) {
         mark(p);
+    }
+
+    // ---- Experimental: options of this PC version, not of the game, each with what it costs ----
+    card_group("实验性功能", "Experimental");
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));   // a plain note, not a warning
+    ImGui::TextWrapped("%s", tr("实验性功能：并非在所有系统上效果都一样。",
+                                "Experimental features: they may not work the same way on every system."));
+    ImGui::PopStyleColor();
+    {   // [nvn] mirror_capture: auto / on / off, with what it does and what it costs
+        static constexpr const char* kCapKeys[] = {"auto", "on", "off"};
+        static constexpr const char* kCapZh[] = {"自动 (显存足够时开启)", "开启", "关闭 (节省显存)"};
+        static constexpr const char* kCapEn[] = {"Automatic (on when the card has room)", "On", "Off (saves video memory)"};
+        int ci = 0;
+        for (int i = 0; i < 3; ++i)
+            if (g3d.capture == kCapKeys[i]) ci = i;
+        if (card_choice("mirror_cap", "帧流水线 (Mirror Capture)", "Frame pipelining (mirror capture)",
+                        "让游戏在当前画面还在绘制时就准备好下一帧，画面更流畅，也能消除部分显卡上的闪烁。代价：多占用约 2–3.5 GB 显存。重启后生效。",
+                        "Lets the game get the next frame ready while the current one is still being drawn, for smoother play. It also "
+                        "removes flicker on some graphics cards. The cost: about 2-3.5 GB of extra video memory. Takes effect after a restart.",
+                        &ci, kCapZh, kCapEn, 3, true)) {
+            g3d.capture = kCapKeys[ci];
+            mark(p);
+        }
     }
 
     pane_end(live);
@@ -1299,6 +1413,7 @@ void draw_category_tabs(Page& p) {
         if (clicked) {
             p.active_tab = i;
             g_pane.shown.valid = false;
+            g_pane.focus_first = true;
         }
         const ImU32 bg = sel ? IM_COL32(28, 86, 102, 235)
                              : (hov || foc) ? IM_COL32(24, 64, 82, 195) : IM_COL32(12, 24, 40, 175);
@@ -1320,10 +1435,12 @@ void draw_category_tabs(Page& p) {
     if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) {
         p.active_tab = (p.active_tab + kTabCount - 1) % kTabCount;
         g_pane.shown.valid = false;
+        g_pane.focus_first = true;
     }
     if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) {
         p.active_tab = (p.active_tab + 1) % kTabCount;
         g_pane.shown.valid = false;
+        g_pane.focus_first = true;
     }
 }
 
@@ -1332,6 +1449,10 @@ void draw_category_tabs(Page& p) {
 void draw_settings_page(UiHost& host) {
     static Page page;
     Page& p = page;
+    static int last_frame = -2;
+    const int frame = ImGui::GetFrameCount();
+    if (frame != last_frame + 1) g_pane.focus_first = true;
+    last_frame = frame;
     if (!p.loaded) {
         p.edit = host.settings();
         p.edit.fps = host.settings().fps;
@@ -1382,7 +1503,7 @@ void draw_settings_page(UiHost& host) {
         ImGui::TextColored(p.notice_warn ? kOrange : kEmerald, "%s", p.notice.c_str());
     } else {
         ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(kDimText, "%s", tr("提示：鼠标悬停或方向键选中条目，右侧查看说明", "Tip: hover or select an item for details"));
+        ImGui::TextColored(kDimText, "%s", tr("提示：方向键或悬停选择条目，左右微调，右侧查看说明", "Tip: D-pad or hover to select, Left/Right to adjust"));
     }
 }
 
@@ -1422,8 +1543,34 @@ void draw_settings_menu(UiHost& host, gfx::Overlay& ov) {
 
         const float close_w = px(92.0f);
         const float lang_w = px(96.0f);
+        const float quit_w = px(104.0f);
         const float right_x = ImGui::GetWindowContentRegionMax().x;
-        ImGui::SameLine(std::max(px(260.0f), right_x - close_w - lang_w - px(10.0f)));
+        ImGui::SameLine(std::max(px(260.0f), right_x - close_w - lang_w - quit_w - px(18.0f)));
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.46f, 0.14f, 0.16f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.62f, 0.20f, 0.22f, 1.0f));
+        if (ImGui::Button(tr("退出游戏", "Quit game"), ImVec2(quit_w, 0.0f))) ImGui::OpenPopup("##quit_confirm");
+        ImGui::PopStyleColor(2);
+        if (ImGui::BeginPopupModal("##quit_confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+            ImGui::TextUnformatted(tr("退出游戏？上次存档之后的进度将会丢失。", "Quit the game? Progress since your last save is lost."));
+            ImGui::Dummy(ImVec2(0.0f, px(6.0f)));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.46f, 0.14f, 0.16f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.62f, 0.20f, 0.22f, 1.0f));
+            if (ImGui::Button(tr("退出", "Quit"), ImVec2(px(104.0f), 0.0f))) {
+                ImGui::CloseCurrentPopup();
+                host.request_exit();
+            }
+            ImGui::PopStyleColor(2);
+            ImGui::SameLine();
+            // Cancel, Esc, or a click anywhere outside the dialog closes it. Outside is where the press landed against the dialog's
+            // rectangle, not ImGui's hover state: in play that reads "not hovered" even on the dialog's own buttons.
+            const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize(), cp = ImGui::GetIO().MouseClickedPos[ImGuiMouseButton_Left];
+            const bool outside = !ImGui::IsWindowAppearing() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                                 (cp.x < wp.x || cp.y < wp.y || cp.x >= wp.x + ws.x || cp.y >= wp.y + ws.y);
+            if (ImGui::Button(tr("取消", "Cancel"), ImVec2(px(104.0f), 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape) || outside)
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine();
         if (ImGui::Button(g_zh ? "EN / 中文" : "中文 / EN", ImVec2(lang_w, 0.0f))) {
             g_zh = !g_zh;
             FpsSettings f = host.settings().fps;

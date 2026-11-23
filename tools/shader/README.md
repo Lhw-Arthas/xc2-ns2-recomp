@@ -48,10 +48,5 @@ Downstream code is untouched: it still sees a `v4float` whose bits are the stenc
 
 Renames `OpName` strings. glslang names a uniform block's instance `<block>_1` when the block and the instance
 share a name, and NVN finds a descriptor by the name the translator baked in, so a hand-built module has to be
-renamed back before the runtime will use it.
-
-## install_shaders.ps1
-
-Copies `.spv` files into the cache and merges their `results.tsv` rows. Note that the runtime reads
-`spirv.preload.pack` **before** the loose files, so installing a shader means dropping the pack too - otherwise
-the old module keeps loading and the patch appears to do nothing.
+renamed back before the runtime will use it. See `tools/build/patch-shaders.ps1` for installing rebuilt shaders into a
+cache (including dropping `spirv.preload.pack` so loose files are not shadowed).

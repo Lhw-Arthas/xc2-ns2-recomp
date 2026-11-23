@@ -34,6 +34,7 @@
 #include "nvn_abi.h"
 #include "nvn_cmd.h"
 #include "nvn_gpu.h"
+#include "nvn_gpu_internal.h"
 #include "nvn_impl.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
@@ -314,7 +315,15 @@ NVNwindowAcquireTextureResult acquire_texture(be::Window* w, NVNsync* sync, int*
     // immediately after nvnWindowAcquireTexture returns and only wait on the acquire sync right before
     // submitting; returning early lets the CPU overwrite live GPU UBOs/VBs in flight.
     // Release w->lock first because present_on_render_thread() acquires w->lock while completing the slot.
-    if (slot_serial) be::gpu::wait_serial(slot_serial, UINT64_MAX);
+    // [nvn] acquire_wait = auto | on | off. auto skips the wait while mirror_capture is on (submissions own their bytes; the wait only cost fps).
+    static const bool wait_on = [] {
+        const std::string v = nxrt::config_get_str("nvn", "acquire_wait", "auto");
+        const bool on = v == "auto" ? !be::gpu::mirror_capture_on() : nxrt::config_get_bool("nvn", "acquire_wait", true);
+        NXLOG_I(kTag, "acquire_wait: %s ([nvn] acquire_wait = %s)", on ? "on (an acquire waits for the slot's last frame)" : "off (mirror_capture holds the bytes)",
+                v.c_str());
+        return on;
+    }();
+    if (slot_serial && wait_on) be::gpu::wait_serial(slot_serial, UINT64_MAX);
     if (index) *index = slot;
     if (be::Sync* s = be::host_of<be::Sync>(sync)) {
         const uint64_t ser = nvn2_sync_scope() ? slot_serial : be::gpu::last_serial();

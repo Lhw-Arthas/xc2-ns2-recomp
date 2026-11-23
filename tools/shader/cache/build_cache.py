@@ -20,6 +20,7 @@ Design notes, because this is meant to be driven by something other than a perso
   * idempotent: blocks already in the cache are skipped, so re-running after an interruption continues.
 """
 import argparse
+import collections
 import json
 import os
 import shutil
@@ -80,10 +81,35 @@ def read_manifest(path):
         except ValueError:
             raise SystemExit("the manifest has no code_sha1_16/code_file/ctrl_file column: " + path)
         for line in f:
-            p = line.rstrip("\n").split("\t")
+            raw = line.rstrip("\n")
+            p = raw.split("\t")
             if len(p) > max(i_hash, i_code, i_ctrl):
-                rows.append({"hash": p[i_hash], "code": p[i_code], "ctrl": p[i_ctrl], "raw": line.rstrip("\n")})
-    return header, rows
+                rows.append({"hash": p[i_hash], "code": p[i_code], "ctrl": p[i_ctrl], "cols": p, "raw": raw})
+    return header, rows, (i_code, i_ctrl)
+
+
+def run_stream(cmd, rep):
+    """Run a child command, streaming progress lines live when not emitting JSON."""
+    tail = collections.deque(maxlen=40)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, errors="replace", bufsize=1)
+    for line in p.stdout:
+        s = line.rstrip("\r\n")
+        tail.append(s)
+        if not rep.as_json and "/" in s:
+            stripped = s.strip()
+            if stripped[:1].isdigit():
+                print("      " + stripped, flush=True)
+    rc = p.wait()
+    return rc, "\n".join(tail)
+
+
+def move_or_copy(src, dst):
+    """Prefer an O(1) same-volume replace over copying bytes and NTFS metadata."""
+    try:
+        os.replace(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
 
 def cached(path):
@@ -103,6 +129,7 @@ def main(argv):
     ap.add_argument("--harness", required=True, help="spirv_harness executable")
     ap.add_argument("--spirv-val", default="", help="spirv-val executable the harness validates with; unset: next to the "
                                                    "harness in tools/spirv-val, else the harness's own lookup (VULKAN_SDK, PATH)")
+    ap.add_argument("--no-val", action="store_true", help="skip spirv-val per-shader subprocess validation")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--stage", default="", help="scratch folder (default: <blocks>/../build_cache)")
     ap.add_argument("--pack-tool", default="", help="optional pack_full.py; without it the pack is left alone")
@@ -121,18 +148,18 @@ def main(argv):
         os.makedirs(work, exist_ok=True)
         tsv = os.path.join(work, "files.tsv")
         rep.step("index", ard=a.ard)
-        r = subprocess.run([sys.executable, os.path.join(here, "ard_index.py"),
-                            "--ard", a.ard, "--out", tsv], capture_output=True, text=True)
-        if r.returncode != 0:
-            rep.say((r.stderr or r.stdout or "").strip()[-600:])
+        rc, tail = run_stream([sys.executable, os.path.join(here, "ard_index.py"),
+                               "--ard", a.ard, "--out", tsv], rep)
+        if rc != 0:
+            rep.say(tail[-600:])
             rep.fail(EXIT_INPUT, "the index step failed")
             return EXIT_INPUT
         a.blocks = os.path.join(work, "blocks")
-        rep.step("extract", ard=a.ard, out=a.blocks)
-        r = subprocess.run([sys.executable, os.path.join(here, "extract_embedded.py"),
-                            "--ard", a.ard, "--tsv", tsv, "--out", a.blocks], capture_output=True, text=True)
-        if r.returncode != 0:
-            rep.say((r.stderr or r.stdout or "").strip()[-600:])
+        rep.step("extract", ard=a.ard, out=a.blocks, jobs=a.jobs)
+        rc, tail = run_stream([sys.executable, os.path.join(here, "extract_embedded.py"),
+                               "--ard", a.ard, "--tsv", tsv, "--out", a.blocks, "--jobs", str(a.jobs)], rep)
+        if rc != 0:
+            rep.say(tail[-600:])
             rep.fail(EXIT_INPUT, "the extraction step failed")
             return EXIT_INPUT
     if not a.blocks:
@@ -147,7 +174,7 @@ def main(argv):
         rep.fail(EXIT_DEP, "no shader harness at " + a.harness)
         return EXIT_DEP
 
-    header, rows = read_manifest(manifest)
+    header, rows, (i_code, i_ctrl) = read_manifest(manifest)
     if not rows:
         rep.fail(EXIT_INPUT, "the manifest has no rows")
         return EXIT_INPUT
@@ -164,56 +191,77 @@ def main(argv):
     stage = a.stage or os.path.join(work, "build_cache")
     stage_in = os.path.join(stage, "in")
     stage_out = os.path.join(stage, "out")
-    for d in (stage_in, stage_out):
-        if os.path.isdir(d):
-            shutil.rmtree(d)
-        os.makedirs(d)
+    if os.path.isdir(stage_out):
+        shutil.rmtree(stage_out)
+    os.makedirs(stage_out)
 
-    rep.step("stage", folder=stage_in)
-    with open(os.path.join(stage_in, "manifest.tsv"), "w", encoding="utf-8", newline="\n") as f:
-        f.write("\t".join(header) + "\n")
-        for r in missing:
-            for name, src in ((r["code"], os.path.join(a.blocks, r["code"])),
-                              (r["ctrl"], os.path.join(a.blocks, r["ctrl"]))):
-                if not os.path.exists(src):
-                    rep.fail(EXIT_INPUT, "the manifest names a file that is not there: " + src)
-                    return EXIT_INPUT
-                shutil.copy2(src, os.path.join(stage_in, name))
-            f.write(r["raw"] + "\n")
+    blocks_abs = os.path.abspath(a.blocks)
+    out_abs = os.path.abspath(stage_out)
+    direct = (len(missing) == len(rows)) and not out_abs.startswith(blocks_abs + os.sep)
+    if direct:
+        if not a.ard:
+            for r in missing:
+                for src in (os.path.join(a.blocks, r["code"]), os.path.join(a.blocks, r["ctrl"])):
+                    if not os.path.exists(src):
+                        rep.fail(EXIT_INPUT, "the manifest names a file that is not there: " + src)
+                        return EXIT_INPUT
+        rep.step("stage", folder=a.blocks, mode="direct")
+        batch_in = a.blocks
+    else:
+        if os.path.isdir(stage_in):
+            shutil.rmtree(stage_in)
+        os.makedirs(stage_in)
+        rep.step("stage", folder=stage_in, mode="manifest")
+        with open(os.path.join(stage_in, "manifest.tsv"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("\t".join(header) + "\n")
+            for r in missing:
+                code_src = os.path.abspath(os.path.join(a.blocks, r["code"]))
+                ctrl_src = os.path.abspath(os.path.join(a.blocks, r["ctrl"]))
+                for src in (code_src, ctrl_src):
+                    if not os.path.exists(src):
+                        rep.fail(EXIT_INPUT, "the manifest names a file that is not there: " + src)
+                        return EXIT_INPUT
+                cols = list(r["cols"])
+                cols[i_code] = code_src
+                cols[i_ctrl] = ctrl_src
+                f.write("\t".join(cols) + "\n")
+        batch_in = stage_in
 
     rep.step("translate", count=len(missing), jobs=a.jobs)
-    cmd = [a.harness, "--batch", stage_in, "--out", stage_out, "--jobs", str(a.jobs)]
-    # The harness validates every translation with spirv-val, and a machine without the Vulkan SDK has none: it used
-    # to die with an unhandled Win32Exception in the middle of the batch (issue #5, 2026-11-18). The release package
-    # ships it in tools/spirv-val, next to the harness's own folder.
-    spirv_val = a.spirv_val
-    if not spirv_val:
-        guess = os.path.join(os.path.dirname(os.path.abspath(a.harness)), "..", "spirv-val", "spirv-val.exe")
-        guess = os.path.normpath(guess)
-        if os.path.exists(guess):
-            spirv_val = guess
-    if spirv_val:
-        if not os.path.exists(spirv_val):
-            rep.fail(EXIT_DEP, "no spirv-val at " + spirv_val)
-            return EXIT_DEP
-        cmd += ["--spirv-val", spirv_val]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        rep.say((r.stderr or r.stdout or "").strip()[-800:])
-        rep.fail(EXIT_STEP, "the shader harness failed with exit %d" % r.returncode)
+    cmd = [a.harness, "--batch", batch_in, "--out", stage_out, "--jobs", str(a.jobs)]
+    if a.no_val:
+        cmd.append("--no-val")
+    else:
+        # The harness validates every translation with spirv-val, and a machine without the Vulkan SDK has none: it used
+        # to die with an unhandled Win32Exception in the middle of the batch (issue #5, 2026-11-18). The release package
+        # ships it in tools/spirv-val, next to the harness's own folder.
+        spirv_val = a.spirv_val
+        if not spirv_val:
+            guess = os.path.join(os.path.dirname(os.path.abspath(a.harness)), "..", "spirv-val", "spirv-val.exe")
+            guess = os.path.normpath(guess)
+            if os.path.exists(guess):
+                spirv_val = guess
+        if spirv_val:
+            if not os.path.exists(spirv_val):
+                rep.fail(EXIT_DEP, "no spirv-val at " + spirv_val)
+                return EXIT_DEP
+            cmd += ["--spirv-val", spirv_val]
+    rc, tail = run_stream(cmd, rep)
+    if rc != 0:
+        rep.say(tail[-800:])
+        rep.fail(EXIT_STEP, "the shader harness failed with exit %d" % rc)
         return EXIT_STEP
 
     rep.step("install", cache=a.cache)
     os.makedirs(a.cache, exist_ok=True)
-    copied = 0
-    for n in sorted(os.listdir(stage_out)):
-        if n.endswith(".spv"):
-            shutil.copy2(os.path.join(stage_out, n), os.path.join(a.cache, n))
-            copied += 1
-
+    spv_files = [n for n in sorted(os.listdir(stage_out)) if n.endswith(".spv")]
     # Only the rows of shaders that actually produced a .spv: the harness writes a row for a block it could
     # not translate too, and a row without a .spv would make the runtime resolve a shader that is not there.
-    produced = set(os.path.splitext(n)[0] for n in os.listdir(stage_out) if n.endswith(".spv"))
+    produced = set(os.path.splitext(n)[0] for n in spv_files)
+    copied = 0
+    for n in spv_files:
+        move_or_copy(os.path.join(stage_out, n), os.path.join(a.cache, n))
+        copied += 1
     added = 0
     results = os.path.join(a.cache, "results.tsv")
     new_rows = os.path.join(stage_out, "results.tsv")

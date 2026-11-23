@@ -113,6 +113,9 @@ void gpass_stamp(Frame& f, const char* label, uint32_t arg = 0);
 // ---- barriers ---------------------------------------------------------------------------------------------------------------
 void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to, VkImageAspectFlags aspect,
                    uint32_t base_level, uint32_t level_count, uint32_t base_layer, uint32_t layer_count);
+// True when [nvn] early_fragment_tests patched this fragment shader with hardware EarlyFragmentTests / EarlyAndLateFragmentTestsAMD.
+bool early_fragment_tests_patched(const std::string& fs_hash);
+
 // All commands before, all commands after, all memory (used after passes, dispatches, copies and fills).
 void memory_barrier(VkCommandBuffer cb);
 // [nvn] pass_barriers = tracked (S38): image_barrier derives its stage and access masks from the two layouts instead of all commands and
@@ -169,6 +172,7 @@ void mirror_capture_begin(Frame& f);
 std::shared_ptr<void> mirror_capture_take();          // game thread, in the submit call (null: no submit-time capture)
 void mirror_capture_set(std::shared_ptr<void> cap);   // render thread: the capture of the submission about to start
 void mirror_capture_end(VkCommandBuffer cb);
+void vram_log_periodic();                             // thread-safe: periodic VRAM + pool copy usage log line
 
 // ---- compute results held in the pool copy (nvn_gpu_pool.cpp, "compute out") ----------------------------------------------------
 // A dispatch that binds the pool copy directly (nvn_replay.cpp, compute shadows) writes its result there: the range is "out" until the
@@ -280,6 +284,8 @@ VkImageView tex_attachment_view(Texture* t, uint32_t level, uint32_t layer, uint
 VkFormat tex_attachment_format(Texture* t, VkFormat view_format, bool keep_format = false);
 // The image can be bound as a storage image (created with NVN_TEXTURE_FLAGS_IMAGE).
 bool tex_has_storage(Texture* t);
+// The image was created with VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT (can be sampled in-place while bound as a colour attachment).
+bool tex_has_feedback_loop(Texture* t);
 VkFormat tex_storage_format(Texture* t, VkFormat requested);   // the view format a storage binding uses: the UNORM partner of an sRGB image
 // The layout a texture is sampled in: SHADER_READ_ONLY_OPTIMAL, or DEPTH_STENCIL_READ_ONLY_OPTIMAL for depth and stencil formats (so
 // the same layout serves a depth texture that is also the read-only depth attachment of the pass).

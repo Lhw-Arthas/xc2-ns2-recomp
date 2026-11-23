@@ -327,6 +327,8 @@ VkPipeline build_fo(const GraphicsKey& key) {
     VkGraphicsPipelineLibraryCreateInfoEXT li = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &ri,
                                                  VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &li};
+    if (device().features().attachment_feedback_loop_layout)
+        gi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     gi.pColorBlendState = &cb;
     gi.pMultisampleState = &ms;
     gi.pDynamicState = pipeline_dynamic_state();
@@ -560,6 +562,8 @@ void upgrade_main() {
                 lci.pLibraries = j.parts;
                 VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lci};
                 gi.flags |= VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
+                if (device().features().attachment_feedback_loop_layout)
+                    gi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
                 gi.layout = j.layout->layout;
                 if (create_graphics_pipeline_tracked(vkdev(), pipeline_cache_handle(), &gi, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
                 else note_pipeline_created(ms_since(t0), "optimised link");
@@ -797,6 +801,8 @@ VkPipeline gpl_link(const GraphicsKey& key, const ProgLayout& layout, std::share
         lci.pLibraries = parts;
         VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lci};
         if (g_lto) gi.flags |= VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
+        if (device().features().attachment_feedback_loop_layout)
+            gi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
         gi.layout = layout.layout;
         const VkResult res = create_graphics_pipeline_tracked(vkdev(), pipeline_cache_handle(), &gi, &pipe);
         if (res != VK_SUCCESS) {

@@ -59,17 +59,18 @@ std::wstring widen(const std::string& s) {
 bool exists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
 // The candidates, in order: [upscale] fsr_dll, then the release package's upscalers\fsr3\ folder next to the executable, then the executable's own
-// folder; in each the v2.4.0 loader, the v1.1.4 single DLL, then the v2.4.0 upscaler on its own.
+// folder; in each the v2.4.0 loader, the v2.4.0 standalone upscaler, then the v1.1.4 single DLL.
 //
 // The upscaler exports the same five ffx* entry points as the loader (measured 2026-11-19 with llvm-readobj), so it can serve as
 // the entry point when the 39 KB loader is absent and the player only dropped the one file they had (issue #10 follow-up).
-// The loader still wins when both are there: it is the documented front door and it can dispatch to a provider of its choosing.
+// Preferring it before amd_fidelityfx_vk.dll avoids loading an incomplete v1/FG API wrapper when both sit next to each other
+// without the loader (issue #18). The loader still wins when present: it is the documented front door.
 std::wstring find_dll() {
     const std::string cfg = settings().upscale.fsr_dll;
     if (!cfg.empty()) return exists(widen(cfg)) ? widen(cfg) : std::wstring();
     const std::wstring exe = exe_dir();
     for (const std::wstring& dir : {exe + L"upscalers\\fsr3\\", exe})
-        for (const wchar_t* n : {L"amd_fidelityfx_loader_vk.dll", L"amd_fidelityfx_vk.dll", L"amd_fidelityfx_upscaler_vk.dll"})
+        for (const wchar_t* n : {L"amd_fidelityfx_loader_vk.dll", L"amd_fidelityfx_upscaler_vk.dll", L"amd_fidelityfx_vk.dll"})
             if (exists(dir + n)) return dir + n;
     return {};
 }

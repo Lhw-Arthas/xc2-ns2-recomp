@@ -64,6 +64,58 @@ std::map<uint64_t, Fixed> g_fixed;
 std::mutex g_state_mu;                    // init / shutdown
 std::atomic<bool> g_inited{false};
 std::atomic<uint64_t> g_default_heap{0};  // bytes, from Config or [memory] heap_gb
+std::mutex g_alias_base_mu;
+std::atomic<uint64_t> g_alias_base{0};
+
+bool host_range_free(uint64_t base, uint64_t size, MEMORY_BASIC_INFORMATION* blocker = nullptr) {
+    uint64_t cur = base;
+    const uint64_t end = base + size;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cur), &mbi, sizeof mbi) != sizeof mbi) return false;
+        if (mbi.State != MEM_FREE) {
+            if (blocker) *blocker = mbi;
+            return false;
+        }
+        const uint64_t r_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + static_cast<uint64_t>(mbi.RegionSize);
+        if (r_end <= cur) return false;
+        cur = r_end;
+    }
+    return true;
+}
+
+uint64_t select_alias_base() {
+    MEMORY_BASIC_INFORMATION blocker{};
+    if (host_range_free(kAliasBase, kAliasSize, &blocker)) return kAliasBase;
+    static constexpr uint64_t kPreferred[] = {
+        0x4000000000ull, 0x3000000000ull, 0x1000000000ull, 0x5000000000ull,
+    };
+    for (uint64_t cand : kPreferred) {
+        if (cand + kAliasSize <= kMainBase && host_range_free(cand, kAliasSize)) {
+            NXLOG_W(kTag, "alias region %llx (+%llx) blocked on host at %p (+%llx, state 0x%lx, type 0x%lx); using %llx instead",
+                    static_cast<unsigned long long>(kAliasBase), static_cast<unsigned long long>(kAliasSize),
+                    blocker.BaseAddress, static_cast<unsigned long long>(blocker.RegionSize),
+                    static_cast<unsigned long>(blocker.State), static_cast<unsigned long>(blocker.Type),
+                    static_cast<unsigned long long>(cand));
+            return cand;
+        }
+    }
+    for (uint64_t cand = 0x0800000000ull; cand + kAliasSize <= kMainBase; cand += 0x10000000ull) {
+        if (host_range_free(cand, kAliasSize)) {
+            NXLOG_W(kTag, "alias region %llx (+%llx) blocked on host at %p (+%llx, state 0x%lx, type 0x%lx); using %llx instead",
+                    static_cast<unsigned long long>(kAliasBase), static_cast<unsigned long long>(kAliasSize),
+                    blocker.BaseAddress, static_cast<unsigned long long>(blocker.RegionSize),
+                    static_cast<unsigned long>(blocker.State), static_cast<unsigned long>(blocker.Type),
+                    static_cast<unsigned long long>(cand));
+            return cand;
+        }
+    }
+    NXLOG_W(kTag, "alias region %llx (+%llx) blocked on host at %p (+%llx) and no free 128 GiB window found; keeping %llx",
+            static_cast<unsigned long long>(kAliasBase), static_cast<unsigned long long>(kAliasSize),
+            blocker.BaseAddress, static_cast<unsigned long long>(blocker.RegionSize),
+            static_cast<unsigned long long>(kAliasBase));
+    return kAliasBase;
+}
 
 std::mutex g_kernel_mu;
 uint64_t g_kernel_next = kKernelBase;     // guarded by g_kernel_mu
@@ -249,8 +301,9 @@ void init_heap_tables(uint64_t size) {
 
 // First address >= from at which `size` bytes are free in the alias region; 0 when there is none.
 uint64_t find_free_alias(uint64_t from, uint64_t size) {
-    const uint64_t limit = kAliasBase + kAliasSize;
-    uint64_t cand = std::max(from, kAliasBase);
+    const uint64_t base = alias_base();
+    const uint64_t limit = base + kAliasSize;
+    uint64_t cand = std::max(from, base);
     for (;;) {
         if (cand >= limit || size > limit - cand) return 0;
         bool moved = false;
@@ -363,8 +416,18 @@ void shutdown() {
         g_kernel_next = kKernelBase;
     }
     g_default_heap.store(0);
+    g_alias_base.store(0, std::memory_order_release);
     g_inited.store(false);
     NXLOG_I(kTag, "shutdown: all mappings of this module released");
+}
+
+uint64_t alias_base() {
+    if (const uint64_t cached = g_alias_base.load(std::memory_order_acquire)) return cached;
+    std::lock_guard lk(g_alias_base_mu);
+    if (const uint64_t cached = g_alias_base.load(std::memory_order_relaxed)) return cached;
+    const uint64_t chosen = select_alias_base();
+    g_alias_base.store(chosen, std::memory_order_release);
+    return chosen;
 }
 
 bool initialised() { return g_inited.load(); }
@@ -790,7 +853,7 @@ uint64_t heap_alias(uint64_t offset, uint64_t size, uint64_t at, Prot p) {
         return at;
     }
 
-    uint64_t cand = kAliasBase;
+    uint64_t cand = alias_base();
     for (int tries = 0; tries < kAliasTries; tries++) {
         cand = find_free_alias(cand, size);
         if (!cand) break;

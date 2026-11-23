@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "nxrt/config.h"
 #include "nxrt/ftrace.h"
@@ -188,6 +189,22 @@ uint64_t GraphicsKey::hash() const {
     return h;
 }
 
+namespace {
+std::mutex g_early_ft_mu;
+std::unordered_set<std::string> g_early_ft_hashes;
+
+void note_early_fragment_tests_patched(const char* what) {
+    if (!what || !*what) return;
+    std::lock_guard<std::mutex> lk(g_early_ft_mu);
+    g_early_ft_hashes.emplace(what);
+}
+}  // namespace
+
+bool early_fragment_tests_patched(const std::string& fs_hash) {
+    std::lock_guard<std::mutex> lk(g_early_ft_mu);
+    return g_early_ft_hashes.find(fs_hash) != g_early_ft_hashes.end();
+}
+
 // A module for SPIR-V words. The translator declares OpCapability Float64 in every module although no module uses a 64-bit float;
 // devices without shaderFloat64 (Intel iGPUs) reject that, so the capability is dropped when no OpTypeFloat 64 exists.
 static VkShaderModule create_module(const std::vector<uint32_t>& words, const char* what) {
@@ -217,25 +234,39 @@ static VkShaderModule create_module(const std::vector<uint32_t>& words, const ch
     // stencil test runs before them as on the console. Without it a driver may run the shader for fragments the test rejects: their image
     // writes land while their colour does not, which is how the light-list OR shaders spent the four per-tile slots and left the black
     // rectangle (HANDOVER 42.21). Only the listed shaders are touched - the general rule crashed amdvlk while it built pipelines.
+    std::vector<uint32_t> with_early;
     {
         static const std::string list = config_get_str("nvn", "early_fragment_tests_fs",
             "eb74f4cb,077ceb59,d3d6d5bf,a6db222b,1eb6d5fe,238b7791,fe2136f8,3c39992a,b8843fe5,766314ee,a629f4ac");
-        // [nvn] early_fragment_tests = off | early | amd (default off). amdvlk faults while it builds a pipeline with plain
-        // EarlyFragmentTests for these shaders, so \"amd\" uses EarlyAndLateFragmentTestsAMD instead (HANDOVER 42.21).
-        static const std::string mode = config_get_str("nvn", "early_fragment_tests", "off");
-        const bool amd = mode == "amd";
+        // [nvn] early_fragment_tests = off | early | amd | auto (default off).
+        // "amd" (and "auto" on AMD GPUs exposing VK_AMD_shader_early_and_late_fragment_tests) uses EarlyAndLateFragmentTestsAMD.
+        static const std::string cfg_mode = config_get_str("nvn", "early_fragment_tests", "off");
+        const std::string mode = (cfg_mode == "auto")
+            ? (device().features().early_and_late_fragment_tests_amd ? std::string("amd") : std::string("off"))
+            : cfg_mode;
+        const bool amd = (mode == "amd") && device().features().early_and_late_fragment_tests_amd;
+        const bool active = (mode == "early") || amd;
         bool want = false;
-        if (mode != "off" && what) {
-            const std::string h(what);
-            for (size_t k = 0; k < list.size() && !want;) {
-                size_t j = list.find(',', k);
-                if (j == std::string::npos) j = list.size();
-                if (j > k) want = h.compare(0, j - k, list, k, j - k) == 0;
-                k = j + 1;
+        if (active && what) {
+            if (list == "auto" || list == "*") {
+                want = true;
+            } else {
+                const std::string h(what);
+                for (size_t k = 0; k < list.size() && !want;) {
+                    size_t j = list.find(',', k);
+                    if (j == std::string::npos) j = list.size();
+                    if (j > k) want = h.compare(0, j - k, list, k, j - k) == 0;
+                    k = j + 1;
+                }
             }
         }
-        std::vector<uint32_t> with_early;
-        if (want && spirv_add_early_fragment_tests(*code, with_early, amd)) code = &with_early;
+        if (want && spirv_add_early_fragment_tests(*code, with_early, amd)) {
+            code = &with_early;
+            note_early_fragment_tests_patched(what);
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 20)
+                NXLOG_I(kTag, "early_fragment_tests (%s): patched fs %s", amd ? "EarlyAndLateFragmentTestsAMD" : "EarlyFragmentTests", what);
+        }
     }
     static const bool init_outputs = config_get_bool("nvn", "init_outputs", true);
     std::vector<uint32_t> initialised;
@@ -864,6 +895,8 @@ VkPipeline build_graphics_pipeline(const GraphicsKey& key, const ProgLayout& lay
     ri.stencilAttachmentFormat = static_cast<VkFormat>(key.stencil_format);
 
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri};
+    if (device().features().attachment_feedback_loop_layout)
+        gi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     gi.stageCount = ns;
     gi.pStages = stages;
     gi.pVertexInputState = &vi;

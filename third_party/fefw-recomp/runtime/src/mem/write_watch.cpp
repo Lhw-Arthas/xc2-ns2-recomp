@@ -436,7 +436,10 @@ bool vamm_watch_on() {
     static const bool on = config_get_bool("memory", "vamm_write_watch", true);
     return on;
 }
-bool in_alias_window(uint64_t start, uint64_t end) { return start >= kAliasBase && end <= kAliasBase + kAliasSize && start < end; }
+bool in_alias_window(uint64_t start, uint64_t end) {
+    const uint64_t ab = alias_base();
+    return start >= ab && end <= ab + kAliasSize && start < end;
+}
 
 }  // namespace
 

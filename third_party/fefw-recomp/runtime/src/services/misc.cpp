@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <algorithm>
 #include <cstdint>
@@ -416,10 +417,11 @@ static const std::vector<uint32_t>& aoc_indices() {
             return v;
         }
         const std::string dir = aoc_romfs_dir();
-        std::FILE* f = std::fopen((dir + "/indices.txt").c_str(), "r");
-        if (f) {
+        const std::filesystem::path dir_path = std::filesystem::u8path(dir);
+        std::ifstream f(dir_path / "indices.txt");
+        if (f.is_open()) {
             unsigned n = 0;
-            while (std::fscanf(f, "%u", &n) == 1) {
+            while (f >> n) {
                 const std::string romfs = aoc_content_romfs(n);
                 if (aoc_is_dir(romfs)) {
                     v.push_back(n);
@@ -428,24 +430,26 @@ static const std::vector<uint32_t>& aoc_indices() {
                             romfs.c_str());
                 }
             }
-            std::fclose(f);
         } else {
             // No list: read the folder, which is what a package extracts to. Each <16-hex id> whose romfs/ is there
             // becomes one entry, and its index comes from whichever base its name uses.
+            // Use u8string() + path-based is_directory(): path::string() converts through the Windows ANSI code page and throws
+            // system_error on any non-ANSI filename inside the DLC folder (issue #25).
             std::error_code ec;
-            for (const auto& e : std::filesystem::directory_iterator(std::filesystem::u8path(dir), ec)) {
+            for (const auto& e : std::filesystem::directory_iterator(dir_path, ec)) {
                 if (!e.is_directory(ec)) continue;
-                const std::string name = e.path().filename().string();
-                if (name.size() != 16) continue;
+                const auto name_u8 = e.path().filename().u8string();
+                if (name_u8.size() != 16) continue;
                 uint64_t id = 0;
                 bool hex = true;
-                for (char c : name) {
+                for (const auto ch : name_u8) {
+                    const char c = static_cast<char>(ch);
                     const int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10
                                                                                       : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
                     if (d < 0) { hex = false; break; }
                     id = (id << 4) | static_cast<uint64_t>(d);
                 }
-                if (!hex || !aoc_is_dir((e.path() / "romfs").string())) continue;
+                if (!hex || !std::filesystem::is_directory(e.path() / "romfs", ec)) continue;
                 const int index = aoc_index_of_id(id);
                 if (index >= 0) v.push_back(static_cast<uint32_t>(index));
             }

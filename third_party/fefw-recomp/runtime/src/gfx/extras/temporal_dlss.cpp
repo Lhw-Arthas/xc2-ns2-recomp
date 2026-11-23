@@ -112,6 +112,42 @@ sl::float4x4 mat(const float* cm) {   // column-major column-vector matrix -> St
     return m;
 }
 
+// [dlss] preset: default | J | K (any mode) | L | M (Performance / Ultra Performance only). Switchable live.
+std::atomic<int> g_dlss_preset{-1};          // -1: not read yet; else a sl::DLSSPreset value
+std::atomic<uint32_t> g_dlss_preset_epoch{0};
+int parse_dlss_preset(std::string v) {
+    for (char& c : v) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (v.size() == 1 && v[0] >= 'J' && v[0] <= 'M') return static_cast<int>(sl::DLSSPreset::ePresetJ) + (v[0] - 'J');
+    return static_cast<int>(sl::DLSSPreset::eDefault);
+}
+sl::DLSSPreset dlss_preset_now() {
+    int p = g_dlss_preset.load(std::memory_order_acquire);
+    if (p < 0) {
+        p = parse_dlss_preset(config_get_str("dlss", "preset", "default"));
+        int expect = -1;
+        g_dlss_preset.compare_exchange_strong(expect, p);
+        p = g_dlss_preset.load(std::memory_order_acquire);
+    }
+    return static_cast<sl::DLSSPreset>(p);
+}
+const char* dlss_preset_label(sl::DLSSPreset p) {
+    switch (p) {
+        case sl::DLSSPreset::ePresetJ: return "J";
+        case sl::DLSSPreset::ePresetK: return "K";
+        case sl::DLSSPreset::ePresetL: return "L";
+        case sl::DLSSPreset::ePresetM: return "M";
+        default: return "default";
+    }
+}
+// The model a mode actually gets (options()): L / M only reach Performance and Ultra Performance.
+std::string dlss_preset_in_mode(sl::DLSSMode m) {
+    const sl::DLSSPreset p = dlss_preset_now();
+    const bool lm = p == sl::DLSSPreset::ePresetL || p == sl::DLSSPreset::ePresetM;
+    if (lm && m != sl::DLSSMode::eMaxPerformance && m != sl::DLSSMode::eUltraPerformance)
+        return std::string("default (") + dlss_preset_label(p) + " is for Performance / Ultra Performance only)";
+    return dlss_preset_label(p);
+}
+
 class Dlss final : public TemporalBackend {
 public:
     explicit Dlss(gfx::Device& dev) : dev_(&dev) {}
@@ -128,7 +164,14 @@ public:
         // The mode: kept while the input size stays in its dynamic range (the game may change its render size per frame), else the one
         // whose scale is nearest the actual ratio and whose range holds the input (DLAA at the same size).
         const bool same_out = f.out.width == last_out_.width && f.out.height == last_out_.height;
+        const uint32_t epoch = g_dlss_preset_epoch.load(std::memory_order_acquire);
+        if (epoch != preset_epoch_ && last_mode_ != sl::DLSSMode::eCount && same_out && in_range(range_, f.render)) {   // [dlss] preset changed live
+            preset_epoch_ = epoch;
+            if (s.set_options(vp, options(last_mode_, f.out)) != sl::Result::eOk) return fail("slDLSSSetOptions");
+            NXLOG_I(kTag, "%s: model preset %s (mode %s)", name(), dlss_preset_in_mode(last_mode_).c_str(), mode_name(last_mode_));
+        }
         if (!same_out || !in_range(range_, f.render)) {
+            preset_epoch_ = epoch;
             sl::DLSSMode m = sl::DLSSMode::eDLAA;
             Range rg{f.out.width, f.out.height, f.out.width, f.out.height};
             const double r = static_cast<double>(f.out.width) / static_cast<double>(f.render.width);
@@ -153,8 +196,8 @@ public:
             }
             if ((m != last_mode_ || !same_out) && s.set_options(vp, options(m, f.out)) != sl::Result::eOk) return fail("slDLSSSetOptions");
             if (m != last_mode_ || !same_out)
-                NXLOG_I(kTag, "%s: mode %s, %ux%u -> %ux%u (input range %ux%u .. %ux%u)", name(), mode_name(m), f.render.width, f.render.height, f.out.width,
-                        f.out.height, rg.min_w, rg.min_h, rg.max_w, rg.max_h);
+                NXLOG_I(kTag, "%s: mode %s, %ux%u -> %ux%u (input range %ux%u .. %ux%u), model preset %s", name(), mode_name(m), f.render.width,
+                        f.render.height, f.out.width, f.out.height, rg.min_w, rg.min_h, rg.max_w, rg.max_h, dlss_preset_in_mode(m).c_str());
             if (!in_range(rg, f.render) && !same_out)
                 NXLOG_W(kTag, "%s: input %ux%u is outside every mode's range for %ux%u", name(), f.render.width, f.render.height, f.out.width, f.out.height);
             last_mode_ = m;
@@ -212,6 +255,11 @@ private:
         o.outputHeight = out.height;
         o.colorBuffersHDR = sl::Boolean::eTrue;
         o.useAutoExposure = sl::Boolean::eTrue;
+        // J and K go to every mode. L and M are the Ultra Performance / Performance models: on DLAA at 4K they drew rows of black lines
+        // across the picture and cost frame time (2026-11-22, RTX 5090), so they apply to those two modes only and the rest keep default.
+        const sl::DLSSPreset p = dlss_preset_now();
+        if (p == sl::DLSSPreset::ePresetL || p == sl::DLSSPreset::ePresetM) o.performancePreset = o.ultraPerformancePreset = p;
+        else o.dlaaPreset = o.qualityPreset = o.balancedPreset = o.performancePreset = o.ultraPerformancePreset = o.ultraQualityPreset = p;
         return o;
     }
     static bool range_for(Sl& s, sl::DLSSMode m, VkExtent2D out, Range* r) {
@@ -243,11 +291,20 @@ private:
     gfx::Device* dev_;
     bool dlaa_ = false, failed_ = false;
     sl::DLSSMode last_mode_ = sl::DLSSMode::eCount;
+    uint32_t preset_epoch_ = 0;
     VkExtent2D last_out_ = {};
     Range range_;
 };
 
 }  // namespace
+
+void set_dlss_preset_live(const char* preset) {
+    const int p = parse_dlss_preset(preset ? preset : "default");
+    if (g_dlss_preset.exchange(p, std::memory_order_acq_rel) == p) return;
+    g_dlss_preset_epoch.fetch_add(1, std::memory_order_acq_rel);
+    NXLOG_I(kTag, "DLSS model preset -> %s (live)", dlss_preset_label(static_cast<sl::DLSSPreset>(p)));
+}
+std::string dlss_preset_current() { return dlss_preset_label(dlss_preset_now()); }
 
 bool temporal_dlss_available() {
     const std::wstring dir = sl_dir();

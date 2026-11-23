@@ -80,7 +80,7 @@ uint32_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint64_t& out) {
                       : (1ull << kernel::app_core_count()) - 1;
             return kernel::kOk;
         case 1: out = kPriorityMaskApp; return kernel::kOk;                   // PriorityMask
-        case 2: out = mem::kAliasBase; return kernel::kOk;                    // AliasRegionAddress
+        case 2: out = mem::alias_base(); return kernel::kOk;                  // AliasRegionAddress
         case 3: out = mem::kAliasSize; return kernel::kOk;                    // AliasRegionSize
         case 4: out = mem::kHeapBase; return kernel::kOk;                     // HeapRegionAddress
         case 5: out = mem::kHeapMax; return kernel::kOk;                      // HeapRegionSize

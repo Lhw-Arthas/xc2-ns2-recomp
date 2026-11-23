@@ -29,11 +29,14 @@ const SECTIONS = [
       { id: 'upscaler', type: 'select', label: 'settings.upscaler.label', sec: 'dlss', key: 'upscaler', def: 'taau',
         options: [['taau', 'settings.upscaler.taau'], ['fsr3', 'settings.upscaler.fsr3'], ['dlss', 'settings.upscaler.dlss'],
           ['xess', 'settings.upscaler.xess'], ['auto', 'settings.upscaler.auto']],
-        hint: 'settings.upscaler.hint' },
+        hint: 'settings.upscaler.hint',
+        // the DLSS files (NVIDIA's, not in the package) and the button that fetches them, while DLSS is chosen for upscaling or frames
+        status: 'dlss', showStatus: (m) => m.upscaler === 'dlss' || m.upscaler === 'auto' || m.frame_gen === 'dlss' },
       { id: 'lockRenderSize', type: 'toggle', label: 'settings.lockRenderSize.label', sec: 'upscale', key: 'lock_render_size', def: '0',
         hint: 'settings.lockRenderSize.hint' },
       { id: 'fsr_dll', type: 'path', label: 'settings.fsrDll.label', sec: 'upscale', key: 'fsr_dll', def: '', placeholder: 'settings.fsrDll.placeholder',
-        hint: 'settings.fsrDll.hint' },
+        hint: 'settings.fsrDll.hint',
+        status: 'fsr', showStatus: (m) => m.upscaler === 'fsr3' || m.upscaler === 'auto' || m.frame_gen === 'fsr3' },
       { id: 'frame_gen', type: 'select', label: 'settings.frameGen.label', sec: 'dlss', key: 'frame_gen', def: '0',
         options: [['0', 'settings.frameGen.off'], ['dlss', 'settings.frameGen.dlss'], ['fsr3', 'settings.frameGen.fsr3']],
         hint: 'settings.frameGen.hint' },
@@ -82,8 +85,7 @@ const SECTIONS = [
       { id: 'log_path', type: 'path', label: 'settings.logPath.label', sec: 'log', key: 'path', def: 'nxrt.log',
         placeholder: 'settings.logPath.placeholder', hint: 'settings.logPath.hint' },
       // The game's own language: it follows the console's, so the value is a Switch code (zh-CN is a Windows locale
-      // The game's own text language. Every value below is one the retail 3.0.1 title lists as supported
-      // (NXRT_TITLE_SUPPORTED_LANGUAGES, written by setup); voice is Japanese and English whatever is chosen.
+      // The game's own text language (AmericanEnglish runs as BritishEnglish). Voice is Japanese and English whatever is chosen.
       { id: 'game_lang', type: 'select', label: 'settings.gameLang.label', sec: 'system', key: 'language', def: 'auto',
         // Order is a statement, not alphabetical: Simplified first, Traditional next, then the two English entries,
         // then Japanese, then the rest. Automatic (follow the Windows language) sits last.
@@ -187,7 +189,7 @@ export async function render(el, ctx) {
 
   const fieldHtml = (f) => `
     <div class="field">
-      <label class="name">${esc(t(f.label))}${f.hint ? `<span class="hint">${esc(t(f.hint))}</span>` : ''}${f.status ? `<span class="hint" data-status="${f.status}">${esc(t('settings.files.checking'))}</span>` : ''}</label>
+      <label class="name">${esc(t(f.label))}${f.hint ? `<span class="hint">${esc(t(f.hint))}</span>` : ''}${f.status && (!f.showStatus || f.showStatus(model)) ? `<span class="hint" data-status="${f.status}">${esc(t('settings.files.checking'))}</span>` : ''}</label>
       <div class="control">${CONTROL[f.type](f, model[f.id])}</div>
     </div>`;
 
@@ -295,6 +297,85 @@ export async function render(el, ctx) {
     put('fsr', `${line('settings.files.upscaling', r.fsr_upscaling)}. ${line('settings.files.frameGen', r.fsr_framegen)}.`);
     put('dlss', `${line('settings.files.dlss', r.dlss)}. ${line('settings.files.dlssFrameGen', r.dlss_framegen)}.`);
     if (r.xess) put('xess', `${line('settings.files.xess', r.xess)}.`);
+    // Optional official-source downloaders for DLSS (NVIDIA Streamline) and FSR (AMD GPUOpen), shown while the default folder lacks them.
+    const syncDl = async (kind, need) => {
+      const st = await api(`${kind}_download_status`).catch(() => null);
+      if (st && st.state === 'running') pollDownloader(kind);
+      else renderDownloader(kind, need, st && st.state === 'error' ? st : null);
+    };
+    await syncDl('dlss', !r.dlss_framegen.found && !String(model.dlss_dll || '').trim());
+    await syncDl('fsr', (!r.fsr_upscaling.found || !r.fsr_framegen.found) && !String(model.fsr_dll || '').trim());
+  }
+
+  const dlCfg = {
+    dlss: {
+      size: 276,
+      getKey: 'settings.files.dlssGet',
+      hintKey: 'settings.files.dlssGetHint',
+      doneKey: 'settings.files.dlssGetDone',
+      confirmKey: 'settings.files.dlssConfirm',
+      params: { version: '2.14.16', size: 276 },
+    },
+    fsr: {
+      size: 46,
+      getKey: 'settings.files.fsrGet',
+      hintKey: 'settings.files.fsrGetHint',
+      doneKey: 'settings.files.fsrGetDone',
+      confirmKey: 'settings.files.fsrConfirm',
+      params: { version: '2.4.0 / 1.1.4', size: 46 },
+    },
+  };
+  const dlPoll = { dlss: 0, fsr: 0 };
+
+  function renderDownloader(kind, show, st) {
+    const cfgDl = dlCfg[kind];
+    el.querySelectorAll(`[data-status="${kind}"]`).forEach((n) => {
+      let box = n.parentElement.querySelector(`[data-dl-get="${kind}"]`);
+      if (!show) {
+        if (box) box.remove();
+        return;
+      }
+      if (!box) {
+        box = document.createElement('span');
+        box.className = 'hint';
+        box.dataset.dlGet = kind;
+        n.after(box);
+      }
+      if (st && st.state === 'running') {
+        box.innerHTML = `${esc(st.message)} <button class="btn" data-dl-cancel="${kind}">${esc(t('settings.files.dlssGetCancel'))}</button>`;
+      } else {
+        box.innerHTML = `<button class="btn" data-dl-start="${kind}">${icon('download')}${esc(t(cfgDl.getKey, cfgDl.params))}</button> `
+          + `${esc(t(cfgDl.hintKey, cfgDl.params))}${st ? ` ${esc(st.message)}` : ''}`;
+      }
+      box.querySelector(`[data-dl-start="${kind}"]`)?.addEventListener('click', () => startDownloader(kind));
+      box.querySelector(`[data-dl-cancel="${kind}"]`)?.addEventListener('click', () => api(`cancel_${kind}_download`).catch(() => {}));
+    });
+    refreshIcons();
+  }
+  async function startDownloader(kind) {
+    const cfgDl = dlCfg[kind];
+    if (!window.confirm(t(cfgDl.confirmKey, cfgDl.params))) return;
+    try {
+      await api(`start_${kind}_download`);
+    } catch (e) {
+      toast(errText(e), 'error');
+      return;
+    }
+    pollDownloader(kind);
+  }
+  async function pollDownloader(kind) {
+    clearTimeout(dlPoll[kind]);
+    const st = await api(`${kind}_download_status`).catch(() => null);
+    if (!st) return;
+    if (st.state === 'running') {
+      renderDownloader(kind, true, st);
+      dlPoll[kind] = setTimeout(() => pollDownloader(kind), 400);
+    } else if (st.state === 'done') {
+      toast(t(dlCfg[kind].doneKey), 'ok');
+      checkFiles();
+    } else if (st.state === 'error') {
+      renderDownloader(kind, true, st);
+    }
   }
   let checkTimer = 0;
 

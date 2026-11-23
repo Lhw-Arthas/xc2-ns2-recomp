@@ -438,8 +438,8 @@ bool apply_fixed(Sec sec, const std::string& k, const std::string& v, Settings* 
                 if (lower(v) == "auto") { s->display.fps_cap = -1; return true; }
                 return set_int(0, 1000, &s->display.fps_cap);
             }
-            if (k == "width") return set_int(320, 16384, &s->display.width);
-            if (k == "height") return set_int(320, 16384, &s->display.height);
+            if (k == "width") return set_size(&s->display.width);
+            if (k == "height") return set_size(&s->display.height);
             if (k == "keep_aspect") return set_bool(&s->display.keep_aspect);
             if (k == "render_scale") {
                 if (lower(v) == "auto") { s->display.render_scale = 0; return true; }
