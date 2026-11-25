@@ -30,4 +30,15 @@ bool spirv_hdr_tonemap(const std::vector<uint32_t>& in, std::vector<uint32_t>& o
 // Returns false (out untouched) when the shader is not one, or peak_ratio <= 1.001.
 bool spirv_hdr_tonemap_lut(const std::vector<uint32_t>& in, float peak_ratio, std::vector<uint32_t>& out);
 
+// HDR patch of a clipping LUT tone map (XC2) (Xenoblade Chronicles 2): the scene colour times the exposure is clamped to [0, 1] per channel, shaped
+// (Log2, scale, Exp2) and looked up in one 3D grading volume whose output is display-encoded [0, 1]. The volume's curve flattens from about mid
+// grey (scene 0.25) to white. The patch keeps the grade and scales the written colour by F^(1/2.2): F = hdr(m) / sdr(m) with m the largest scene
+// channel before the clamp, sdr(v) the game's own display-linear response to a grey of v (its shaper and volume, sampled live) and hdr the curve
+// that follows the game's slope at the knee instead of flattening, hdr(v) = sdr(k) + slope (v - k); F = 1 below the knee. The highlights leave
+// the shader above 1 (linear, times paper white), for the output pass to fit to the display.
+// Below the knee the shader writes exactly what the original writes. Matched by structure: a fragment shader with one or two 3D samples (two
+// volumes blended by depth in the field) at one coordinate whose three components lead back to Exp2(Log2(FClamp(a * b, 0, 1)) * exponent), and a
+// Location 0 vec4 output written per component with alpha 1.0 (the title screen's and the field's passes, with and without a depth write).
+bool spirv_hdr_tonemap_scene(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);
+
 }  // namespace nxrt::extras

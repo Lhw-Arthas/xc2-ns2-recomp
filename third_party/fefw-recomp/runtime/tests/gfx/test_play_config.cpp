@@ -115,7 +115,7 @@ bool same_settings(const Settings& a, const Settings& b) {
     const nxrt::extras::Settings &ea = a.extras, &eb = b.extras;
     if (!(ea.hdr.mode == eb.hdr.mode && ea.hdr.format == eb.hdr.format && ea.hdr.peak_nits == eb.hdr.peak_nits &&
           ea.hdr.paper_white_nits == eb.hdr.paper_white_nits && ea.hdr.highlight_boost == eb.hdr.highlight_boost &&
-          ea.hdr.ui_white_nits == eb.hdr.ui_white_nits && ea.hdr.deband == eb.hdr.deband))
+          ea.hdr.ui_white_nits == eb.hdr.ui_white_nits && ea.hdr.deband == eb.hdr.deband && ea.hdr.style == eb.hdr.style))
         return false;
     if (!(ea.upscale.mode == eb.upscale.mode && ea.upscale.sharpness == eb.upscale.sharpness && ea.upscale.fsr_dll == eb.upscale.fsr_dll &&
           ea.upscale.dlss_dll == eb.upscale.dlss_dll && ea.upscale.xess_dll == eb.upscale.xess_dll &&
@@ -967,6 +967,7 @@ const char* const kExtrasFile =
     "highlight_boost = 1.5\n"
     "ui_white_nits = 150\n"
     "deband = 0\n"
+    "style = vivid\n"
     "[upscale]\n"
     "mode = fsr1\n"
     "sharpness = 0.5\n"
@@ -989,6 +990,7 @@ NXTEST(extras_defaults) {
     CHECK(d.extras.hdr.highlight_boost == 1.0);
     CHECK(d.extras.hdr.ui_white_nits == 0.0);
     CHECK(d.extras.hdr.deband);
+    CHECK(d.extras.hdr.style == nxrt::extras::HdrStyle::Accurate);
     CHECK(d.extras.upscale.mode == UpscaleMode::Off);
     CHECK(d.extras.upscale.sharpness == 0.8);
     CHECK(d.extras.upscale.fsr_dll.empty());
@@ -1019,6 +1021,7 @@ NXTEST(extras_full_file_every_key) {
     CHECK(s.extras.hdr.highlight_boost == 1.5);
     CHECK(s.extras.hdr.ui_white_nits == 150.0);
     CHECK(!s.extras.hdr.deband);
+    CHECK(s.extras.hdr.style == nxrt::extras::HdrStyle::Vivid);
     CHECK(s.extras.upscale.mode == UpscaleMode::Fsr1);
     CHECK(s.extras.upscale.sharpness == 0.5);
     CHECK_EQ(s.extras.upscale.fsr_dll, std::string("C:\\Tools\\amd_fidelityfx_vk.dll"));
@@ -1161,7 +1164,7 @@ NXTEST(extras_keys_and_words_case_insensitive) {
 
 NXTEST(extras_defaults_are_written) {
     const std::string text = format_settings(default_settings());
-    CHECK(text.find("[hdr]\nmode = auto\nformat = auto\npeak_nits = 0\npaper_white_nits = 0\nhighlight_boost = 1\nui_white_nits = 0\ndeband = 1\n") !=
+    CHECK(text.find("[hdr]\nmode = auto\nformat = auto\npeak_nits = 0\npaper_white_nits = 0\nhighlight_boost = 1\nui_white_nits = 0\ndeband = 1\nstyle = accurate\n") !=
           std::string::npos);
     CHECK(text.find("[upscale]\nmode = off\nsharpness = 0.8\nscene_scale = 100\nfsr_dll = \ndlss_dll = \nxess_dll = \nframe_generation = 0\n") !=
           std::string::npos);
@@ -1173,7 +1176,7 @@ NXTEST(extras_full_file_round_trip) {
     std::string err;
     REQUIRE_MSG(parse_settings(kExtrasFile, &s, &err), err);
     const std::string text = format_settings(s);
-    CHECK(text.find("[hdr]\nmode = on\nformat = hdr10\npeak_nits = 1000\npaper_white_nits = 250\nhighlight_boost = 1.5\nui_white_nits = 150\ndeband = 0\n") !=
+    CHECK(text.find("[hdr]\nmode = on\nformat = hdr10\npeak_nits = 1000\npaper_white_nits = 250\nhighlight_boost = 1.5\nui_white_nits = 150\ndeband = 0\nstyle = vivid\n") !=
           std::string::npos);
     CHECK(text.find("[upscale]\nmode = fsr1\nsharpness = 0.5\nscene_scale = 100\nfsr_dll = C:\\Tools\\amd_fidelityfx_vk.dll\n") != std::string::npos);
     CHECK(text.find("xess_dll = \nframe_generation = 1\n") != std::string::npos);

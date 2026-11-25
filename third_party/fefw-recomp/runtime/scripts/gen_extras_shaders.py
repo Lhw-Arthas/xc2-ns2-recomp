@@ -42,6 +42,9 @@ layout(push_constant) uniform PushConstants {
     vec4 scn;    // the picture in u_scene / u_final UV: origin xy, size zw
     vec4 ui;     // x: UI brightness over paper white (1 = paper white), y: 1 = deband the 8-bit source (HDR modes),
                  // z: HDR test pattern (0 none, 1 peak, 2 black, 3 staircase), w: the peak pattern's inner squares in nits
+    vec4 hx;     // x: 1 = u_src (and u_scene / u_final) hold display-encoded floats with highlights above 1, y: the brightest highlight
+                 // over paper white they are fitted to,
+                 // w: 1 = clip the source at 1 instead (the 8-bit look, for the highlight expansion of src.w)
 } pc;
 
 // Picture controls on a display-encoded signal (0..1 in SDR; above 1 for HDR highlights): black level, contrast around mid grey, saturation
@@ -69,6 +72,22 @@ vec3 srgb_eotf(vec3 x) {
     vec3 lo = x / 12.92;
     vec3 hi = pow((x + 0.055) / 1.055, vec3(2.4));
     return vec3(x.r <= 0.04045 ? lo.r : hi.r, x.g <= 0.04045 ? lo.g : hi.g, x.b <= 0.04045 ? lo.b : hi.b);
+}
+
+// A display-encoded value with highlights above 1 to linear: sRGB up to 1, a 2.2 power above (the tone-map patch's encode).
+vec3 decode_ext(vec3 x) {
+    x = max(x, vec3(0.0));
+    vec3 hi = pow(x, vec3(2.2));
+    vec3 lo = srgb_eotf(x);
+    return vec3(x.r > 1.0 ? hi.r : lo.r, x.g > 1.0 ? hi.g : lo.g, x.b > 1.0 ? hi.b : lo.b);
+}
+
+// Highlights above paper white (1.0) brought under r: slope 1 at 1, r the asymptote; one factor for the three channels keeps the hue.
+vec3 fit_highlights(vec3 c, float r) {
+    float m = max(max(c.r, c.g), c.b);
+    if (m <= 1.0) return c;
+    float a = max(r - 1.0, 1e-4);
+    return c * ((1.0 + a * (1.0 - exp(-(m - 1.0) / a))) / m);
 }
 
 // Triangular noise in [-1, 1] for a pixel (the sum of two hashed uniforms), the same every frame.
@@ -103,6 +122,8 @@ void main() {
     vec2 texel = pc.crop.xy + local * pc.crop.zw;
     texel = clamp(texel, pc.crop.xy + 0.5, pc.crop.xy + pc.crop.zw - 0.5);
     vec3 rgb = textureLod(u_src, texel / pc.src.xy, 0.0).rgb;
+    bool enc = pc.hx.x > 0.5, clip = pc.hx.w > 0.5;   // clip: the old look, as if the source were 8-bit
+    if (enc) rgb = clip ? srgb_eotf(rgb) : decode_ext(rgb);
 
     int mode = int(pc.p.x + 0.5);
     bool adjust = pc.p.w > 0.5;
@@ -133,9 +154,11 @@ void main() {
     if (mode >= 2 && pc.ui.y > 0.5 && pat == 0) {
         vec3 e = srgb_oetf(rgb);
         vec3 room = clamp(min(e, 1.0 - e) * 255.0, 0.0, 1.0);
-        rgb = srgb_eotf(e + room * (tpdf_noise(uvec2(gl_FragCoord.xy)) / 255.0));
+        vec3 d = srgb_eotf(e + room * (tpdf_noise(uvec2(gl_FragCoord.xy)) / 255.0));
+        rgb = vec3(rgb.r < 1.0 ? d.r : rgb.r, rgb.g < 1.0 ? d.g : rgb.g, rgb.b < 1.0 ? d.b : rgb.b);   // highlights above white as they are
     }
     if (adjust && mode >= 2) rgb = pow(picture(pow(max(rgb, vec3(0.0)), vec3(1.0 / 2.2))), vec3(2.2));   // HDR: on a 2.2 power curve
+    if (enc && !clip && mode >= 2 && pat == 0) rgb = fit_highlights(rgb, pc.hx.y);   // the game's own highlights, fitted to the display
     // Display-referred 8-bit game output is clamped to [0,1] (= [0, paper white]). When highlight expansion is requested,
     // keep shadows/midtones at 1:1 paper white and lift upper highlights smoothly toward peak_ratio * paper_white.
     if (pat == 0 && mode >= 2 && (pc.src.w > 1.001 || abs(pc.ui.x - 1.0) > 0.001)) {
@@ -151,6 +174,7 @@ void main() {
         // UI drawn over the scene changed the pixel: no expansion, the UI brightness instead
         vec2 suv = pc.scn.xy + local * pc.scn.zw;
         vec3 fin = max(textureLod(u_final, suv, 0.0).rgb, vec3(0.0)), scn = max(textureLod(u_scene, suv, 0.0).rgb, vec3(0.0));
+        if (enc) { fin = clip ? srgb_eotf(fin) : decode_ext(fin); scn = clip ? srgb_eotf(scn) : decode_ext(scn); }
         vec3 d = abs(pow(fin, vec3(1.0 / 2.2)) - pow(scn, vec3(1.0 / 2.2)));
         float ui = smoothstep(0.008, 0.04, max(d.r, max(d.g, d.b)));
         rgb *= mix(gain, pc.ui.x, ui);
@@ -183,7 +207,7 @@ layout(location = 0) in vec2 v_dst;
 layout(location = 0) out vec4 o_color;
 layout(set = 0, binding = 0) uniform sampler2D u_ui;
 layout(push_constant) uniform PushConstants {
-    vec4 p;      // x: mode (2 HDR10, 3 scRGB), y: paper white nits, z: peak nits
+    vec4 p;      // x: mode (1 SDR, 2 HDR10, 3 scRGB), y: paper white nits, z: peak nits
 } pc;
 
 // IEC 61966-2-1 sRGB EOTF (encoded to linear) of clamp(x, 0, 1).
@@ -217,7 +241,9 @@ void main() {
     vec3 lin = srgb_eotf(straight);   // scene-linear, 1.0 = paper white
     int mode = int(pc.p.x + 0.5);
     vec3 outc;
-    if (mode == 2) {
+    if (mode == 1) {
+        outc = straight;              // SDR (the HDR / SDR compare): the sRGB-encoded colour as ImGui would write it
+    } else if (mode == 2) {
         // BT.709 to BT.2020 -> nits, limited to the peak, then PQ
         vec3 r2020 = vec3(dot(vec3(0.6274, 0.3293, 0.0433), lin),
                           dot(vec3(0.0691, 0.9195, 0.0114), lin),
@@ -377,7 +403,7 @@ HEADER = """// GENERATED by scripts/gen_extras_shaders.py: do not edit
 //     game picture; the same sampler setup as the present pass.
 //     Bindings 1 (u_scene, the window texture before the UI) and 2 (u_final, the window texture as presented), same size, read at scn:
 //     where they differ the UI covers the pixel and the highlight expansion is left out. Bind u_final to both when no copy exists.
-//   Push constants: 112 bytes, VK_SHADER_STAGE_FRAGMENT_BIT.
+//   Push constants: 128 bytes, VK_SHADER_STAGE_FRAGMENT_BIT.
 //     offset 0   vec4 pic   picture rectangle in destination UV: x, y, w, h (0, 0, 1, 1 when the picture fills the target)
 //     offset 16  vec4 crop  source crop in texels: x, y, w, h
 //     offset 32  vec4 src   x, y: whole source size in texels; z: 1 = flip the picture vertically, 0 = no flip
@@ -401,6 +427,10 @@ HEADER = """// GENERATED by scripts/gen_extras_shaders.py: do not edit
 //                           z: test pattern in modes 2 and 3 (extras/hdr_pattern.h): 0 none, 1 peak (small tiles of 10000 nits around w nits, on black,
 //                              PQ or scRGB with no peak limit), 2 black (tiles of 8-bit codes 1..16 on black, then the picture controls and the encode),
 //                              3 staircase (8 bars of 300..1000 nits along the top 7%, on black, no peak limit)
+//     offset 112 vec4 hx    x: 1 = the source (and u_scene / u_final) are float with display-encoded values, highlights above 1: decoded by sRGB up
+//                           to 1 and a 2.2 power above; in modes 2 and 3 the largest channel m above 1 is then fitted under y, one factor per
+//                           pixel, before the UI brightness: 1 + (y - 1)(1 - exp(-(m - 1) / (y - 1))); w: 1 = the source is clipped at 1 and decoded by sRGB instead
+//                           (the 8-bit picture), no reshape (src.w's expansion applies as for an 8-bit source)
 //   Output: location 0, vec4, alpha always 1. Letterbox bars are (0, 0, 0, 1) in every mode.
 //
 // kOverlayCompositeFrag: fragment shader that draws the ImGui overlay on an HDR swapchain image. Used with kOutVert.
@@ -408,7 +438,8 @@ HEADER = """// GENERATED by scripts/gen_extras_shaders.py: do not edit
 //   Descriptors: set 0, binding 0, COMBINED_IMAGE_SAMPLER (sampler2D u_ui), fragment stage. The image has the swapchain's size
 //     and is read at v_dst with a linear sampler, clamp to edge (the texel centres, so no scaling).
 //   Push constants: 16 bytes, VK_SHADER_STAGE_FRAGMENT_BIT.
-//     offset 0   vec4 p     x: mode, read as int(x + 0.5): 2 = HDR10 (BT.709 to BT.2020, nits = min(rgb * y, z), ST 2084 PQ),
+//     offset 0   vec4 p     x: mode, read as int(x + 0.5): 1 = SDR (the straight sRGB-encoded colour, for an SDR swapchain after the HDR / SDR
+//                             compare switched to it), 2 = HDR10 (BT.709 to BT.2020, nits = min(rgb * y, z), ST 2084 PQ),
 //                             3 = scRGB (rgb * y / 80, no clamp), any other value = scene-linear, unencoded.
 //                           y: paper white nits (UI white, the sRGB value 1.0, maps to this); z: peak nits (mode 2 limit); w: unused.
 //   Output: location 0, vec4 (encoded rgb of the un-premultiplied colour, a = the overlay's alpha). Texels with alpha 0 output

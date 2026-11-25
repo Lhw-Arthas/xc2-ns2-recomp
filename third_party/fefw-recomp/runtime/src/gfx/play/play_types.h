@@ -364,7 +364,7 @@ const char* key_alt_sens();
 //              dynamic_resolution anisotropy lod_bias bloom chromatic_aberration fast_gpu_memory fewer_gpu_waits shader_prewarm astc_quality (fast high uncompressed)
 //              monitor (auto or the display's number, 1 = the first)
 //   [hdr]      mode (off auto on) format (auto hdr10 scrgb) peak_nits (0 = auto, else 200..10000) paper_white_nits (0 = auto, else
-//              80..500) highlight_boost (0..2) ui_white_nits (0 = paper white, else 80..500) deband (1/0)
+//              80..500) highlight_boost (0..2) ui_white_nits (0 = paper white, else 80..500) deband (1/0) style (accurate vivid)
 //   [upscale]  mode (off fsr1 nis, and fsr3 dlss xess kept but not used; spatial = fsr1) sharpness (0..1) fsr_dll dlss_dll xess_dll (paths, kept verbatim)
 //              frame_generation (1/0)
 //   [latency]  mode (off auto on boost) log_timings (1/0)

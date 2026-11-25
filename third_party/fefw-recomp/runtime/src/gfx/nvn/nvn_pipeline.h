@@ -87,7 +87,7 @@ struct GraphicsKey {
     uint8_t xfb = 0;                            // the vertex shader runs with transform feedback (captured outputs, no fragment stage)
     uint8_t dual_src = 0;                       // a blend factor of an enabled attachment reads the second source (fragment output moved to Location 0, Index 1)
     uint8_t no_out = 0;                         // the pass has no colour attachment: the fragment shader's outputs become private variables
-    uint8_t pad[0 + 1] = {};
+    uint8_t sdr_tone_map = 0;                   // HDR scene shown as SDR: a patched tone-map shader runs as the game's own (extras/hdr_live.h)
     // Tessellation control and evaluation stages (null: none). Last, so that the prewarm key file keeps its record layout (it records the bytes
     // before these and never a tessellated key). A key with them has topology PATCH_LIST and patch_control_points = the NVN patch size.
     const ShaderInfo* tess[2] = {};

@@ -36,6 +36,8 @@ void pin_render_size_tick();
 // declares for an HDR TV on Switch 2 (nn::vi layer content luminance ranges, NVN2 window colour space and HDR metadata); see docs/S14.md.
 enum class HdrMode : uint8_t { Off = 0, Auto, On, Native };
 enum class HdrFormat : uint8_t { Auto = 0, Hdr10, ScRgb };     // swapchain flavour (Auto: HDR10 when offered, else scRGB)
+// Accurate: the game's own picture plus the highlights it really has ([hdr] keep_highlights); Vivid: the picture stretched toward the peak
+enum class HdrStyle : uint8_t { Accurate = 0, Vivid };
 
 struct HdrSettings {
     HdrMode mode = HdrMode::Auto;
@@ -45,6 +47,7 @@ struct HdrSettings {
     double highlight_boost = 1.0;    // 0 = the game's SDR look up to its own white, 1 = highlights reach the peak (0 .. 2)
     double ui_white_nits = 0;        // the game UI's white: 0 = paper white, else 80..500 (needs the UI split, [hdr] ui_split)
     bool deband = true;              // hide the 8-bit picture's steps (banding) in HDR with a fine noise
+    HdrStyle style = HdrStyle::Accurate;   // live
 };
 
 // Nis: NVIDIA Image Scaling v1.0.3 (spatial, any GPU). Fsr3, Dlss, Dlaa: temporal (Dlaa = DLSS at the input size).

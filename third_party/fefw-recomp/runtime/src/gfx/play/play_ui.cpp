@@ -109,6 +109,8 @@ constexpr extras::HdrPattern kHdrPatternKinds[] = {extras::HdrPattern::None, ext
                                                    extras::HdrPattern::Black};
 
 constexpr const char* kHdrFmtZh[] = {"自动", "HDR10", "scRGB"};
+constexpr const char* kHdrStyleZh[] = {"准确", "鲜艳"};
+constexpr const char* kHdrStyleEn[] = {"Accurate", "Vivid"};
 constexpr const char* kHdrFmtEn[] = {"Auto", "HDR10", "scRGB"};
 
 constexpr const char* kLatencyZh[] = {"关闭", "自动", "开启", "增强 (Boost)"};
@@ -1200,21 +1202,35 @@ void tab_graphics(const LiveStatus& live, Page& p, float bottom_h) {
     }
 
     card_group("HDR 高动态范围输出", "HDR Output");
+    // Native uses the HDR levels a game declares (nn::vi / NVN window metadata); offered only when the running game declares them
+    const extras::HdrState hst = extras::hdr_state();
+    const bool game_levels = hst.game_standard_nits >= 80.0f || hst.game_max_cll > 0.0f;
+    // started in HDR: mode and format switch live; started with HDR off: turning it on needs a restart
+    const bool hdr_live = hst.scene_hdr;
     int hmode = static_cast<int>(hdr.mode);
     if (card_choice("hdr_mode", "HDR 模式", "HDR mode",
-                    "开启需显示器及 Windows 系统均开启 HDR。「Switch 2 原生 HDR」使用游戏原版 HDR 色调映射参数。\n\n选「自动」，Windows 开启 HDR 时就会使用 HDR。修改后需重启游戏。",
-                    "Requires an HDR display with Windows HDR enabled.\n\n"
-                    "Choose Auto to use HDR whenever Windows has HDR on. Restart the game after changing it.",
-                    &hmode, kHdrModeZh, kHdrModeEn, 4, true)) {
+                    "需要显示器和 Windows 都开启 HDR。游戏以 HDR 启动时可随时切换；以「关闭」启动时，开启 HDR 需要重启游戏。\n\n选「自动」，Windows 开启 HDR 时就会使用 HDR。",
+                    "Needs an HDR display with Windows HDR turned on. Switches right away when the game started with HDR; if it started with HDR off, "
+                    "turning HDR on needs a restart.\n\nChoose Auto to use HDR whenever Windows has HDR on.",
+                    &hmode, kHdrModeZh, kHdrModeEn, game_levels || hmode == 3 ? 4 : 3, !hdr_live, hdr_live)) {
         hdr.mode = static_cast<extras::HdrMode>(hmode);
+        mark(p);
+    }
+    int hstyle = static_cast<int>(hdr.style);
+    if (card_choice("hdr_style", "HDR 风格", "HDR style",
+                    "「准确」保留游戏原本的画面，只加上游戏里真实存在的高光亮度。「鲜艳」把画面拉伸得更亮、更有冲击力。\n\n想看到美术设计的原貌就选「准确」；想要更亮的画面就选「鲜艳」，再用「HDR 高光增强」调整。",
+                    "Accurate keeps the game's own picture and adds only the brightness its highlights really have. Vivid stretches the picture for a brighter, punchier look.\n\n"
+                    "Choose Accurate to see the game as its artists made it. Choose Vivid for a brighter look, then adjust it with HDR highlight boost.",
+                    &hstyle, kHdrStyleZh, kHdrStyleEn, 2, false, true)) {
+        hdr.style = static_cast<extras::HdrStyle>(hstyle);
         mark(p);
     }
     int hfmt = static_cast<int>(hdr.format);
     if (card_choice("hdr_fmt", "HDR 信号格式", "HDR format",
-                    "发送给显示器的信号格式：HDR10 或 scRGB，自动会优先选用显示器原生支持的 HDR10。\n\n保持「自动」。只有显示器或录制软件需要 scRGB 时才修改。修改后需重启游戏。",
+                    "发送给显示器的信号格式：HDR10 或 scRGB，自动会优先选用显示器原生支持的 HDR10。\n\n保持「自动」。只有显示器或录制软件需要 scRGB 时才修改。",
                     "Signal format sent to display (HDR10 or scRGB).\n\n"
-                    "Leave this on Auto. Only change it if your display or recording software needs scRGB. Restart the game after changing it.",
-                    &hfmt, kHdrFmtZh, kHdrFmtEn, 3, true)) {
+                    "Leave this on Auto. Only change it if your display or recording software needs scRGB.",
+                    &hfmt, kHdrFmtZh, kHdrFmtEn, 3, !hdr_live, hdr_live)) {
         hdr.format = static_cast<extras::HdrFormat>(hfmt);
         mark(p);
     }
@@ -1239,7 +1255,7 @@ void tab_graphics(const LiveStatus& live, Page& p, float bottom_h) {
         mark(p);
     }
     const SliderHint h_boost = hint_boost(hdr.highlight_boost);
-    if (card_slider_f("hdr_boost", "HDR 高光增强", "HDR highlight boost",
+    if (hdr.style == extras::HdrStyle::Vivid && card_slider_f("hdr_boost", "HDR 高光增强", "HDR highlight boost",
                       "控制高光向峰值亮度扩展的幅度，0.00 接近 SDR，1.00 标准 HDR。\n\n调高直到太阳和反光闪耀；如果明亮的天空变成一片白，就调低。",
                       "Expands highlights toward peak brightness.\n\n"
                       "Raise it until the sun and reflections sparkle. Lower it if bright skies turn into plain white.",

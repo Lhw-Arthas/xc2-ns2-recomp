@@ -25,6 +25,7 @@
 
 #include "api_dlss.h"
 #include "extras/framegen.h"
+#include "extras/hdr_nvn.h"
 #include "nvn_framegen.h"
 #include "extras/taau.h"
 #include "extras/temporal.h"
@@ -646,6 +647,7 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
     // scale (and bring an unscaled one up), so the upscaler writes the full output size.
     if (gpu::tex_gpu_attachment(out) && gpu::tex_scale_wanted(out) != gpu::tex_scale(out))
         gpu::tex_rescale(out, f, gpu::tex_scale_wanted(out), "the upscaler's output");
+    if (extras::hdr_highlights_kept()) gpu::tex_promote_float(out, f, "the upscaler's output");   // the tone map's highlights above 1
     if (!gpu::tex_gpu(color) || !gpu::tex_gpu(out) || gpu::tex_is_depth(out)) {
         static bool told = false;
         if (!told) {

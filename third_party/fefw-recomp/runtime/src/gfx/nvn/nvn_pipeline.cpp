@@ -795,6 +795,7 @@ static VkShaderModule fragment_module(const GraphicsKey& key) {
 
     if (!want_prune && !want_uint_smp) {
         if (key.no_out) return no_output_module(fs);
+        if (key.sdr_tone_map) return shader_module(fs);
         if (want_int_out) return fs_int_output_module(fs);
         if (key.dual_src) return dual_source_module(fs);
         return hdr_fragment_module(fs);
@@ -803,7 +804,7 @@ static VkShaderModule fragment_module(const GraphicsKey& key) {
     std::vector<SpvSamplerSlot> slots;
     std::vector<uint32_t> id;
     const uint32_t flags = (key.no_out ? 1u : 0u) | (want_int_out ? 2u : 0u) | (key.dual_src ? 4u : 0u) |
-                           (extras::hdr_scene_active() && fs->spirv.size() <= 65536 ? 8u : 0u);
+                           (extras::hdr_scene_active() && !key.sdr_tone_map && fs->spirv.size() <= 65536 ? 8u : 0u);
     if (flags) id.push_back(0x30000000u | flags);
     if (want_prune) id.push_back(0x50000000u | keep_mask);
     if (want_uint_smp) {
@@ -831,7 +832,7 @@ static VkShaderModule fragment_module(const GraphicsKey& key) {
         if (spirv_outputs_to_uint(cur, tmp)) { cur = std::move(tmp); changed = true; }
     } else if (key.dual_src) {
         if (spirv_dual_source_output(cur, tmp)) { cur = std::move(tmp); changed = true; }
-    } else if (extras::hdr_scene_active() && fs->spirv.size() <= 65536) {
+    } else if (extras::hdr_scene_active() && !key.sdr_tone_map && fs->spirv.size() <= 65536) {
         if (extras::hdr_tonemap_variant(cur, fs->hash, tmp)) { cur = std::move(tmp); changed = true; }
     }
     if (!slots.empty()) {
