@@ -49,7 +49,7 @@ std::recursive_mutex g_module_mu;   // every module cache below; the variant mak
 std::map<LayoutKey, ProgLayout> g_layouts;
 // Descriptor set layouts and the pipeline layout built from them, shared by every program whose descriptors are the same (S24): two programs with
 // the same signature get the same VkPipelineLayout handle, so the shader parts compiled for one are found again for the other.
-struct SharedLayout { VkDescriptorSetLayout sets[5] = {}; VkPipelineLayout layout = VK_NULL_HANDLE; };
+struct SharedLayout { VkDescriptorSetLayout sets[5] = {}; VkDescriptorUpdateTemplate templates[4] = {}; VkPipelineLayout layout = VK_NULL_HANDLE; };
 std::map<std::string, SharedLayout> g_shared_layouts;
 std::unordered_map<const ShaderInfo*, VkShaderModule> g_modules;
 std::mutex g_module_id_mu;
@@ -58,7 +58,7 @@ std::unordered_map<VkShaderModule, uint64_t> g_module_ids;   // every module cre
 std::atomic<uint64_t> g_built_at_draw{0};                    // whole pipelines built by the render thread at a draw
 std::atomic<bool> g_cache_dirty{false};
 std::atomic<uint32_t> g_new_since_save{0};      // pipelines and parts created since the cache file was last written
-bool g_cache_big = false;                       // the file loaded at start was large (a shader preparation made it): rewritten rarely, see pipeline_cache_dirty
+std::atomic<bool> g_cache_big{false};         // the file loaded at start was large (a shader preparation made it): rewritten rarely, see pipeline_cache_dirty
 // Producer modules with extra outputs (nvn_spirv_patch.h): (shader, slots as location * 4 + scalar type).
 std::map<std::pair<const ShaderInfo*, std::vector<uint32_t>>, VkShaderModule> g_variants;
 std::unordered_map<const ShaderInfo*, VkShaderModule> g_dual_src;
@@ -72,6 +72,18 @@ struct GfxEntry {
     std::shared_ptr<PipeUpgrade> up;
 };
 std::unordered_map<uint64_t, std::vector<GfxEntry>> g_gfx;
+// Direct-mapped render-thread L1 cache for settled graphics pipelines (avoids unordered_map bucket lookup + atomic RMW per draw).
+struct GfxFastSlot {
+    uint64_t hash = 0;
+    uint64_t gen = 0;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    GraphicsKey key;
+};
+constexpr size_t kGfxFastSlots = 256;
+GfxFastSlot g_gfx_fast[kGfxFastSlots];
+uint64_t g_gfx_fast_gen = 1;
+uint32_t g_gfx_fast_hits = 0;
+std::atomic<uint64_t> g_layout_gen{1};
 std::map<std::pair<const ShaderInfo*, VkPipelineLayout>, VkPipeline> g_compute;
 VkPipelineCache g_cache = VK_NULL_HANDLE;
 bool g_cache_tried = false;
@@ -151,7 +163,7 @@ void ensure_cache() {
             std::fclose(f);
         }
     }
-    g_cache_big = data.size() >= (64u << 20);
+    g_cache_big.store(data.size() >= (64u << 20), std::memory_order_relaxed);
     VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
     ci.pInitialData = data.empty() ? nullptr : data.data();
@@ -169,11 +181,16 @@ void ensure_cache() {
 // pipeline cache (and out of vkGetPipelineCacheData on drivers where serialising GPL parts crashes, issue #49).
 void ensure_gpl_cache() {
     if (g_gpl_cache_ready.load(std::memory_order_acquire)) return;
+    ensure_cache();
     std::lock_guard<std::mutex> lk(g_cache_mu);
     if (g_gpl_cache_tried) return;
     g_gpl_cache_tried = true;
     VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     vkCreatePipelineCache(vkdev(), &ci, nullptr, &g_gpl_cache);
+    if (g_gpl_cache != VK_NULL_HANDLE && g_cache != VK_NULL_HANDLE) {
+        std::shared_lock<std::shared_mutex> cache_lk(g_cache_rw_mu);
+        vkMergePipelineCaches(vkdev(), g_gpl_cache, 1, &g_cache);
+    }
     g_gpl_cache_ready.store(true, std::memory_order_release);
 }
 
@@ -195,13 +212,14 @@ void save_cache() {
     }
     std::lock_guard<std::mutex> save_lk(g_save_mu);
     // written to a temporary file and renamed, so a process that ends in the middle of it leaves the old cache intact
-    const std::string tmp = path + ".tmp";
+        const std::string tmp = path + ".tmp";
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) return;
         f.write(data.data(), static_cast<std::streamsize>(n));
         if (!f) return;
     }
+    if (n >= (64u << 20)) g_cache_big.store(true, std::memory_order_relaxed);
     std::error_code ec;
     std::filesystem::rename(tmp, path, ec);
     if (ec) {
@@ -220,11 +238,11 @@ bool should_save_pipeline_cache(const std::string& mode, uint32_t vendor_id) {
 }
 
 // A cache of hundreds of MB (the shader preparation's) is rewritten only after thousands of new pipelines: the new ones are few next to it and
-// the write takes seconds. The ordinary small cache is written whenever something new appeared, as before.
+// the write takes seconds. The ordinary small cache is marked dirty when anything new appeared (background saver throttles writes).
 bool pipeline_cache_dirty() {
     if (!g_cache_save_on.load(std::memory_order_relaxed)) return false;
     if (!g_cache_dirty.load(std::memory_order_relaxed)) return false;
-    return !g_cache_big || g_new_since_save.load(std::memory_order_relaxed) >= 3000;
+    return !g_cache_big.load(std::memory_order_relaxed) || g_new_since_save.load(std::memory_order_relaxed) >= 3000;
 }
 void pipeline_cache_save() { save_cache(); }
 // The write at the end of a session: skipped when the cache is the big one of a preparation and little was added.
@@ -613,6 +631,22 @@ bool push_uniforms_on() {
     return on;
 }
 
+bool early_fragment_tests_active() {
+    static const bool on = [] {
+        const std::string cfg_mode = config_get_str("nvn", "early_fragment_tests", "off");
+        const std::string mode = (cfg_mode == "auto")
+            ? (device().features().early_and_late_fragment_tests_amd ? std::string("amd") : std::string("off"))
+            : cfg_mode;
+        if (mode != "early" && !((mode == "amd") && device().features().early_and_late_fragment_tests_amd)) return false;
+        const std::string list = config_get_str("nvn", "early_fragment_tests_fs",
+            "eb74f4cb,077ceb59,d3d6d5bf,a6db222b,1eb6d5fe,238b7791,fe2136f8,3c39992a,b8843fe5,766314ee,a629f4ac");
+        return list == "auto" || list == "*";
+    }();
+    return on;
+}
+
+uint64_t prog_layout_gen() { return g_layout_gen.load(std::memory_order_relaxed); }
+
 const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
     LayoutKey key;
     for (int i = 0; i < 6; ++i) key.s[i] = stages[i];
@@ -641,6 +675,7 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
                 d.nvn_stage = st;
                 index[k] = pl.bindings.size();
                 pl.has_sampler |= d.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                pl.has_storage_writes |= d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 pl.bindings.push_back(d);
             } else {
                 pl.bindings[f->second].stages |= stage_bit(s->stage);   // shared binding (the support buffer)
@@ -650,14 +685,47 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
     std::vector<VkDescriptorSetLayoutBinding> lbs[4];
     std::string sig;                                   // the descriptors of the program, as bytes: the key of the shared layout
     for (int set = 0; set < 4; ++set) {
-        for (const BindingDesc& d : pl.bindings) {
+        for (uint32_t bi = 0; bi < static_cast<uint32_t>(pl.bindings.size()); ++bi) {
+            const BindingDesc& d = pl.bindings[bi];
             if (d.set != static_cast<uint32_t>(set)) continue;
             VkDescriptorSetLayoutBinding b = {};
             b.binding = d.binding;
             b.descriptorType = d.type;
-            b.descriptorCount = std::max<uint32_t>(1, d.shader->refl.bindings[d.index].count);
+            const DescriptorBinding& db = d.shader->refl.bindings[d.index];
+            b.descriptorCount = std::max<uint32_t>(1, db.count);
             b.stageFlags = d.stages;
             lbs[set].push_back(b);
+            pl.set_binding_idx[set].push_back(bi);
+            if (d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                const NvnSource src = db.nvn.source;
+                if (src == NvnSource::UniformBlock || src == NvnSource::UniformAsStorage) {
+                    if (d.nvn_stage >= 0 && d.nvn_stage < 6 && db.nvn.index >= 0 && db.nvn.index < 16)
+                        pl.ubo_mask[d.nvn_stage] |= static_cast<uint16_t>(1u << db.nvn.index);
+                } else if (src == NvnSource::StorageBuffer) {
+                    if (d.nvn_stage >= 0 && d.nvn_stage < 6) {
+                        if (db.nvn.index >= 0 && db.nvn.index < 16)
+                            pl.ssbo_mask[d.nvn_stage] |= static_cast<uint16_t>(1u << db.nvn.index);
+                        else
+                            pl.ssbo_mask[d.nvn_stage] = 0xFFFFu;
+                    }
+                }
+            }
+            if (db.nvn.source == NvnSource::HandleInUniform) {
+                pl.has_handle_in_ubo = true;
+                if (d.nvn_stage >= 0 && d.nvn_stage < 6 && db.nvn.index >= 0 && db.nvn.index < 16)
+                    pl.ubo_mask[d.nvn_stage] |= static_cast<uint16_t>(1u << db.nvn.index);
+            }
+            if (d.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                const NvnSource src = db.nvn.source;
+                if (src == NvnSource::SamplerBinding || src == NvnSource::HandleInUniform) {
+                    pl.sampler_binding_idx.push_back(bi);
+                    if (db.image.dim == 2) pl.has_sampler_3d = true;
+                }
+                if (src == NvnSource::SamplerBinding || src == NvnSource::HandleInUniform || src == NvnSource::ImageBinding)
+                    pl.prep_tex_idx.push_back(bi);
+            } else if (d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+                pl.prep_tex_idx.push_back(bi);
+            }
             pl.has_set[set] = true;
             const uint32_t w[4] = {b.binding, static_cast<uint32_t>(b.descriptorType), b.descriptorCount, b.stageFlags};
             sig.append(reinterpret_cast<const char*>(w), sizeof w);
@@ -724,6 +792,39 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
                 NXLOG_E(kTag, "descriptor set layout %d failed", set);
                 return nullptr;
             }
+            if (!lbs[set].empty() && !(set == 0 && pl.push_set0) && vkCreateDescriptorUpdateTemplate) {
+                bool tpl_ok = true;
+                std::vector<VkDescriptorUpdateTemplateEntry> entries;
+                entries.reserve(lbs[set].size());
+                for (size_t i = 0; i < lbs[set].size(); ++i) {
+                    const VkDescriptorSetLayoutBinding& lb = lbs[set][i];
+                    if (lb.descriptorCount != 1 ||
+                        (lb.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                         lb.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                         lb.descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                         lb.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)) {
+                        tpl_ok = false;
+                        break;
+                    }
+                    VkDescriptorUpdateTemplateEntry te = {};
+                    te.dstBinding = lb.binding;
+                    te.dstArrayElement = 0;
+                    te.descriptorCount = 1;
+                    te.descriptorType = lb.descriptorType;
+                    te.offset = i * sizeof(DescTemplateSlot);
+                    te.stride = sizeof(DescTemplateSlot);
+                    entries.push_back(te);
+                }
+                if (tpl_ok) {
+                    VkDescriptorUpdateTemplateCreateInfo tci = {VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
+                    tci.descriptorUpdateEntryCount = static_cast<uint32_t>(entries.size());
+                    tci.pDescriptorUpdateEntries = entries.data();
+                    tci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
+                    tci.descriptorSetLayout = nl.sets[set];
+                    if (vkCreateDescriptorUpdateTemplate(vkdev(), &tci, nullptr, &nl.templates[set]) != VK_SUCCESS)
+                        nl.templates[set] = VK_NULL_HANDLE;
+                }
+            }
         }
         nl.sets[kPoolSet] = pool_layout;            // not owned (pool_sets_shutdown destroys it)
         VkPipelineLayoutCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -735,9 +836,44 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
             NXLOG_E(kTag, "pipeline layout failed");
             return nullptr;
         }
+        if (pl.push_set0 && !lbs[0].empty() && vkCreateDescriptorUpdateTemplate && vkCmdPushDescriptorSetWithTemplateKHR) {
+            bool pt_ok = true;
+            std::vector<VkDescriptorUpdateTemplateEntry> entries;
+            entries.reserve(lbs[0].size());
+            for (size_t i = 0; i < lbs[0].size(); ++i) {
+                const VkDescriptorSetLayoutBinding& lb = lbs[0][i];
+                if (lb.descriptorCount != 1 ||
+                    (lb.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                     lb.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)) {
+                    pt_ok = false;
+                    break;
+                }
+                VkDescriptorUpdateTemplateEntry te = {};
+                te.dstBinding = lb.binding;
+                te.dstArrayElement = 0;
+                te.descriptorCount = 1;
+                te.descriptorType = lb.descriptorType;
+                te.offset = i * sizeof(VkDescriptorBufferInfo);
+                te.stride = sizeof(VkDescriptorBufferInfo);
+                entries.push_back(te);
+            }
+            if (pt_ok) {
+                VkDescriptorUpdateTemplateCreateInfo tci = {VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
+                tci.descriptorUpdateEntryCount = static_cast<uint32_t>(entries.size());
+                tci.pDescriptorUpdateEntries = entries.data();
+                tci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR;
+                tci.pipelineBindPoint = (lbs[0][0].stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+                    ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS;
+                tci.pipelineLayout = nl.layout;
+                tci.set = 0;
+                if (vkCreateDescriptorUpdateTemplate(vkdev(), &tci, nullptr, &nl.templates[0]) != VK_SUCCESS)
+                    nl.templates[0] = VK_NULL_HANDLE;
+            }
+        }
         sh = g_shared_layouts.emplace(sig, nl).first;
     }
     for (int set = 0; set < 5; ++set) pl.sets[set] = sh->second.sets[set];
+    for (int set = 0; set < 4; ++set) pl.templates[set] = sh->second.templates[set];
     pl.layout = sh->second.layout;
     pl.push_stages = pcr.stageFlags;
     pl.push_bytes = pcr.size;
@@ -790,7 +926,10 @@ static VkShaderModule fragment_module(const GraphicsKey& key) {
     if (!fs) return VK_NULL_HANDLE;
     const bool want_int_out = !key.no_out && key.logic_op_enable && key_int_colour(key);
     const uint32_t keep_mask = key.no_out ? 0u : active_color_mask(key);
-    const bool want_prune = !key.no_out && !key.dual_src && fs_has_unattached_outputs(fs, keep_mask);
+    // Prewarm/prebuild keys leave color_count == 0 (real no-color draws set no_out = 1),
+    // so skip output pruning there or precompiled FS parts will never match draw-time keys.
+    const bool want_prune = !key.no_out && key.color_count > 0 && !key.dual_src &&
+                            fs_has_unattached_outputs(fs, keep_mask);
     const bool want_uint_smp = key.uint_samplers != 0;
 
     if (!want_prune && !want_uint_smp) {
@@ -1103,14 +1242,31 @@ VkPipeline build_graphics_pipeline(const GraphicsKey& key, const ProgLayout& lay
 }
 
 VkPipeline graphics_pipeline(const GraphicsKey& key, const ProgLayout& layout) {
-    ensure_cache();
     const uint64_t h = key.hash();
+    GfxFastSlot& fs = g_gfx_fast[h & (kGfxFastSlots - 1)];
+    if (fs.gen == g_gfx_fast_gen && fs.hash == h && fs.key == key) {
+        if ((++g_gfx_fast_hits & 255u) == 0) {
+            counters().pipeline_cache_hits.fetch_add(256, std::memory_order_relaxed);
+            g_gfx_fast_hits = 0;
+        }
+        return fs.pipe;
+    }
+    ensure_cache();
     auto& bucket = g_gfx[h];
     for (auto& e : bucket)
         if (e.first == key) {
             counters().pipeline_cache_hits.fetch_add(1, std::memory_order_relaxed);
-            if (e.up && e.up->state.load(std::memory_order_acquire) != 0) gpl_take_upgrade(e.second, e.alt, e.up);
+            if (e.up && e.up->state.load(std::memory_order_acquire) != 0) {
+                gpl_take_upgrade(e.second, e.alt, e.up);
+                ++g_gfx_fast_gen;
+            }
             if (e.alt && gpl_ab_whole()) return e.alt;
+            if (!e.up && !e.alt && e.second) {
+                fs.hash = h;
+                fs.gen = g_gfx_fast_gen;
+                fs.pipe = e.second;
+                fs.key = key;
+            }
             return e.second;
         }
     prewarm_init();
@@ -1768,22 +1924,35 @@ void pool_sets_shutdown() {
 
 size_t pipeline_count() { return static_cast<size_t>(g_pipeline_count.get()); }
 
-void module_cache_clear() {
-    VkDevice d = vkdev();
-    std::lock_guard<std::recursive_mutex> lk(g_module_mu);
-    for (auto& [k, m] : g_modules) if (m) vkDestroyShaderModule(d, m, nullptr);
-    g_modules.clear();
-    for (auto& [k, m] : g_variants) if (m) vkDestroyShaderModule(d, m, nullptr);
-    g_variants.clear();
-    for (auto& [k, m] : g_dual_src) if (m) vkDestroyShaderModule(d, m, nullptr);
-    g_dual_src.clear();
-    for (auto& [k, e] : g_no_out) if (e.first && e.second) vkDestroyShaderModule(d, e.first, nullptr);
+// Collect every live VkShaderModule across all seven maps before destroying so shared fallback handles (variant maps returning
+// shader_module(s)) are destroyed at most once and no map retains a dangling handle between gpl_prepare batches. Caller holds g_module_mu.
+static void clear_all_shader_modules_locked(VkDevice d) {
+    std::unordered_set<VkShaderModule> unique;
+    auto drain = [&](auto& map) {
+        for (auto& [k, h] : map)
+            if (h) unique.insert(h);
+        map.clear();
+    };
+    drain(g_modules);
+    drain(g_variants);
+    drain(g_dual_src);
+    drain(g_hdr_mod);
+    drain(g_int_out_mod);
+    for (auto& [k, e] : g_no_out)
+        if (e.first) unique.insert(e.first);
     g_no_out.clear();
-    for (auto& [k, v] : g_xfb_mod) if (v.first) vkDestroyShaderModule(d, v.first, nullptr);
+    for (auto& [k, v] : g_xfb_mod)
+        if (v.first) unique.insert(v.first);
     g_xfb_mod.clear();
+    for (VkShaderModule h : unique) vkDestroyShaderModule(d, h, nullptr);
     std::lock_guard<std::mutex> lk2(g_module_id_mu);
     g_module_ids.clear();
     g_module_subgroups.clear();
+}
+
+void module_cache_clear() {
+    std::lock_guard<std::recursive_mutex> lk(g_module_mu);
+    clear_all_shader_modules_locked(vkdev());
 }
 
 uint64_t module_content_id(VkShaderModule m) {
@@ -1881,11 +2050,18 @@ void pipeline_hot_shader_changed(const ShaderInfo* s) {
         it = g_compute.erase(it);
         g_compute_keys.sub(1);
     }
+    ++g_gfx_fast_gen;
     prewarm_hot_disable();   // the key file's pipelines and the parts built ahead were made from the old words
     NXLOG_I(kTag, "spv_hot: %s: modules dropped, %zu pipeline(s) destroyed, prewarm off for this run", s->hash.c_str(), dropped);
 }
 
 void pipeline_shutdown() {
+    if (g_gfx_fast_hits) {
+        counters().pipeline_cache_hits.fetch_add(g_gfx_fast_hits, std::memory_order_relaxed);
+        g_gfx_fast_hits = 0;
+    }
+    ++g_gfx_fast_gen;
+    g_layout_gen.fetch_add(1, std::memory_order_relaxed);
     VkDevice d = vkdev();
     prewarm_shutdown();
     gpl_stop();
@@ -1906,30 +2082,16 @@ void pipeline_shutdown() {
     g_layouts.clear();
     for (auto& [k, l] : g_shared_layouts) {          // the handles in g_layouts were copies of these
         if (l.layout) vkDestroyPipelineLayout(d, l.layout, nullptr);
-        for (int set = 0; set < 4; ++set)            // kPoolSet's is pool_sets_shutdown's
+        for (int set = 0; set < 4; ++set) {          // kPoolSet's is pool_sets_shutdown's
+            if (l.templates[set] && vkDestroyDescriptorUpdateTemplate) vkDestroyDescriptorUpdateTemplate(d, l.templates[set], nullptr);
             if (l.sets[set]) vkDestroyDescriptorSetLayout(d, l.sets[set], nullptr);
+        }
     }
     g_shared_layouts.clear();
     pool_sets_shutdown();
-    for (auto& [k, m] : g_modules)
-        if (m) vkDestroyShaderModule(d, m, nullptr);
-    g_modules.clear();
-    for (auto& [k, m] : g_variants)
-        if (m) vkDestroyShaderModule(d, m, nullptr);
-    g_variants.clear();
-    for (auto& [k, m] : g_dual_src)
-        if (m) vkDestroyShaderModule(d, m, nullptr);
-    g_dual_src.clear();
-    for (auto& [k, e] : g_no_out)
-        if (e.first && e.second) vkDestroyShaderModule(d, e.first, nullptr);
-    g_no_out.clear();
-    for (auto& [k, v] : g_xfb_mod)
-        if (v.first) vkDestroyShaderModule(d, v.first, nullptr);
-    g_xfb_mod.clear();
     {
-        std::lock_guard<std::mutex> lk(g_module_id_mu);
-        g_module_ids.clear();
-        g_module_subgroups.clear();
+        std::lock_guard<std::recursive_mutex> lk(g_module_mu);
+        clear_all_shader_modules_locked(d);
     }
     for (auto& [k, b] : g_const_bufs) device().destroy_buffer(b.first);
     g_const_bufs.clear();

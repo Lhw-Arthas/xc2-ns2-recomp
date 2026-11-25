@@ -62,7 +62,9 @@ struct Slot {
     size_t dpool_cur = 0;
     gfx::Buffer upload;
     VkDeviceSize upload_off = 0;
-    std::vector<gfx::Buffer> extra;       // staging / overflow buffers of the submission
+    std::vector<gfx::Buffer> upload_overflow;  // reusable 16 MiB chunks borrowed from g->upload_pool (returned on slot reset, never freed per frame!)
+    VkDeviceSize overflow_off = 0;
+    std::vector<gfx::Buffer> extra;       // one-off staging buffers (> 16 MiB) / adopted texprep buffers of the submission
     uint64_t serial = 0;                  // last submission that used the slot
     bool timed = false;                   // frame trace: the submission wrote GPU timestamps (query pair index = slot index * 2)
     uint64_t cpu_t0 = 0;
@@ -114,6 +116,7 @@ struct Gpu {
     int last_index = -1;
     std::chrono::steady_clock::time_point last_present{};
     Slot slots[kSlots];
+    std::vector<gfx::Buffer> upload_pool;   // render-thread pool of reusable kUploadBytes chunks (eliminates per-frame vkAllocateMemory/vkFreeMemory)
     VkQueryPool qpool = VK_NULL_HANDLE;   // frame trace: two timestamps per slot
     VkQueryPool gpool = VK_NULL_HANDLE;   // GPU pass profiler ([prof] gpu_passes): kGpMax timestamps per slot
     uint32_t next_slot = 0;
@@ -175,14 +178,38 @@ void drain_pending_destroy() {
     for (auto& fn : pend) g->deferred.push_back({s, std::move(fn)});
 }
 
-void retire() {
+void retire(int64_t budget_ns = 0) {
     drain_pending_destroy();
     const uint64_t done = read_completed();
+    const auto t0 = budget_ns > 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    size_t ran = 0;
     while (!g->deferred.empty() && g->deferred.front().serial <= done) {
         auto fn = std::move(g->deferred.front().fn);
         g->deferred.pop_front();
         g_gauge_deferred.sub(1);
         fn();
+        ++ran;
+        if (budget_ns > 0 && ran >= 4 &&
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count() >= budget_ns)
+            break;
+    }
+    // Reclaim completed slots' upload_overflow and extra staging buffers immediately (~2 frames) instead of waiting 72 slots (~2s)
+    // for the ring to wrap, preventing multi-GB host-visible memory accumulation during map switches.
+    constexpr size_t kUploadPoolMax = 8;
+    for (Slot& s : g->slots) {
+        if (!s.serial || s.serial > done) continue;
+        if (!s.upload_overflow.empty()) {
+            for (auto& b : s.upload_overflow) {
+                if (g->upload_pool.size() < kUploadPoolMax) g->upload_pool.push_back(b);
+                else g->dev->destroy_buffer(b);
+            }
+            s.upload_overflow.clear();
+            s.overflow_off = 0;
+        }
+        if (!s.extra.empty()) {
+            for (auto& b : s.extra) g->dev->destroy_buffer(b);
+            s.extra.clear();
+        }
     }
 }
 
@@ -447,7 +474,7 @@ Slot& acquire_slot() {
     }
     s.gp_n = 0;
     s.gp_labels.clear();
-    retire();
+    retire(1500000);   // 1.5 ms per-frame teardown budget: spreads scene-switch resource frees smoothly across frames
     vkResetCommandPool(g->dev->device(), s.pool, 0);
     s.pro_next = 0;
     s.pro_cur = s.pro_final = VK_NULL_HANDLE;
@@ -456,8 +483,16 @@ Slot& acquire_slot() {
     s.sets_live = 0;
     s.dpool_cur = 0;
     s.upload_off = 0;
+    s.overflow_off = 0;
+    constexpr size_t kUploadPoolMax = 8;
+    for (auto& b : s.upload_overflow) {
+        if (g->upload_pool.size() < kUploadPoolMax) g->upload_pool.push_back(b);
+        else g->dev->destroy_buffer(b);
+    }
+    s.upload_overflow.clear();
     for (auto& b : s.extra) g->dev->destroy_buffer(b);
     s.extra.clear();
+    s.serial = 0;   // cleared while recording so retire() never touches the active slot
     return s;
 }
 
@@ -484,6 +519,9 @@ VkCommandBuffer Frame::prologue() {
     return c;
 }
 
+std::atomic<uint64_t> g_staging_overflows{0};
+uint64_t staging_overflow_count() { return g_staging_overflows.load(std::memory_order_relaxed); }
+
 UploadAlloc Frame::upload(VkDeviceSize size, VkDeviceSize align) {
     Slot& s = *static_cast<Slot*>(slot);
     if (align == 0) align = 16;
@@ -497,10 +535,50 @@ UploadAlloc Frame::upload(VkDeviceSize size, VkDeviceSize align) {
         a.size = size;
         return a;
     }
+    // Pooled 16 MiB overflow chunk arena: avoids calling vkCreateBuffer/vkAllocateMemory per allocation when >16 MiB/submission!
+    if (size <= kUploadBytes) {
+        if (!s.upload_overflow.empty()) {
+            gfx::Buffer& cur = s.upload_overflow.back();
+            const VkDeviceSize o2 = (s.overflow_off + align - 1) & ~(align - 1);
+            if (o2 + size <= cur.size) {
+                s.overflow_off = o2 + size;
+                UploadAlloc a;
+                a.buffer = cur.buffer;
+                a.offset = o2;
+                a.ptr = static_cast<uint8_t*>(cur.mapped) + o2;
+                a.size = size;
+                return a;
+            }
+        }
+        gfx::Buffer chunk;
+        if (g->upload_pool.empty()) retire();   // reclaim any just-finished slots before allocating a new 16 MiB chunk
+        if (!g->upload_pool.empty()) {
+            chunk = g->upload_pool.back();
+            g->upload_pool.pop_back();
+        } else {
+            g_staging_overflows.fetch_add(1, std::memory_order_relaxed);
+            const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+            if (g->dev->create_buffer(kUploadBytes, usage, gfx::MemoryUse::Upload, &chunk, "nvn upload chunk") != VK_SUCCESS) {
+                NXLOG_E(kTag, "upload chunk of %llu bytes failed", static_cast<unsigned long long>(kUploadBytes));
+                return {};
+            }
+        }
+        s.upload_overflow.push_back(chunk);
+        s.overflow_off = size;
+        UploadAlloc a;
+        a.buffer = chunk.buffer;
+        a.offset = 0;
+        a.ptr = static_cast<uint8_t*>(chunk.mapped);
+        a.size = size;
+        return a;
+    }
     return staging(size + align);
 }
 
 UploadAlloc Frame::staging(VkDeviceSize size) {
+    if (size <= kUploadBytes) return upload(size, 256);
+    g_staging_overflows.fetch_add(1, std::memory_order_relaxed);
     Slot& s = *static_cast<Slot*>(slot);
     gfx::Buffer b;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -713,6 +791,48 @@ void memory_barrier(VkCommandBuffer cb) {
     b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
     b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+void memory_barrier_in_pass(VkCommandBuffer cb) {
+    g_gauge_barriers_mem.add(1);
+    VkMemoryBarrier2 b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+void transfer_pre_barrier(VkCommandBuffer cb) {
+    g_gauge_barriers_mem.add(1);
+    VkMemoryBarrier2 b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+void transfer_post_barrier(VkCommandBuffer cb) {
+    g_gauge_barriers_mem.add(1);
+    VkMemoryBarrier2 b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
+                      VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                      VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
     VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     di.memoryBarrierCount = 1;
     di.pMemoryBarriers = &b;
@@ -1408,6 +1528,8 @@ void tear_down() {
     gfx::Device& d = *gp->dev;
     vkDeviceWaitIdle(d.device());
     for (Slot& s : gp->slots) {
+        for (auto& b : s.upload_overflow) d.destroy_buffer(b);
+        s.upload_overflow.clear();
         for (auto& b : s.extra) d.destroy_buffer(b);
         vk_gauge_descriptor_sets().sub(static_cast<int64_t>(s.sets_live));
         s.sets_live = 0;
@@ -1422,6 +1544,8 @@ void tear_down() {
             if (s.cb) vk_gauge_command_buffers().sub(1);
         }
     }
+    for (auto& b : gp->upload_pool) d.destroy_buffer(b);
+    gp->upload_pool.clear();
     if (gp->qpool) { vkDestroyQueryPool(d.device(), gp->qpool, nullptr); vk_gauge_query_pools().sub(1); }
     if (gp->gpool) { vkDestroyQueryPool(d.device(), gp->gpool, nullptr); vk_gauge_query_pools().sub(1); }
     if (gp->timeline) { vkDestroySemaphore(d.device(), gp->timeline, nullptr); vk_gauge_semaphores().sub(1); }

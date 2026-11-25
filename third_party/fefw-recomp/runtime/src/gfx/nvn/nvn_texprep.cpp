@@ -254,18 +254,23 @@ void worker_main() {
                 TexCaps full = s.caps;
                 full.cache_only = false;
                 full.encode_threads = 1;
-                const int prio = GetThreadPriority(GetCurrentThread());
-                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                 *res = PreparedTexture();
                 ok = prepare_guarded(*t, full, *res, crashed);
-                SetThreadPriority(GetCurrentThread(), prio);
                 if (ok) s_transcoded.fetch_add(1, std::memory_order_relaxed);
             }
             ok = ok && hash_guarded(*t, h1) && h0 == h1;     // the storage must not have changed while the job read it
-            // A big result is copied into the upload buffer here: allocating it and touching its pages costs as much as the preparation itself
+            // A big result is copied into the upload buffer here: serialize VMA host-visible buffer allocations so background workers
+            // do not stampede VMA/WDDM locks against nvn-render during scene streaming.
             if (ok && s.stage_bytes && res->data.size() >= s.stage_bytes && !s.verify) {
-                if (!s.quiesced.load() && gpu::device().create_buffer(res->data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gfx::MemoryUse::Upload, &stage, "nvn staging (prepared)") == VK_SUCCESS &&
-                    stage.mapped) {
+                static std::mutex s_stage_mu;
+                bool made = false;
+                {
+                    std::lock_guard<std::mutex> slk(s_stage_mu);
+                    made = !s.quiesced.load() &&
+                           gpu::device().create_buffer(res->data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gfx::MemoryUse::Upload, &stage, "nvn staging (prepared)") == VK_SUCCESS &&
+                           stage.mapped != nullptr;
+                }
+                if (made) {
                     std::memcpy(stage.mapped, res->data.data(), res->data.size());
                     gpu::device().flush_buffer(stage);
                     staged_size = res->data.size();
@@ -364,7 +369,7 @@ void init_once() {
         s.verify = config_get_bool("nvn", "tex_prep_verify", false);
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
         int n = static_cast<int>(config_get_int("nvn", "tex_prep_threads", 0));
-        if (n <= 0) n = static_cast<int>(std::clamp<unsigned>(hw / 3, 2, 8));
+        if (n <= 0) n = static_cast<int>(std::clamp<unsigned>(hw / 6, 2, 4));
         for (int i = 0; i < n; ++i) std::thread(worker_main).detach();
         g_enabled.store(1);
         g_tex_prep_on.store(true);

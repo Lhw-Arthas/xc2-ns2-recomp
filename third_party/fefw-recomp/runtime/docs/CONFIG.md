@@ -360,6 +360,13 @@ Rules:
 | `nvn` | `uint_tex_patch` | `true` | `NXRT_NVN_UINT_TEX_PATCH` | `src/gfx/nvn/nvn_replay.cpp`, `nvn_spirv_patch.cpp` | Default-on runtime rewrite for issues #15/#39/#44/#54: fragment float samplers bound to unsigned integer colour textures (`R8_UINT` etc.) or the stencil plane of depth-stencil textures (`DEPTH32F_STENCIL8` / `DEPTH24_STENCIL8` in stencil mode) are rewritten to `usampler` with `OpBitcast` back to float and nearest filtering so `floatBitsToInt(...)` reads the exact bits legally on both NVIDIA and AMD without offline cache patching. |
 | `nvn` | `trace_snap_per_frame` | `0` | `NXRT_NVN_TRACE_SNAP_PER_FRAME` | `src/gfx/nvn/nvn_replay.cpp` | When `1` (or automatically when `NXRT_TRACE_SPAN > 1`), `trace_snap*` filenames include the frame index `f<frame>_` so multi-frame `F11` burst snapshots never overwrite earlier frames. |
 | `media` | `hwdec_backend` | `auto` | `NXRT_MEDIA_HWDEC_BACKEND` | `src/media/video_ffmpeg.cpp` | Which hardware decode the film uses: `d3d11va` (the long-standing path) or `vulkan` (FFmpeg's Vulkan Video decode). Both hand back NV12 through `av_hwframe_transfer_data`; the CPU decoders stay the fallback. Added 2026-11-21 because D3D11VA hands back mosaic frames at 4K on an RX 6800 XT. |
+| `nvn` | `debug_labels` | `validation` | `NXRT_NVN_DEBUG_LABELS` | `src/gfx/nvn/nvn_replay.cpp` | Emit `vkCmdBeginDebugUtilsLabelEXT` / `End` markers during command-buffer replay; defaults to on only when Vulkan validation is enabled. |
+| `nvn` | `force_split_draws` | `false` | `NXRT_NVN_FORCE_SPLIT_DRAWS` | `src/gfx/nvn/nvn_replay.cpp` | Allow `[nvn] split_draws` command-buffer splitting even when `mirror_capture` is active. |
+| `nvn` | `split_us` | `0` | `NXRT_NVN_SPLIT_US` | `src/gfx/nvn/nvn_replay.cpp` | Minimum interval in microseconds between `[nvn] split_draws` flushes; `0` disables interval throttling. |
+| `nvn` | `tex_preupload_max` | `12` | `NXRT_NVN_TEX_PREUPLOAD_MAX` | `src/gfx/nvn/nvn_replay.cpp` | Maximum number of background-prepared textures pre-uploaded per frame when `[nvn] tex_preupload` is enabled (`1..1024`). |
+| `nvn` | `tex_preupload_kb` | `4096` | `NXRT_NVN_TEX_PREUPLOAD_KB` | `src/gfx/nvn/nvn_replay.cpp` | Per-frame byte budget in KiB for `[nvn] tex_preupload` uploads (`256..524288`). |
+| `xc2` | `cutscene_fps` | `60 (when fps > 60)` | `NXRT_XC2_CUTSCENE_FPS` | `xc2/src/xc2_boot.cpp` | Cutscene frame-rate cap on retail 3.0.1 when `[xc2] fps > 60`: defaults to `60` (`0` disables cutscene capping). |
+| `nvn` | `auto_prepare` | `true` | `NXRT_NVN_AUTO_PREPARE` | `xc2/src/xc2_boot.cpp` | Automatically precompile paired `programs.bin` shader parts via `prepare_shaders` at launch when `prepare.state` is missing or stale for the active GPU/driver. |
 
 ### Audio notes
 

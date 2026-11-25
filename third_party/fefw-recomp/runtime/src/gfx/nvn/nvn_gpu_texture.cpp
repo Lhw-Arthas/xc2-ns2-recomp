@@ -79,6 +79,9 @@ struct TexGpu {
     bool last_sampled_ok = false;                       // ... and what it said, so a repeated format costs no map lookup
     std::array<uint32_t, 12> last_key = {};             // view_for's last answer (render thread): most lookups repeat it (rt agent)
     VkImageView last_view = VK_NULL_HANDLE;
+    gpu::ViewRequest last_req = {};                     // tex_sampled_view's last request (render thread MRU fast path)
+    VkImageView last_req_view = VK_NULL_HANDLE;
+    bool last_req_valid = false;
     int refs = 1;                                      // texture objects over the same storage share one image (render thread)
     struct SparseState* sparse = nullptr;               // a sparse-residency image (a big texture of a virtual pool), else null
     // CPU-streamed textures (tex_ensure_current): uploads for CPU writes that came at most kStreamGap presents apart, in a row
@@ -1633,6 +1636,7 @@ static void swap_image(Texture* t, TexGpu* g, Frame& f, const Shape& s, const gf
     for (auto& kv : g->views) views.push_back(kv.second);
     g->views.clear();
     g->last_view = VK_NULL_HANDLE;
+    g->last_req_valid = false;
     defer_destroy([old, views]() mutable {
         for (VkImageView v : views) { vkDestroyImageView(vkdev(), v, nullptr); vk_gauge_image_views().sub(1); }
         device().destroy_image(old);
@@ -2186,6 +2190,22 @@ bool tex_copy_source_ok(Texture* t) {
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
     TexGpu* g = tex_or_null(t);
     if (!g) return VK_NULL_HANDLE;
+    if (g->last_req_valid &&
+        g->last_req.type == req.type &&
+        g->last_req.depth_compare == req.depth_compare &&
+        g->last_req.base_level == req.base_level &&
+        g->last_req.level_count == req.level_count &&
+        g->last_req.base_layer == req.base_layer &&
+        g->last_req.layer_count == req.layer_count &&
+        g->last_req.format == req.format &&
+        g->last_req.depth_aspect == req.depth_aspect &&
+        g->last_req.component == req.component &&
+        g->last_req.swizzle.r == req.swizzle.r &&
+        g->last_req.swizzle.g == req.swizzle.g &&
+        g->last_req.swizzle.b == req.swizzle.b &&
+        g->last_req.swizzle.a == req.swizzle.a) {
+        return g->last_req_view;
+    }
     const bool is3d = g->type == VK_IMAGE_TYPE_3D;
     const uint32_t total_layers = is3d ? g->base.depth : g->layers;   // 3D images: the slices are the layers of 2D views
     const uint32_t bl = req.base_level;
@@ -2309,7 +2329,13 @@ VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
         g->last_sampled_ok = feature->second;
     }
     if (!g->last_sampled_ok) return bad_view(*t, "view format does not support sampling");
-    return view_for(*g, req.type, bl, nl, bly, nly, fmt, asp, req.swizzle);
+    const VkImageView v = view_for(*g, req.type, bl, nl, bly, nly, fmt, asp, req.swizzle);
+    if (v) {
+        g->last_req = req;
+        g->last_req_view = v;
+        g->last_req_valid = true;
+    }
+    return v;
 }
 
 VkImageView tex_attachment_view(Texture* t, uint32_t level, uint32_t layer, uint32_t layer_count, VkFormat view_format, bool keep_format) {

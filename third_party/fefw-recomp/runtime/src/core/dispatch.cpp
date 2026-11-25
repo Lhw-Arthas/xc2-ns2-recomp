@@ -59,29 +59,45 @@ struct FnCacheEntry {
     uint64_t addr;
     GuestFn fn;
 };
-constexpr size_t kFnCache = 1024;
+constexpr size_t kFnCache = 8192;
 thread_local FnCacheEntry t_fn_cache[kFnCache];
 thread_local uint32_t t_fn_epoch = 0;
 
-// Flat table (above): 64 MiB of guest addresses, 64 MiB reserved and committed once; a page stays untouched until an entry is written.
+// Flat table (above): 64 MiB of guest addresses for main, plus a 32 MiB flat table for sdk (0x7500000000, 45,922 functions in XC2 NS2).
 constexpr uint64_t kFlatSpan = 0x4000000;
+constexpr uint64_t kSdkBase = 0x7500000000ull;
+constexpr uint64_t kSdkSpan = 0x2000000;   // 32 MiB guest code span -> 32 MiB sparse VM (~180 KiB touched)
+std::atomic<uint32_t*> g_sdk_flat{nullptr};
 
 inline uint64_t flat_index(uint64_t a) { return std::rotr(a - mem::kMainBase, 2); }   // a misaligned address is out of range
+inline uint64_t sdk_flat_index(uint64_t a) { return std::rotr(a - kSdkBase, 2); }
 
 void flat_put(uint64_t guest_addr, GuestFn fn) {   // under g_write
     if (!nx_fn_flat) {
-        void* p = VirtualAlloc(nullptr, kFlatSpan, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        void* p = VirtualAlloc(nullptr, kFlatSpan, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE);
         if (!p) return;
         nx_fn_flat_host = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         nx_fn_flat = static_cast<uint32_t*>(p);
-        __atomic_store_n(&nx_fn_flat_n, kFlatSpan / 4, __ATOMIC_RELEASE);
+        std::atomic_ref<uint64_t>(nx_fn_flat_n).store(kFlatSpan / 4, std::memory_order_release);
     }
-    const uint64_t i = flat_index(guest_addr);
-    if (i >= nx_fn_flat_n) return;
-    // a function outside the image (none today) stays out of the table: its callers take call_indirect
     const uintptr_t h = reinterpret_cast<uintptr_t>(fn);
     const uint32_t off = h > nx_fn_flat_host && h - nx_fn_flat_host <= UINT32_MAX ? uint32_t(h - nx_fn_flat_host) : 0;
-    __atomic_store_n(&nx_fn_flat[i], off, __ATOMIC_RELEASE);
+    const uint64_t i = flat_index(guest_addr);
+    if (i < nx_fn_flat_n) {
+        std::atomic_ref<uint32_t>(nx_fn_flat[i]).store(off, std::memory_order_release);
+        return;
+    }
+    const uint64_t si = sdk_flat_index(guest_addr);
+    if (si < kSdkSpan / 4) {
+        uint32_t* sf = g_sdk_flat.load(std::memory_order_relaxed);
+        if (!sf) {
+            void* p = VirtualAlloc(nullptr, kSdkSpan, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE);
+            if (!p) return;
+            sf = static_cast<uint32_t*>(p);
+            g_sdk_flat.store(sf, std::memory_order_release);
+        }
+        std::atomic_ref<uint32_t>(sf[si]).store(off, std::memory_order_release);
+    }
 }
 std::vector<std::unique_ptr<Table>> g_all_tables;   // owns current + retired tables
 std::atomic<size_t> g_fn_count{0};
@@ -149,11 +165,22 @@ HleTrace& hle_trace() {
     return *t;
 }
 
+// Flat contiguous HLE fast-dispatch table (16 bytes/entry, zero unique_ptr chase, zero LOCK XADD on normal calls).
+struct HleFast {
+    std::atomic<HleFn> fn{nullptr};
+    const char* name = nullptr;
+};
 constexpr size_t kMaxThunks = mem::kHleSize / 16;
+HleFast g_hle_fast[kMaxThunks];
+std::atomic<HleFn> g_named_hle_fn{nullptr};
+std::atomic<bool> g_hle_trace_checked{false};
+std::atomic<bool> g_hle_trace_on{false};
 
 size_t thunk_index(uint64_t addr) { return static_cast<size_t>((addr - mem::kHleBase) / 16); }
 
 }  // namespace
+
+void hle_mark_needs_name(HleFn fn) { g_named_hle_fn.store(fn, std::memory_order_release); }
 
 void fn_register(uint64_t guest_addr, GuestFn fn) {
     if (!guest_addr || !fn) return;
@@ -196,6 +223,7 @@ void fn_clear() {
     std::lock_guard<std::mutex> lk(g_write);
     g_table.store(nullptr);
     if (nx_fn_flat) std::memset(nx_fn_flat, 0, kFlatSpan);
+    if (uint32_t* sf = g_sdk_flat.load(std::memory_order_relaxed)) std::memset(sf, 0, kSdkSpan);
     g_fn_epoch.fetch_add(1, std::memory_order_release);
     g_all_tables.clear();
     g_fn_count = 0;
@@ -247,6 +275,8 @@ uint64_t hle_register(const char* name, HleFn fn) {
         g_thunk_count.store(g_thunks.size(), std::memory_order_release);
     }
     g_thunks[i]->fn = fn;
+    g_hle_fast[i].name = g_thunks[i]->name.c_str();
+    g_hle_fast[i].fn.store(fn, std::memory_order_release);
     return mem::kHleBase + i * 16;
 }
 
@@ -294,6 +324,11 @@ std::vector<HleInfo> hle_list() {
 
 void hle_clear() {
     std::lock_guard<std::mutex> lk(g_hle_lock);
+    const size_t n = g_thunks.size();
+    for (size_t i = 0; i < n; ++i) {
+        g_hle_fast[i].fn.store(nullptr, std::memory_order_relaxed);
+        g_hle_fast[i].name = nullptr;
+    }
     g_thunk_count.store(0);
     g_thunks.clear();
     g_thunk_by_name.clear();
@@ -319,14 +354,44 @@ void trap(const char* what, uint64_t addr) {
 }
 
 void dispatch_call(::Ctx* c, uint64_t addr) {
-    // HLE thunks live in their own address range, away from every lifted function: no hash lookup for them
+    // HLE thunks live in their own address range, away from every lifted function: direct flat-array dispatch with zero LOCK XADD.
     const bool in_hle_range = addr - mem::kHleBase < mem::kHleSize;
-    if (!in_hle_range) {
+    if (in_hle_range) {
+        if (!g_hle_trace_checked.load(std::memory_order_relaxed)) {
+            g_hle_trace_on.store(!hle_trace().prefix.empty(), std::memory_order_relaxed);
+            g_hle_trace_checked.store(true, std::memory_order_release);
+        }
+        const size_t idx = thunk_index(addr);
+        if (idx < g_thunk_count.load(std::memory_order_acquire) &&
+            !g_hle_trace_on.load(std::memory_order_relaxed) && !ft::on()) {
+            const HleFast& hf = g_hle_fast[idx];
+            if (HleFn fn = hf.fn.load(std::memory_order_acquire)) {
+                if (fn != g_named_hle_fn.load(std::memory_order_relaxed)) {
+                    fn(c);
+                    return;
+                }
+                const char* saved = t_hle_name;
+                t_hle_name = hf.name;
+                fn(c);
+                t_hle_name = saved;
+                return;
+            }
+        }
+    } else {
         const uint64_t i = flat_index(addr);
-        if (i < __atomic_load_n(&nx_fn_flat_n, __ATOMIC_ACQUIRE)) {
-            if (const uint32_t off = __atomic_load_n(&nx_fn_flat[i], __ATOMIC_ACQUIRE)) {
+        if (i < std::atomic_ref<uint64_t>(nx_fn_flat_n).load(std::memory_order_acquire)) {
+            if (const uint32_t off = std::atomic_ref<uint32_t>(nx_fn_flat[i]).load(std::memory_order_acquire)) {
                 reinterpret_cast<GuestFn>(nx_fn_flat_host + off)(c);
                 return;
+            }
+        }
+        const uint64_t si = sdk_flat_index(addr);
+        if (si < kSdkSpan / 4) {
+            if (uint32_t* sf = g_sdk_flat.load(std::memory_order_acquire)) {
+                if (const uint32_t off = std::atomic_ref<uint32_t>(sf[si]).load(std::memory_order_acquire)) {
+                    reinterpret_cast<GuestFn>(nx_fn_flat_host + off)(c);
+                    return;
+                }
             }
         }
         const uint32_t ep = g_fn_epoch.load(std::memory_order_acquire);

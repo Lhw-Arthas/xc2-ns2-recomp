@@ -22,6 +22,7 @@
 #include <string>
 
 #include "nxrt/config.h"
+#include "nxrt/diag.h"
 #include "nxrt/render_quality.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/fiber.h"
@@ -34,8 +35,10 @@
 #include "nxrt/log.h"
 #include "nxrt/memory.h"
 #include "nxrt/module.h"
+#include "nxrt/movie_vdec.h"
 #include "nxrt/nxmodule.h"
 #include "nxrt/runtime.h"
+#include "nxrt/services_api.h"
 #include "nxrt/svc.h"
 #include "nxrt/gfx.h"
 #include "nxrt/gfx_tuning.h"
@@ -47,6 +50,8 @@
 #include <memory>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -680,6 +685,168 @@ static void arm_model_probe(uint64_t main_base) {
 // (NS1 does the same through a patch page: frame_rate.c xc2_rate_store, patches-v301.txt set xc2fps. Their build reads the period through
 // the virtual every frame; ours has to be checked - if the game caches it at boot, this write lands before the read either way.)
 static nxrt::FrameLimiter *g_frame_limiter = nullptr;   // the play-mode limiter: its measured interval is the display time
+static std::atomic<float> g_fps_limiter_step{1.0f / 60.0f};
+static std::atomic<float> g_fps_game_step{1.0f / 60.0f};
+static uint64_t g_fps_main_base = 0;
+
+// Retail 3.0.1 vsync-period virtual override (main+0xba1320, vtable slot +0xc8 at main+0xe62780; zero direct BL callers).
+// Separates NS1-style dual words without binary patching:
+//   - renderSyncSys limiter (lr = main+0xb8eb4c / 0xb8ebd0) receives exact target step (1/90 gameplay, 1/60 cutscene), never self-locking;
+//   - getFrameStep (0xb865bc, 0xb8e540) receives the 5-frame real-time moving average so gameplay/hair/cloth keep 1.0x real time.
+static void host_vsync_period_301(::Ctx *c) {
+    const uint64_t mb = g_fps_main_base;
+    int32_t iv = 1;
+    const uint64_t iv_addr = mb + 0xe95460;   // retail 3.0.1 vsync interval (written to 1 at boot by 0x735300)
+    if (nxrt::mem::is_mapped(iv_addr, 4)) {
+        std::memcpy(&iv, reinterpret_cast<const void *>(iv_addr), 4);
+    }
+    if (iv <= 0) iv = 2;   // matches cbz w8 -> 2*period in renderSyncSys (0xb8eba0)
+    const uint64_t lr = c->x[30];
+    const bool is_limiter = (lr == mb + 0xb8eb4c || lr == mb + 0xb8ebd0);
+    static std::atomic<uint64_t> seen[8] = {};
+    static std::atomic<int> nseen{0};
+    bool known = false;
+    const int n = nseen.load(std::memory_order_relaxed);
+    for (int i = 0; i < n && i < 8; ++i) {
+        if (seen[i].load(std::memory_order_relaxed) == lr) { known = true; break; }
+    }
+    if (!known && n < 8) {
+        const int idx = nseen.fetch_add(1, std::memory_order_relaxed);
+        if (idx < 8) {
+            seen[idx].store(lr, std::memory_order_relaxed);
+            NXLOG_I("xc2", "vsync_period(0xba1320): caller lr=0x%llx (main+0x%llx) role=%s iv=%d",
+                    static_cast<unsigned long long>(lr), static_cast<unsigned long long>(lr - mb),
+                    is_limiter ? "renderSyncSys-limiter" : "game-step", iv);
+        }
+    }
+    const float step = is_limiter ? g_fps_limiter_step.load(std::memory_order_relaxed)
+                                  : g_fps_game_step.load(std::memory_order_relaxed);
+    c->v[0].u64[0] = 0;
+    c->v[0].u64[1] = 0;
+    c->v[0].f[0] = step / static_cast<float>(iv);
+}
+
+static std::atomic<int64_t> g_teardown_fps{60};
+static nxrt::GuestFn g_orig_821b40 = nullptr;
+static nxrt::GuestFn g_orig_822570 = nullptr;
+static nxrt::GuestFn g_orig_822600 = nullptr;
+
+// Scale guest-83's frame-counted 0x27d0 resource-bank teardown (main+0x820200 via 0x821b40/0x822570, and main+0x822600) back to <=60 Hz wall time.
+// Main retires consumer nodes at 30 Hz (33.3 ms), while 60 fps teardown waits 4 rendered frames per stage (66.7 ms); above 60 fps,
+// unmodified 2/4-frame thresholds finish in <=33.3 ms and unmap active pools during cutscene exit or fast travel.
+static bool hold_teardown_counter(uint64_t bank, uint16_t off, uint16_t trigger_minus_one, uint16_t hold_limit, uint16_t& held) {
+    if (held < hold_limit) {
+        ++held;
+        const uint16_t back = static_cast<uint16_t>(trigger_minus_one - 1);
+        std::memcpy(reinterpret_cast<void*>(bank + off), &back, 2);
+        return true;
+    }
+    return false;
+}
+
+static void handle_teardown_tick(uint64_t bank, bool is_820200) {
+    if (!bank || !nxrt::mem::is_mapped(bank, 0x10c0)) return;
+    const int64_t cur_fps = g_teardown_fps.load(std::memory_order_relaxed);
+    const int64_t scale = (cur_fps > 60) ? ((cur_fps + 59) / 60) : 1;
+
+    struct TeardownHold {
+        uint64_t bank = 0;
+        uint16_t h4184_3 = 0;
+        uint16_t h4182_1 = 0;
+        uint16_t h4182_3 = 0;
+    };
+    static std::mutex mu;
+    static std::vector<TeardownHold> holds;
+    static std::atomic<bool> logged_once{false};
+
+    uint32_t flags = 0;
+    std::memcpy(&flags, reinterpret_cast<const void*>(bank + 4284), 4);
+    const bool phase4184 = is_820200 && ((flags & 0x40000u) == 0);
+    const bool phase4182 = !is_820200 || ((flags & 0x40000u) != 0 && (flags & 0x8000000u) != 0);
+    if (!phase4184 && !phase4182) return;
+
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = std::find_if(holds.begin(), holds.end(), [bank](const TeardownHold& e) { return e.bank == bank; });
+    if (scale <= 1) {
+        if (it != holds.end()) holds.erase(it);
+        return;
+    }
+
+    const uint16_t extra2 = static_cast<uint16_t>(2 * (scale - 1));
+    const uint16_t extra4 = static_cast<uint16_t>(4 * (scale - 1));
+    bool held_now = false;
+    if (phase4184) {
+        uint16_t c4184 = 0;
+        std::memcpy(&c4184, reinterpret_cast<const void*>(bank + 4184), 2);
+        if (c4184 == 0) {
+            if (it != holds.end()) it->h4184_3 = 0;
+            return;
+        }
+        if (c4184 != 3) return;
+        if (it == holds.end()) {
+            holds.push_back({bank, 0, 0, 0});
+            it = holds.end() - 1;
+        }
+        held_now = hold_teardown_counter(bank, 4184, 3, extra4, it->h4184_3);
+    } else {
+        uint16_t c4182 = 0;
+        std::memcpy(&c4182, reinterpret_cast<const void*>(bank + 4182), 2);
+        if (c4182 == 0) {
+            if (it != holds.end()) {
+                it->h4182_1 = 0;
+                it->h4182_3 = 0;
+            }
+            return;
+        }
+        if (c4182 == 1) {
+            if (it == holds.end()) {
+                holds.push_back({bank, 0, 0, 0});
+                it = holds.end() - 1;
+            }
+            held_now = hold_teardown_counter(bank, 4182, 1, extra2, it->h4182_1);
+        } else if (c4182 == 3) {
+            if (it == holds.end()) {
+                holds.push_back({bank, 0, 0, 0});
+                it = holds.end() - 1;
+            }
+            held_now = hold_teardown_counter(bank, 4182, 3, extra2, it->h4182_3);
+            if (!held_now) holds.erase(it);
+        }
+    }
+    if (held_now && !logged_once.exchange(true, std::memory_order_relaxed)) {
+        NXLOG_I("xc2", "teardown cadence: scaling bank 0x%llx cleanup at %lld fps (%lldx)",
+                static_cast<unsigned long long>(bank), static_cast<long long>(cur_fps), static_cast<long long>(scale));
+    }
+}
+
+static void wrap_teardown_821b40(::Ctx* c) {
+    if (c) handle_teardown_tick(c->x[0], true);
+    if (g_orig_821b40) g_orig_821b40(c);
+}
+
+static void wrap_teardown_822570(::Ctx* c) {
+    if (c) handle_teardown_tick(c->x[0], true);
+    if (g_orig_822570) g_orig_822570(c);
+}
+
+static void wrap_teardown_822600(::Ctx* c) {
+    if (c) handle_teardown_tick(c->x[0], false);
+    if (g_orig_822600) g_orig_822600(c);
+}
+
+static void arm_teardown_cadence_301(uint64_t main_base, int64_t fps) {
+    if (fps <= 60) return;
+    g_teardown_fps.store(fps, std::memory_order_relaxed);
+    g_orig_821b40 = nxrt::fn_lookup(main_base + 0x821b40ull);
+    g_orig_822570 = nxrt::fn_lookup(main_base + 0x822570ull);
+    g_orig_822600 = nxrt::fn_lookup(main_base + 0x822600ull);
+    if (g_orig_821b40) nxrt::fn_register(main_base + 0x821b40ull, wrap_teardown_821b40);
+    if (g_orig_822570) nxrt::fn_register(main_base + 0x822570ull, wrap_teardown_822570);
+    if (g_orig_822600) nxrt::fn_register(main_base + 0x822600ull, wrap_teardown_822600);
+    NXLOG_I("xc2", "teardown cadence: wrapped indirect dispatch 821b40=%d 822570=%d 822600=%d for >60 fps safety (target %lld fps, scale %lldx)",
+            g_orig_821b40 != nullptr, g_orig_822570 != nullptr, g_orig_822600 != nullptr,
+            static_cast<long long>(fps), static_cast<long long>((fps + 59) / 60));
+}
 
 static void arm_frame_rate(uint64_t main_base) {
     const int64_t fps = nxrt::config_get_int("xc2", "fps", 0);
@@ -701,19 +868,64 @@ static void arm_frame_rate(uint64_t main_base) {
     NXLOG_I("xc2", "present_ahead = %s (auto = 1 while [nvn] mirror_capture is on, else 0; [nvn] present_ahead overrides this default)",
             nxrt::config_get_str("nvn", "present_ahead", "").c_str());
     if (fps <= 0) return;
-    const uint64_t period_addr = main_base + 0xf65a44;      // the 1/60 the vsync-period virtual loads (0x3C888889)
-    if (!nxrt::mem::is_mapped(period_addr, 4)) {
-        NXLOG_W("xc2", "frame rate: the vsync period is not mapped at 0x%llx: the game keeps its own 30 fps step",
-                static_cast<unsigned long long>(period_addr));
-        return;
-    }
+    const uint64_t period_addr = main_base + 0xf65a44;      // the 1/60 the vsync-period virtual loads (0x3C888889) on 3.0.0
     float old = 0.0f;
-    std::memcpy(&old, reinterpret_cast<const void*>(period_addr), 4);
-    // 0xf65a44 is the 3.0.0 rodata address of 1/60 (0x3C888889); on 3.0.1 it falls inside .bss (0.0f) and the game already
-    // runs natively at 60 fps (present interval 1). Skip patching and the fps_follow thread when the slot does not hold 1/60.
-    if (std::fabs(old - (1.0f / 60.0f)) > 1e-4f) {
-        NXLOG_I("xc2", "frame rate: main+0xf65a44 holds %.6f (expected 1/60); skipping 3.0.0 vsync-period patch",
-                static_cast<double>(old));
+    const bool has_300_slot = nxrt::mem::is_mapped(period_addr, 4) &&
+                              (std::memcpy(&old, reinterpret_cast<const void*>(period_addr), 4), std::fabs(old - (1.0f / 60.0f)) <= 1e-4f);
+    if (!has_300_slot) {
+        g_fps_main_base = main_base;
+        const float init_step = static_cast<float>(1.0 / static_cast<double>(fps));
+        g_fps_limiter_step.store(init_step, std::memory_order_relaxed);
+        g_fps_game_step.store(init_step, std::memory_order_relaxed);
+        nxrt::fn_register(main_base + 0xba1320, host_vsync_period_301);
+        arm_teardown_cadence_301(main_base, fps);
+        const int64_t cutscene_fps = nxrt::config_get_int("xc2", "cutscene_fps", fps > 60 ? 60 : 0);
+        NXLOG_I("xc2", "frame rate: hooked retail 3.0.1 vsync_period virtual at main+0xba1320 (target %lld fps, cutscene %lld fps, step %.2f ms)",
+                static_cast<long long>(fps), static_cast<long long>(cutscene_fps), static_cast<double>(init_step) * 1000.0);
+        nxrt::set_present_interval_hz(static_cast<double>(fps));
+        nxrt::services::viapi::set_display_vsync_hz(static_cast<double>(fps));
+        const bool follow = nxrt::config_get_bool("xc2", "fps_follow", true);
+        if ((!follow && cutscene_fps <= 0) || !g_frame_limiter) return;
+        std::thread([main_base, fps, cutscene_fps, follow] {
+            constexpr uint64_t kCutsceneFlagOff = 0xedf1a0ull;
+            int64_t cur_fps = fps;
+            bool was_rt_cutscene = false;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                const bool in_movie = nxrt::media::is_movie_playing();
+                bool in_rt_cutscene = false;
+                const uint64_t flag_addr = main_base + kCutsceneFlagOff;
+                if (nxrt::mem::is_mapped(flag_addr, 1)) {
+                    uint8_t flag = 0;
+                    std::memcpy(&flag, reinterpret_cast<const void *>(flag_addr), 1);
+                    in_rt_cutscene = (flag & 1u) != 0;
+                    if (in_rt_cutscene != was_rt_cutscene) {
+                        was_rt_cutscene = in_rt_cutscene;
+                        NXLOG_I("xc2", "real-time cutscene %s (main+0xedf1a0=0x%02x)", in_rt_cutscene ? "starts" : "ends", static_cast<unsigned>(flag));
+                    }
+                }
+                const bool in_cutscene = in_movie || in_rt_cutscene;
+                const int64_t want_fps = (in_cutscene && cutscene_fps > 0 && cutscene_fps < fps) ? cutscene_fps : fps;
+                if (want_fps != cur_fps) {
+                    cur_fps = want_fps;
+                    g_teardown_fps.store(cur_fps, std::memory_order_relaxed);
+                    nxrt::set_present_interval_hz(static_cast<double>(cur_fps));
+                    nxrt::services::viapi::set_display_vsync_hz(static_cast<double>(cur_fps));
+                    g_frame_limiter->set_target_fps(static_cast<double>(cur_fps));
+                    NXLOG_I("xc2", "frame rate -> %lld fps (%s)", static_cast<long long>(cur_fps),
+                            in_movie ? "AV1 movie" : in_rt_cutscene ? "real-time cutscene" : "gameplay");
+                }
+                const double target = 1.0 / static_cast<double>(cur_fps);
+                g_fps_limiter_step.store(static_cast<float>(target), std::memory_order_relaxed);
+                double step = target;
+                if (follow) {
+                    const double recent_ms = g_frame_limiter->recent_mean_ms(5, 250.0);
+                    if (recent_ms > 0.0) step = (std::max)(target, recent_ms / 1000.0);
+                    step = (std::min)(step, 1.0 / 15.0);
+                }
+                g_fps_game_step.store(static_cast<float>(step), std::memory_order_relaxed);
+            }
+        }).detach();
         return;
     }
     // [xc2] fps_interval (default 2): the game's "vsyncs per frame". 2 with period 1/(2 fps) is the shipping arrangement;
@@ -2072,6 +2284,108 @@ static void arm_ns2_mem_probe(uint64_t main_base) {
 // The release split (upstream's fefw_rt.dll / fefw_stub.cpp): the runtime and this boot code live in a DLL and
 // the player's exe only hands it the process. Built with XC2_RT_DLL the entry is exported under a C name so the
 // stub can find it; without the define this is still the exe entry it always was.
+static bool run_shader_prepare(bool interactive, bool force, const std::string& programs_file, bool* cancelled = nullptr) {
+    if (cancelled) *cancelled = false;
+    nxrt::nvn::ShaderPrepareOptions o;
+    o.programs_file = programs_file;
+    o.only_if_needed = !force;
+    o.force = force;
+
+    std::atomic<uint64_t> done{0}, total{0};
+    std::atomic<bool> stop{false}, finished{false};
+    std::mutex mu;
+    std::condition_variable cv;
+    bool ok = false;
+    nxrt::nvn::ShaderPrepareResult res;
+
+    auto run_body = [&] {
+        std::atomic<uint64_t> next_log{1000};
+        o.progress = [&](uint64_t d, uint64_t t) -> bool {
+            done.store(d, std::memory_order_relaxed);
+            total.store(t, std::memory_order_relaxed);
+            nxrt::diag_progress();
+            uint64_t m = next_log.load(std::memory_order_relaxed);
+            if ((d >= m || (t > 0 && d == t)) && next_log.compare_exchange_strong(m, d + 1000, std::memory_order_relaxed)) {
+                NXLOG_I("xc2", "shader prepare: %llu / %llu programs", static_cast<unsigned long long>(d),
+                        static_cast<unsigned long long>(t));
+                if (!interactive) {
+                    std::fprintf(stderr, "shader prepare: %llu / %llu\n", static_cast<unsigned long long>(d),
+                                 static_cast<unsigned long long>(t));
+                }
+            }
+            return !stop.load(std::memory_order_relaxed);
+        };
+        ok = nxrt::nvn::prepare_shaders(o, &res);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            finished.store(true, std::memory_order_release);
+        }
+        cv.notify_all();
+    };
+
+    if (!interactive) {
+        run_body();
+    } else {
+        std::thread worker(run_body);
+        uint64_t shown_done = ~0ull;
+        bool title_changed = false;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::milliseconds(5), [&] { return finished.load(std::memory_order_acquire); });
+        }
+        while (!finished.load(std::memory_order_acquire)) {
+            nxrt::diag_progress();
+            nxrt::platform::pump_events(false, 0);
+            if (nxrt::platform::quit_requested()) stop.store(true, std::memory_order_relaxed);
+            const uint64_t d = done.load(std::memory_order_relaxed);
+            const uint64_t t = total.load(std::memory_order_relaxed);
+            if (t > 0 && d != shown_done) {
+                shown_done = d;
+                title_changed = true;
+                char buf[160];
+                const int pct = static_cast<int>(d * 100 / t);
+                std::snprintf(buf, sizeof buf, "%s - Preparing Shaders %d%% (%llu / %llu)", nxrt::game::info().title, pct,
+                              static_cast<unsigned long long>(d), static_cast<unsigned long long>(t));
+                nxrt::platform::set_window_title(buf);
+            }
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::milliseconds(100), [&] { return finished.load(std::memory_order_acquire); });
+        }
+        worker.join();
+        if (title_changed) nxrt::platform::set_window_title(nxrt::game::info().title);
+    }
+
+    if (cancelled) *cancelled = res.cancelled;
+    if (!ok) {
+        if (interactive && res.error.rfind("cannot open ", 0) == 0) {
+            NXLOG_I("xc2", "shader prepare: skipped (%s)", res.error.c_str());
+            return true;
+        }
+        NXLOG_W("xc2", "shader prepare failed: %s", res.error.c_str());
+        if (!interactive) std::fprintf(stderr, "shader prepare failed: %s\n", res.error.c_str());
+        return false;
+    }
+    if (res.already_ready) {
+        NXLOG_I("xc2", "shader prepare: cache already up to date (%llu programs)",
+                static_cast<unsigned long long>(res.programs));
+        if (!interactive) {
+            std::fprintf(stderr, "shader prepare: already ready (%llu programs)\n",
+                         static_cast<unsigned long long>(res.programs));
+        }
+    } else {
+        NXLOG_I("xc2", "shader prepare: %s (%llu/%llu prepared, %llu parts, %.2f s)",
+                res.cancelled ? "cancelled" : "done", static_cast<unsigned long long>(res.prepared),
+                static_cast<unsigned long long>(res.programs), static_cast<unsigned long long>(res.parts), res.seconds);
+        if (!interactive) {
+            std::fprintf(stderr, "shader prepare: %llu/%llu prepared, %llu missing, %llu failed, %llu parts in %.2f s\n",
+                         static_cast<unsigned long long>(res.prepared), static_cast<unsigned long long>(res.programs),
+                         static_cast<unsigned long long>(res.missing_shaders), static_cast<unsigned long long>(res.failed),
+                         static_cast<unsigned long long>(res.parts), res.seconds);
+        }
+    }
+    return !res.cancelled && res.failed == 0;
+}
+
 #ifdef XC2_RT_DLL
 extern "C" __declspec(dllexport) int xc2_rt_main(int argc, char **argv) {
 #else
@@ -2080,6 +2394,9 @@ int main(int argc, char **argv) {
     std::string exefs;
     std::string link = "host";
     std::string entry_mode = "rtld";
+    std::string programs_file;
+    bool prepare_only = false;
+    bool force_prepare = false;
     uint64_t addr_override = 0;
     const char *logp = "xc2_boot.log";
     for (int i = 1; i < argc; i++) {
@@ -2090,9 +2407,12 @@ int main(int argc, char **argv) {
         else if (arg("--gfx")) ++i;   // parsed again below (window | headless)
         else if (arg("--entry")) entry_mode = argv[++i];
         else if (arg("--addr")) addr_override = std::strtoull(argv[++i], nullptr, 0);
-        else die("usage: xc2_boot --exefs DIR [--link host|rtld] [--gfx window|headless] [--log FILE]");
+        else if (!std::strcmp(argv[i], "--prepare-shaders")) prepare_only = true;
+        else if (!std::strcmp(argv[i], "--force-prepare")) force_prepare = true;
+        else if (arg("--programs")) programs_file = argv[++i];
+        else die("usage: xc2_boot --exefs DIR [--link host|rtld] [--gfx window|headless] [--prepare-shaders] [--log FILE]");
     }
-    if (exefs.empty()) die("--exefs is required: point it at the ExeFS you dumped from your own copy");
+    if (!prepare_only && exefs.empty()) die("--exefs is required: point it at the ExeFS you dumped from your own copy");
     if (!exefs.empty() && exefs.back() == '\\') exefs.pop_back();
 
     nxrt_register_game_xc2ns2_core();   // before nxrt::init reads the title facts
@@ -2108,7 +2428,7 @@ int main(int argc, char **argv) {
     const char* gfxmode = "window";
     for (int i = 1; i < argc; i++)
         if (!std::strcmp(argv[i], "--gfx") && i + 1 < argc) gfxmode = argv[++i];
-    const bool headless = !std::strcmp(gfxmode, "headless");
+    const bool headless = prepare_only || !std::strcmp(gfxmode, "headless");
     std::unique_ptr<nxrt::gfx::Device> gfx_device;
     std::unique_ptr<nxrt::gfx::Renderer> gfx_renderer;
     nxrt::nvn::install();
@@ -2225,6 +2545,26 @@ int main(int argc, char **argv) {
         bd.limiter = frame_limiter;
         bd.keep_aspect = play_disp.keep_aspect;
         if (!nxrt::nvn::install_backend(bd)) die("NVN back end failed to start (see the log)");
+        if (prepare_only) {
+            const bool ok = run_shader_prepare(false, force_prepare, programs_file);
+            nxrt::nvn::shutdown_backend();
+            gfx_renderer.reset();
+            gfx_device.reset();
+            nxrt::shutdown();
+            return ok ? 0 : 1;
+        }
+        if (!headless && nxrt::config_get_bool("nvn", "auto_prepare", true)) {
+            bool prep_cancelled = false;
+            run_shader_prepare(true, force_prepare, programs_file, &prep_cancelled);
+            if (prep_cancelled || nxrt::platform::quit_requested()) {
+                nxrt::nvn::shutdown_backend();
+                gfx_renderer.reset();
+                gfx_device.reset();
+                if (!headless) nxrt::platform::shutdown();
+                nxrt::shutdown();
+                return 0;
+            }
+        }
         nxrt::play::StartOptions po;
         po.device = gfx_device.get();
         po.renderer = gfx_renderer.get();

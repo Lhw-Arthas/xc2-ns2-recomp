@@ -16,6 +16,8 @@
 #include "nxrt/dispatch.h"
 #include "nxrt/log.h"
 
+namespace nxrt { void hle_mark_needs_name(HleFn fn); }
+
 namespace nxrt::nvn {
 namespace {
 
@@ -152,6 +154,7 @@ uint32_t struct_size(const char* name) {
 void install() {
     std::lock_guard<std::mutex> lk(g_install_mu);
     if (g_installed.load()) return;
+    nxrt::hle_mark_needs_name(stub_handler);
     for (size_t i = 0; i < kEntryCount; ++i) {
         const char* name = g_entries[i].name;
         if (!std::strcmp(name, "nvnBootstrapLoader")) hle_register(name, bootstrap_loader);

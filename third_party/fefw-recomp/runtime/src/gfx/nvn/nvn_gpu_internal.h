@@ -118,6 +118,12 @@ bool early_fragment_tests_patched(const std::string& fs_hash);
 
 // All commands before, all commands after, all memory (used after passes, dispatches, copies and fills).
 void memory_barrier(VkCommandBuffer cb);
+// Vulkan-spec-legal in-pass memory barrier (graphics stages only + BY_REGION_BIT): keeps dynamic rendering pass open.
+void memory_barrier_in_pass(VkCommandBuffer cb);
+// Narrow transfer barriers for vkCmdUpdateBuffer (do_write_memory) to avoid full ALL_COMMANDS->ALL_COMMANDS stalls.
+void transfer_pre_barrier(VkCommandBuffer cb);
+void transfer_post_barrier(VkCommandBuffer cb);
+uint64_t staging_overflow_count();
 // [nvn] pass_barriers = tracked (S38): image_barrier derives its stage and access masks from the two layouts instead of all commands and
 // all memory. Set by the replay for each submission; any thread may record image barriers, so it is an atomic.
 void set_narrow_barriers(bool on);
@@ -128,6 +134,7 @@ struct BufRef {
     VkDeviceSize offset = 0;
     VkDeviceSize avail = 0;       // bytes from offset to the end of the pool buffer
     bool ok = false;
+    bool snapped = false;
 };
 // The buffer and offset of `size` bytes at a GPU address. When the address is in no pool (or size runs past the pool), ok is
 // false and the buffer is the dummy buffer (a zeroed 64 KiB buffer) so the draw can go on; this is logged once per address.
@@ -174,6 +181,7 @@ void mirror_capture_set(std::shared_ptr<void> cap);   // render thread: the capt
 void mirror_capture_end(VkCommandBuffer cb);
 uint64_t mirror_capture_no_chunk_escapes();           // render thread: cumulative kEscNoChunk escape counter
 void vram_log_periodic();                             // thread-safe: periodic VRAM + pool copy usage log line
+uint64_t staging_overflow_count();                    // render thread: upload overflow allocations since start
 
 // ---- compute results held in the pool copy (nvn_gpu_pool.cpp, "compute out") ----------------------------------------------------
 // A dispatch that binds the pool copy directly (nvn_replay.cpp, compute shadows) writes its result there: the range is "out" until the

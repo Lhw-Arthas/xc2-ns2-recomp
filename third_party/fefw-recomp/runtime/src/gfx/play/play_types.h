@@ -163,7 +163,7 @@ struct DisplaySettings {
     bool vsync = false;            // false: no forced vsync (immediate / mailbox, VRR friendly) with the frame cap below
     // [display] fps_limit (older name fps_cap): 0 = unlimited (with vsync on: mailbox presents), -1 = auto (the display's refresh rate),
     // else the cap; with vsync on, a cap only applies when it is below the refresh rate
-    int fps_cap = 60;
+    int fps_cap = -1;
     int width = 0, height = 0;        // windowed client size: 0 = follow display (capped at 1440p), otherwise explicit
     bool keep_aspect = true;       // letterbox instead of stretching
     // ---- S10 display options (play_display.h). The first four only apply at the next start: the game builds its render targets once.
@@ -235,9 +235,9 @@ inline constexpr int kRenderQualityCount = nxrt::kRenderQualityModeCount;
 int render_output_height();   // [am] resolution's height (the output the share is of), else 1080
 
 struct Game3dSettings {
-    // Index into kRenderQuality: 0 native (DLAA) .. 4 Ultra Performance, 5 console. Saved as [upscale] render_quality; restart.
-    int res_preset = 5;
-    std::string upscaler = "fsr3";      // "dlss" | "fsr3" | "taau" | "bilinear"
+    // Index into kRenderQuality: 0 native (100% / DLAA) .. 4 Ultra Performance, 5 console. Saved as [upscale] render_quality; restart.
+    int res_preset = 0;
+    std::string upscaler = "taau";      // "dlss" | "fsr3" | "taau" | "bilinear"
     std::string fsr_version = "3.1";    // "3.1" | "4.1" | "2.3"
     double sharpness = 0.5;             // [dlss] sharpness (0.0..1.0)
     std::string dlss_preset = "default";   // [dlss] preset: "default" | "J" | "K" | "L" | "M" (live)

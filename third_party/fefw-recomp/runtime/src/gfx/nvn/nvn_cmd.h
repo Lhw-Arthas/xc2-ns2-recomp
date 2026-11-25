@@ -121,11 +121,41 @@ struct CommandBuffer;
 // runs when the NVN call returns (cmdmem_run_pending, from the thunk in nvn_abi.h).
 void cmdmem_charge(CommandBuffer* cb, Op op, uint32_t blob_size);
 
+// Pooled uninitialized byte buffer for CmdList: avoids per-record std::vector zero-fill (double-writing every byte of ~45k
+// commands/frame on the guest thread) and recycles >=32 KiB buffers across CmdLists to avoid malloc/free heap contention.
+struct CmdBytes {
+    uint8_t* ptr = nullptr;
+    size_t len = 0;
+    size_t cap = 0;
+    CmdBytes() = default;
+    ~CmdBytes() { release(); }
+    CmdBytes(const CmdBytes&) = delete;
+    CmdBytes& operator=(const CmdBytes&) = delete;
+    uint8_t* data() { return ptr; }
+    const uint8_t* data() const { return ptr; }
+    size_t size() const { return len; }
+    bool empty() const { return len == 0; }
+    void clear() { len = 0; }
+    void reserve(size_t need);
+    void release();
+    uint8_t* grow_uninit(size_t n) {
+        const size_t at = len;
+        const size_t need = at + n;
+        if (need > cap) reserve(need > cap * 2 ? need : (cap ? cap * 2 : size_t(32768)));
+        len = need;
+        return ptr + at;
+    }
+    void append_bytes(const uint8_t* src, size_t n) {
+        if (!n) return;
+        std::memcpy(grow_uninit(n), src, n);
+    }
+};
+
 class CmdList : public Obj {
 public:
     static constexpr Kind kKind = Kind::CmdList;
     CmdList() : Obj(kKind) {}
-    std::vector<uint8_t> bytes;
+    CmdBytes bytes;
     std::vector<Ref<Obj>> held;           // objects the payloads point to
     uint64_t handle = 0;                  // NVNcommandHandle (0 until EndRecording)
     uint32_t record_count = 0;
@@ -135,27 +165,64 @@ public:
     CommandBuffer* meter = nullptr;       // the buffer recording it (charged per record), null once recorded and for host-made lists
     std::atomic<uint64_t> calls{0};
 
-    // Appends one record. `blob` (may be null) is copied after the payload.
+    // Appends one record without blob (hot path: compile-time aligned payload size, zero blob branch).
     template <class P>
-    void emit(Op op, const P& payload, const void* blob = nullptr, uint32_t blob_size = 0) {
+    void emit(Op op, const P& payload) {
         static_assert(std::is_trivially_copyable_v<P>, "payloads are plain data");
-        append(op, &payload, sizeof(P), blob, blob_size);
+        if (meter) charge_fast(op, 0);
+        constexpr uint32_t p = (static_cast<uint32_t>(sizeof(P)) + 7u) & ~7u;
+        constexpr uint32_t total = static_cast<uint32_t>(sizeof(RecHeader)) + p;
+        uint8_t* dst = bytes.grow_uninit(total);
+        const RecHeader h{static_cast<uint16_t>(op), 0, total};
+        std::memcpy(dst, &h, sizeof h);
+        std::memcpy(dst + sizeof h, &payload, sizeof(P));
+        if constexpr (p > sizeof(P)) std::memset(dst + sizeof h + sizeof(P), 0, p - sizeof(P));
+        ++record_count;
+    }
+    // Appends one record with an optional blob copied after the payload.
+    template <class P>
+    void emit(Op op, const P& payload, const void* blob, uint32_t blob_size) {
+        static_assert(std::is_trivially_copyable_v<P>, "payloads are plain data");
+        if (meter) charge_fast(op, blob_size);
+        constexpr uint32_t p = (static_cast<uint32_t>(sizeof(P)) + 7u) & ~7u;
+        const uint32_t b = (blob_size + 7u) & ~7u;
+        const uint32_t total = static_cast<uint32_t>(sizeof(RecHeader)) + p + b;
+        uint8_t* dst = bytes.grow_uninit(total);
+        const RecHeader h{static_cast<uint16_t>(op), 0, total};
+        std::memcpy(dst, &h, sizeof h);
+        std::memcpy(dst + sizeof h, &payload, sizeof(P));
+        if constexpr (p > sizeof(P)) std::memset(dst + sizeof h + sizeof(P), 0, p - sizeof(P));
+        if (blob_size) {
+            std::memcpy(dst + sizeof h + p, blob, blob_size);
+            if (b > blob_size) std::memset(dst + sizeof h + p + blob_size, 0, b - blob_size);
+        }
+        ++record_count;
     }
     void emit_empty(Op op) { append(op, nullptr, 0, nullptr, 0); }
-    void hold(Obj* o) { if (o) { o->ref(); held.emplace_back(o); } }
+    void hold(Obj* o) {
+        if (!o) return;
+        o->ref();
+        held.emplace_back(o);
+    }
     void reset() { bytes.clear(); held.clear(); record_count = draw_count = 0; handle = 0; }
 
 private:
+    inline void charge_fast(Op op, uint32_t blob_size);
     void append(Op op, const void* payload, uint32_t payload_size, const void* blob, uint32_t blob_size) {
-        if (meter) cmdmem_charge(meter, op, blob_size);
+        if (meter) charge_fast(op, blob_size);
         const uint32_t p = (payload_size + 7u) & ~7u, b = (blob_size + 7u) & ~7u;
         const uint32_t total = static_cast<uint32_t>(sizeof(RecHeader)) + p + b;
-        const size_t at = bytes.size();
-        bytes.resize(at + total);   // zero-initialised padding
+        uint8_t* dst = bytes.grow_uninit(total);
         RecHeader h{static_cast<uint16_t>(op), 0, total};
-        std::memcpy(&bytes[at], &h, sizeof h);
-        if (payload_size) std::memcpy(&bytes[at + sizeof h], payload, payload_size);
-        if (blob_size) std::memcpy(&bytes[at + sizeof h + p], blob, blob_size);
+        std::memcpy(dst, &h, sizeof h);
+        if (payload_size) {
+            std::memcpy(dst + sizeof h, payload, payload_size);
+            if (p > payload_size) std::memset(dst + sizeof h + payload_size, 0, p - payload_size);
+        }
+        if (blob_size) {
+            std::memcpy(dst + sizeof h + p, blob, blob_size);
+            if (b > blob_size) std::memset(dst + sizeof h + p + blob_size, 0, b - blob_size);
+        }
         ++record_count;
     }
 };
@@ -218,7 +285,23 @@ struct CommandBuffer : Obj {
     Device* device = nullptr;
     std::string label;
     std::mutex lock;
+    int64_t rec_start_ns = 0;                        // steady_clock timestamp at BeginRecording (nvn.gprof telemetry)
 };
+
+// Inline fast path for CmdList::charge_fast: eliminates ~70k cross-TU cmdmem_charge calls + ~140k switch branches/frame on guest-83.
+inline void CmdList::charge_fast(Op op, uint32_t blob_size) {
+    if (op != Op::FenceSync && op != Op::WaitSync && op != Op::CallCommands &&
+        op != Op::Nop && op != Op::PushDebugGroup && op != Op::PopDebugGroup) {
+        const uint64_t n = 8ull + ((static_cast<uint64_t>(blob_size) + 3u) & ~3ull);
+        CommandBuffer* cb = meter;
+        if (cb->last_block_addr && !cb->cmd_full && !cb->pend_cmd && cb->command_used + n <= cb->command_total) {
+            cb->command_used += n;
+            hw_bytes += n;
+            return;
+        }
+    }
+    cmdmem_charge(meter, op, blob_size);
+}
 
 // Made-up command memory addresses of the overflow rings (above any GPU address a pool can have; one 64 GiB slot per buffer).
 constexpr uint64_t kOverflowAddrBase = 0xFF00000000000000ull;

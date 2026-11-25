@@ -6,6 +6,7 @@
 // the next interval is never shorter than 0.9 period: no catch-up bursts) and after a stall of more than 4 periods the
 // schedule restarts from now.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace nxrt {
@@ -60,6 +61,8 @@ public:
         double late_over_half_ms = 0;   // fraction of the waited frames that started more than 0.5 ms late (a robust accuracy measure with few frames, unlike p99)
     };
     Stats stats() const;                // over the intervals since reset_stats() (at most the last 8192)
+    // Recent moving average over the last `max_n` intervals, ignoring stalls > `max_sample_ms` (NS1 frame_rate.c STEP_SAMPLES=5).
+    double recent_mean_ms(std::size_t max_n = 5, double max_sample_ms = 250.0) const;
     void reset_stats();
 
     // Last wait: how long begin_frame() slept/spun (ns), and how late the frame started against its schedule (ns, >= 0).

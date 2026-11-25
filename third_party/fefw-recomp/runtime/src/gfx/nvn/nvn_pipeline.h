@@ -34,11 +34,25 @@ struct BindingDesc {
     int nvn_stage = 0;                          // NVNshaderStage of that module (0 vertex, 1 fragment, 2 geometry, 5 compute)
 };
 
+struct DescTemplateSlot {
+    union {
+        VkDescriptorBufferInfo buf;
+        VkDescriptorImageInfo img;
+        VkBufferView texel;
+    };
+};
+
 struct ProgLayout {
     VkDescriptorSetLayout sets[5] = {};         // 0..3 the program's own; kPoolSet (4) the shared pool arrays, when a stage samples through them
+    VkDescriptorUpdateTemplate templates[4] = {};   // bulk descriptor update templates (sets 0..3, VK_NULL_HANDLE if fallback needed)
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::vector<BindingDesc> bindings;          // every used descriptor of every stage, sorted by (set, binding)
+    std::vector<uint32_t> set_binding_idx[4];   // indices into `bindings` per descriptor set (0..3), matching templates[set] 1:1 (preserves resolve_memo!)
+    std::vector<uint32_t> sampler_binding_idx;  // indices into `bindings` for SamplerBinding/HandleInUniform COMBINED_IMAGE_SAMPLER
+    std::vector<uint32_t> prep_tex_idx;         // indices into `bindings` for STORAGE_IMAGE + COMBINED_IMAGE_SAMPLER (fast prepare_textures)
     bool has_sampler = false;                   // some binding is a combined image sampler (feedback_prepare can skip the others)
+    bool has_sampler_3d = false;                // some binding is a 3D combined image sampler (vol3d_prepare skips all others in O(1))
+    bool has_storage_writes = false;            // some binding is a storage buffer or storage image
     bool has_set[5] = {};
     VkShaderStageFlags push_stages = 0;         // push constant range [0, push_bytes) of generated stages (ShaderInfo::push_bytes); 0 = none
     uint32_t push_bytes = 0;
@@ -48,6 +62,9 @@ struct ProgLayout {
     // Set 0 is pushed and nothing outside it depends on the uniform buffers (no texture handle read from a uniform block): a draw whose
     // only change is a uniform buffer binding pushes set 0 again and keeps the other sets it has bound ([nvn] ubo_only_rebind).
     bool ubo_only = false;
+    bool has_handle_in_ubo = false;             // some binding reads a texture handle from a uniform block (HandleInUniform)
+    uint16_t ubo_mask[6] = {};                  // bit k: stage uses UBO slot k (NS1 XC2_BIND_SKIP port)
+    uint16_t ssbo_mask[6] = {};                 // bit k: stage uses SSBO slot k
 };
 
 // [nvn] push_uniforms (default true): programs whose set 0 fits the device's push descriptor limit push it (ProgLayout::push_set0). False when the
@@ -56,6 +73,7 @@ bool push_uniforms_on();
 
 // Stages by NVN stage index (0 vertex, 1 fragment, 2 geometry, 5 compute); null = absent.
 const ProgLayout* prog_layout(const ShaderInfo* const stages[6]);
+uint64_t prog_layout_gen();
 
 // Vertex input for the key.
 struct KeyAttr {
@@ -238,6 +256,7 @@ using PrepareResult = nxrt::nvn::ShaderPrepareResult;
 bool gpl_prepare(const PrepareOptions& o, PrepareResult* r);       // false: nothing could be done (see r->error)
 void module_cache_clear();                                          // destroys every cached shader module and variant (nothing may be creating pipelines)
 
+bool early_fragment_tests_active();   // true when hardware EarlyFragmentTests is injected for all storage-image fragment shaders
 void pipeline_shutdown();
 size_t pipeline_count();
 

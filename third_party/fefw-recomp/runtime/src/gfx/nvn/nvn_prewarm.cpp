@@ -258,9 +258,11 @@ void saver_main() {
     std::unique_lock<std::mutex> lk(g_mu);
     uint64_t logged = 0;
     auto next_summary = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto next_cache_save = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!g_stop) {
         g_cv.wait_for(lk, std::chrono::seconds(2), [] { return g_stop; });
         if (g_stop) break;
+        const auto now_tp = std::chrono::steady_clock::now();
         const uint64_t sig = g_stats.recorded + g_stats.queued * 3 + g_stats.built * 5 + g_stats.taken * 7 + g_stats.waited * 11 + g_stats.claimed * 13 +
                              g_stats.linked_meanwhile * 17 + g_stats.promoted * 19;
         if (sig != logged) {                       // the process may end without a shutdown: say what the prewarm did while it runs
@@ -273,11 +275,14 @@ void saver_main() {
                     static_cast<unsigned long long>(g_stats.linked_meanwhile), static_cast<unsigned long long>(g_stats.claimed));
         }
         gpl_progress_log();
-        if (std::chrono::steady_clock::now() >= next_summary) {
+        if (now_tp >= next_summary) {
             next_summary += std::chrono::seconds(30);
             log_summary_locked();
         }
-        if (pipeline_cache_dirty()) {
+        // Save the pipeline cache periodically (every 30 s when dirty) rather than on every 2 s tick so the exclusive
+        // vkGetPipelineCacheData lock does not stall in-flight shader compiles on the render thread during boot/area loads.
+        if (now_tp >= next_cache_save && pipeline_cache_dirty()) {
+            next_cache_save = now_tp + std::chrono::seconds(30);
             lk.unlock();
             pipeline_cache_save();
             lk.lock();

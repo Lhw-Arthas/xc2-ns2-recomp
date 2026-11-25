@@ -420,11 +420,18 @@ fn ini_value(dir: &Path, section: &str, key: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Maps [xc2] fps in nxrt.ini to (NXRT_XC2_FPS, NXRT_NVN_PRESENT_INTERVAL_HZ); retail 3.0.1 tops at 60 Hz.
-fn fps_env_for_dir(dir: &Path) -> (&'static str, &'static str) {
+/// Maps [xc2] fps in nxrt.ini to (NXRT_XC2_FPS, NXRT_NVN_PRESENT_INTERVAL_HZ).
+fn fps_env_for_dir(dir: &Path) -> (String, String) {
     match ini_value(dir, "xc2", "fps").as_deref() {
-        Some("0") | Some("30") => ("0", "30"),
-        _ => ("60", "60"),
+        Some("0") | Some("30") => ("0".into(), "30".into()),
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) if (31..=240).contains(&n) => {
+                let s = n.to_string();
+                (s.clone(), s)
+            }
+            _ => ("60".into(), "60".into()),
+        },
+        None => ("60".into(), "60".into()),
     }
 }
 
@@ -591,13 +598,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ini = dir.join(crate::settings::GAME_INI);
-        assert_eq!(fps_env_for_dir(&dir), ("60", "60"));
+        assert_eq!(fps_env_for_dir(&dir), ("60".into(), "60".into()));
         std::fs::write(&ini, "[xc2]\nfps = 0\n").unwrap();
-        assert_eq!(fps_env_for_dir(&dir), ("0", "30"));
+        assert_eq!(fps_env_for_dir(&dir), ("0".into(), "30".into()));
         std::fs::write(&ini, "[xc2]\nfps = 30\n").unwrap();
-        assert_eq!(fps_env_for_dir(&dir), ("0", "30"));
+        assert_eq!(fps_env_for_dir(&dir), ("0".into(), "30".into()));
+        std::fs::write(&ini, "[xc2]\nfps = 90\n").unwrap();
+        assert_eq!(fps_env_for_dir(&dir), ("90".into(), "90".into()));
         std::fs::write(&ini, "[xc2]\nfps = 120\n").unwrap();
-        assert_eq!(fps_env_for_dir(&dir), ("60", "60"));
+        assert_eq!(fps_env_for_dir(&dir), ("120".into(), "120".into()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

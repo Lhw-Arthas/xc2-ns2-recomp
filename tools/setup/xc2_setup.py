@@ -971,11 +971,35 @@ def step_shaders_package(r, repo, install, py, jobs):
         # Re-walking the archive only retries the 22 blocks the translator rejects, and build_cache.py treats "not one
         # shader came out" as a hard failure - measured 2026-11-18. The scan half is done; only the prefill is missing.
         r.log("  the archive scan is already there; only the headless prefill is missing")
+    programs = spirv.parent / "programs.bin"
+    tsv = install / "build" / "shader-cache" / "files.tsv"
+    ard = install / "romfs" / "bf2.ard"
+    if not programs.is_file() and ard.is_file() and tsv.is_file():
+        ext_tool = first_file(repo / "tools" / "shader" / "cache" / "extract_embedded.py",
+                              repo / "tools" / "shader-cache" / "extract_embedded.py")
+        if ext_tool.is_file():
+            n = jobs if jobs > 0 else max(2, (os.cpu_count() or 4) - 1)
+            r.log("  extracting paired shader programs list for pipeline prewarming...")
+            r.run([str(py), str(ext_tool), "--ard", str(ard), "--tsv", str(tsv),
+                   "--programs", str(programs), "--programs-only", "--jobs", str(n)], cwd=repo)
     note = prefill_package(r, repo, install, py, harness, spirv, jobs=jobs)
     r.log("  %d shader(s) in the cache" % len(list(spirv.glob("*.spv"))))
     if not prefilled.is_file():
         return r.end_step("shaders", started, False,
                           note or "the headless prefill named no block; the cache has the archive's share only")
+    exe = install / "xc2_boot.exe"
+    if exe.is_file() and programs.is_file():
+        patched = install / "build" / "exefs-patched"
+        exefs_dir = patched if (patched / "m3_state.json").is_file() and (patched / "main").is_file() else install / "exefs"
+        env = launch_env(install)
+        env["NXRT_NVN_SHADER_CACHE"] = str(spirv)
+        r.log("  precompiling GPU pipeline cache from %s..." % programs.name)
+        r.note_progress("precompiling GPU pipeline cache")
+        rc = r.run([str(exe), "--exefs", str(exefs_dir), "--link", "host", "--gfx", "headless",
+                    "--prepare-shaders", "--log", str(install / "setup" / "prepare.log")],
+                   cwd=install, env=env)
+        if rc != 0:
+            r.log("  pipeline precompile returned exit %d (will retry automatically on launch)" % rc)
     return r.end_step("shaders", started, True)
 
 

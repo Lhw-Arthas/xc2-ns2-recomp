@@ -366,7 +366,7 @@ namespace {
 Game3dSettings hydrate_game3d_from_config() {
     Game3dSettings r;
     const std::string q = config_get_str("upscale", "render_quality", "");
-    r.res_preset = kRenderQualityCount - 1;   // console default
+    r.res_preset = 0;   // native (100%) default when [upscale] render_quality is unset
     for (int i = 0; i < kRenderQualityCount; ++i)
         if (q == kRenderQuality[i].key) r.res_preset = i;
     if (q.empty() && config_get_bool("upscale", "lock_render_size", false)) {   // set by hand: the nearest quality to the ini's scales
@@ -380,7 +380,7 @@ Game3dSettings hydrate_game3d_from_config() {
         }
     }
 
-    std::string up = config_get_str("dlss", "upscaler", "fsr3");
+    std::string up = config_get_str("dlss", "upscaler", "taau");
     for (char& c : up) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (up == "auto") up = extras::temporal_dlss_started() ? "dlss" : "fsr3";
     if (up != "dlss" && up != "fsr3" && up != "taau" && up != "bilinear") up = up == "fsr" ? "fsr3" : "taau";

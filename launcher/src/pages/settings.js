@@ -54,10 +54,15 @@ const SECTIONS = [
   {
     title: 'settings.sec.frameRate', icon: 'gauge', file: 'game',
     fields: [
-      // [xc2] fps: retail 3.0.1 natively steps up to 60 Hz; 0 keeps the 30 Hz cadence/cap (higher output needs Frame Generation).
+      // [xc2] fps: 0/30 keeps the 30 Hz cadence/cap; 60 is retail 3.0.1 native (recommended); 90/120 scale via dual-clock (experimental, cutscenes stay 60).
       { id: 'fps', type: 'select', label: 'settings.fps.label', sec: 'xc2', key: 'fps', def: '60',
-        options: [['0', 'settings.fps.native'], ['60', '60']],
-        normalize: (v) => (['0', '30'].includes(String(v).trim()) ? '0' : '60'),
+        options: [['0', 'settings.fps.native'], ['60', 'settings.fps.fps60'], ['90', 'settings.fps.fps90'], ['120', 'settings.fps.fps120']],
+        normalize: (v) => {
+          const s = String(v).trim();
+          if (s === '0' || s === '30') return '0';
+          if (s === '90' || s === '120') return s;
+          return '60';
+        },
         hint: 'settings.fps.hint' },
       { id: 'vsync_cap', type: 'toggle', label: 'settings.vsyncCap.label', sec: 'latency', key: 'vsync_cap', def: '1',
         hint: 'settings.vsyncCap.hint' },
@@ -68,6 +73,10 @@ const SECTIONS = [
     fields: [
       { id: 'audio_device', type: 'text', label: 'settings.audioDevice.label', sec: 'audio', key: 'device', def: 'default',
         placeholder: 'settings.audioDevice.placeholder', hint: 'settings.audioDevice.hint' },
+      { id: 'audio_channels', type: 'select', label: 'settings.audioChannels.label', sec: 'audio', key: 'channels', def: '2',
+        options: [['2', 'settings.audioChannels.stereo'], ['6', 'settings.audioChannels.surround51']],
+        normalize: (v) => (String(v).trim() === '6' ? '6' : '2'),
+        hint: 'settings.audioChannels.hint' },
       { id: 'out_latency', type: 'number', label: 'settings.audioLatency.label', sec: 'audio', key: 'out_latency_ms', def: '30',
         min: 5, max: 200, hint: 'settings.audioLatency.hint' },
       { id: 'jc2_mouse', type: 'select', label: 'settings.jc2Mouse.label', sec: 'input', key: 'jc2_mouse', def: 'auto',

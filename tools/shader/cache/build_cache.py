@@ -134,6 +134,7 @@ def main(argv):
     ap.add_argument("--stage", default="", help="scratch folder (default: <blocks>/../build_cache)")
     ap.add_argument("--pack-tool", default="", help="optional pack_full.py; without it the pack is left alone")
     ap.add_argument("--pack", default="", help="the spirv.preload.pack to rebuild (needs --pack-tool)")
+    ap.add_argument("--programs", default="", help="output MPRPRG01 programs.bin path (default with --ard: <cache>/../programs.bin)")
     ap.add_argument("--dry-run", action="store_true", help="report what would be translated, change nothing")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
@@ -155,9 +156,11 @@ def main(argv):
             rep.fail(EXIT_INPUT, "the index step failed")
             return EXIT_INPUT
         a.blocks = os.path.join(work, "blocks")
+        programs_out = a.programs or os.path.join(os.path.dirname(os.path.abspath(a.cache)), "programs.bin")
         rep.step("extract", ard=a.ard, out=a.blocks, jobs=a.jobs)
         rc, tail = run_stream([sys.executable, os.path.join(here, "extract_embedded.py"),
-                               "--ard", a.ard, "--tsv", tsv, "--out", a.blocks, "--jobs", str(a.jobs)], rep)
+                               "--ard", a.ard, "--tsv", tsv, "--out", a.blocks,
+                               "--programs", programs_out, "--jobs", str(a.jobs)], rep)
         if rc != 0:
             rep.say(tail[-600:])
             rep.fail(EXIT_INPUT, "the extraction step failed")

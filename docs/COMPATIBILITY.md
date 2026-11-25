@@ -34,7 +34,7 @@ Ryzen 7 5800X + Radeon RX 6800 XT, Adrenalin 26.10.1, 1440p window:
 ## What works
 
 - boots to the title screen, loads a 2022 clear save, plays in the field
-- 60 fps target (`tools\run\play-301.cmd -60`); the game's logic, timers and animations follow it
+- 60 fps recommended (`tools\run\play-301.cmd -60`, launcher default); the game's logic, timers and animations follow it cleanly. Experimental 90 / 120 fps dual-clock modes are selectable in the launcher (cutscenes and movies stay capped at 60 fps; frame-time swings under VSync/VRR may cause minor flicker)
 - the upscaler slot is served by the built-in **TAAU** by default; **FSR 4.1.2** and **FSR 3.1.6** are selectable
   at run time (`[dlss] upscaler = fsr3` + `[upscale] fsr_version`), and FSR 4.1.2 measured no slower than TAAU here
 - dynamic resolution is handled: one FidelityFX context per input size (6 in a long session, 0 crashes)
@@ -60,7 +60,7 @@ Ryzen 7 5800X + Radeon RX 6800 XT, Adrenalin 26.10.1, 1440p window:
 - The **RDNA 2 blue-grey rim** where objects meet the cloud sea and the **cloud-sea shimmer** in motion are fixed:
   both came from the runtime letting the GPU read pool bytes the CPU had already rewritten, which the mirror-capture
   work in pull requests 19 and 27 captures per submission (verified on an RX 6800 XT, 2026-11-22).
-- **First run compiles pipelines**: about 22 seconds with no frame, then it never happens again.
+- **First run prepares shader cache (`shader_prepare`)**: boot-time shader preparation builds GPL pipeline libraries ahead of gameplay from embedded program pairs extracted during setup, eliminating steady-play and multi-map compile hitches once prepared.
 - **Slow frames on area transitions** (texture uploads and memory-pool imports), not in steady play.
 - **Shader cache & NVIDIA validation state**: stencil-plane sampler fixes (`VUID-vkCmdDrawIndexed-format-07753`) are
   reproduced automatically on the player's own shader cache by

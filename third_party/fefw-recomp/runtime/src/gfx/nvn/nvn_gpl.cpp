@@ -1026,7 +1026,7 @@ std::string hex16(uint64_t h) {
 
 // The state file next to the program list: which GPU and driver the preparation ran on and whether it finished. The key changes with the
 // GPU, the driver version, the pipeline cache UUID (a driver update changes it) and the version of the part scheme in this file.
-constexpr int kPrepareScheme = 1;
+constexpr int kPrepareScheme = 2;
 std::string prepare_key(uint64_t programs) {
     const VkPhysicalDeviceProperties& p = device().properties();
     char uuid[40];

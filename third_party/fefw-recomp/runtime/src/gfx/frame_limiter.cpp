@@ -262,6 +262,24 @@ FrameLimiter::Stats FrameLimiter::stats() const {
     return st;
 }
 
+double FrameLimiter::recent_mean_ms(std::size_t max_n, double max_sample_ms) const {
+    if (max_n == 0) return 0.0;
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    const std::size_t avail = std::min(impl_->ring_n, max_n);
+    if (avail == 0) return 0.0;
+    double sum = 0.0;
+    std::size_t cnt = 0;
+    for (std::size_t k = 0; k < avail; ++k) {
+        const std::size_t idx = (impl_->ring_pos + kRing - 1 - k) % kRing;
+        const double ms = static_cast<double>(impl_->ring[idx]) * 1e-6;
+        if (ms <= 0.0) continue;
+        if (max_sample_ms > 0.0 && ms > max_sample_ms) break;
+        sum += ms;
+        ++cnt;
+    }
+    return cnt > 0 ? sum / static_cast<double>(cnt) : 0.0;
+}
+
 void FrameLimiter::reset_stats() {
     std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->ring_n = 0;

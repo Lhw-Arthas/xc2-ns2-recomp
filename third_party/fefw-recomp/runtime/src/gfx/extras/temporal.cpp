@@ -125,7 +125,7 @@ struct Target {
 
 struct State {
     std::mutex mu;
-    bool have_cam = false;
+    std::atomic<bool> have_cam{false};
     Camera cam;                    // this frame's (kept from the first valid G-buffer draw)
     bool have_prev = false;
     Camera prev;
@@ -385,8 +385,9 @@ bool temporal_jitter_block(uint32_t* words, size_t n_words, uint32_t width, uint
 
 void temporal_note_gbuffer(const uint32_t* words, size_t n_words) {
     State& s = st();
+    if (s.have_cam.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lk(s.mu);
-    if (s.have_cam) return;
+    if (s.have_cam.load(std::memory_order_relaxed)) return;
     ++s.gbuffer_blocks;
     Camera c;
     if (!words || !parse_camera(words, n_words, c)) {
@@ -394,7 +395,7 @@ void temporal_note_gbuffer(const uint32_t* words, size_t n_words) {
         return;
     }
     s.cam = c;
-    s.have_cam = true;
+    s.have_cam.store(true, std::memory_order_release);
     if (!s.logged_cam) {
         s.logged_cam = true;
         NXLOG_I(kTag, "camera from the G-buffer uniform block (vertex slot 0: view-projection floats 0..15, view 52..67): projection x %.4f y %.4f, "
@@ -404,9 +405,7 @@ void temporal_note_gbuffer(const uint32_t* words, size_t n_words) {
 }
 
 bool temporal_camera_ready() {
-    State& s = st();
-    std::lock_guard<std::mutex> lk(s.mu);
-    return s.have_cam;
+    return st().have_cam.load(std::memory_order_acquire);
 }
 
 VkImageView temporal_evaluate(void* gfx_device, VkCommandBuffer cb, VkImageView color, VkImageView depth, VkImageLayout depth_layout, VkExtent2D render,
@@ -414,7 +413,7 @@ VkImageView temporal_evaluate(void* gfx_device, VkCommandBuffer cb, VkImageView 
     State& s = st();
     std::lock_guard<std::mutex> lk(s.mu);
     const UpscaleMode mode = upscale_mode();
-    if (!s.have_cam) {
+    if (!s.have_cam.load(std::memory_order_relaxed)) {
         if (++s.no_cam_frames == 120 && !s.logged_nocam) {
             s.logged_nocam = true;
             NXLOG_W(kTag, "120 tone-map draws without a camera: no G-buffer draw held a valid view-projection + view block (%llu blocks seen, %llu rejected)",
@@ -423,7 +422,7 @@ VkImageView temporal_evaluate(void* gfx_device, VkCommandBuffer cb, VkImageView 
         return VK_NULL_HANDLE;
     }
     const Camera cur = s.cam;
-    s.have_cam = false;   // the next frame needs its own
+    s.have_cam.store(false, std::memory_order_release);   // the next frame needs its own
     if (!gfx_device || !color || !depth || !render.width || !render.height || !out.width || !out.height) return VK_NULL_HANDLE;
     gfx::Device& dev = *static_cast<gfx::Device*>(gfx_device);
     if (!init_gpu(s, dev)) {

@@ -88,10 +88,31 @@ def check_pair(ard, recs, sample=24):
     return ok, bad
 
 
-def parse_record(data):
-    """Return (groups, ndsr_record, ndsr_blocks, entries) for one inflated archive record.
+def pair_programs_from_stages(items):
+    """Extract ordered unique (vs, fs, gs) hash triples from sequential (stage, hash_int) entries."""
+    out = []
+    i = 0
+    n = len(items)
+    while i < n:
+        st, h = items[i]
+        if st == 0 and i + 2 < n and items[i + 1][0] == 2 and items[i + 2][0] == 1:
+            out.append((h, items[i + 2][1], items[i + 1][1]))
+            i += 3
+        elif st == 0 and i + 1 < n and items[i + 1][0] == 1:
+            out.append((h, items[i + 1][1], 0))
+            i += 2
+        elif st == 1 and i + 1 < n and items[i + 1][0] == 0:
+            out.append((items[i + 1][1], h, 0))
+            i += 2
+        else:
+            i += 1
+    return out
 
-    Each entry is (code_bytes, ctrl_bytes, sha1_16, row_str).
+
+def parse_record(data):
+    """Return (groups, ndsr_record, ndsr_blocks, entries, programs) for one inflated archive record.
+
+    Each entry is (code_bytes, ctrl_bytes, sha1_16, row_str); each program is (vs_u64, fs_u64, gs_u64).
     """
     ctrls = []
     j = data.find(CONTROL_MAGIC)
@@ -100,7 +121,7 @@ def parse_record(data):
             ctrls.append(j)
         j = data.find(CONTROL_MAGIC, j + 4)
     if not ctrls:
-        return 0, 0, 0, []
+        return 0, 0, 0, [], []
 
     runs, cur = [], [ctrls[0]]
     for c in ctrls[1:]:
@@ -115,6 +136,7 @@ def parse_record(data):
     ndsr_rec = 0
     ndsr_blk = 0
     entries = []
+    programs = []
 
     def build_entry(code_off, size, ctrl_off):
         code = data[code_off:code_off + size]
@@ -126,7 +148,7 @@ def parse_record(data):
         const_off = struct.unpack_from("<I", ctrl, 0x40)[0]
         row = ("run_%s\t%s\t0x0\t0x%x\t0x0\t0xd8\t0x%x\t0x%x\t0x%x\t0x%x\t%s\tcode_%s.bin\tctrl_%s.bin\n"
                % (h, STAGE.get(st, "unknown"), size, prog_end, prog_end, const_off, const_size, h, h, h))
-        return (code, ctrl, h, row)
+        return st, int(h, 16), (code, ctrl, h, row)
 
     for run in runs:
         end = run[-1] + CONTROL_SIZE
@@ -134,12 +156,16 @@ def parse_record(data):
         if pos >= len(data):
             continue
         groups += 1
+        run_items = []
         for c in run:
             cs = struct.unpack_from("<I", data, c + 0x44)[0]
             if cs == 0 or pos + cs > len(data):
                 break
-            entries.append(build_entry(pos, cs, c))
+            st, h_int, ent = build_entry(pos, cs, c)
+            entries.append(ent)
+            run_items.append((st, h_int))
             pos += (cs + 0xff) & ~0xff
+        programs.extend(pair_programs_from_stages(run_items))
 
     # The "NDSR" containers (ndsr.pck) put the code BEFORE the control table and describe each program
     # with a 16-byte entry in an opcode stream:  [control][?][code][(size << 4) | flags]
@@ -149,6 +175,7 @@ def parse_record(data):
     if data[:4] == NDSR_MAGIC:
         lo, hi = ctrls[0], ctrls[-1] + CONTROL_SIZE
         ndsr_rec = 1
+        ndsr_items = []
         for k in range(0, len(data) - 16, 4):
             ctrl, _unused, code_off, field = struct.unpack_from("<IIII", data, k)
             if not (lo <= ctrl < hi) or not (0 < code_off < lo):
@@ -157,15 +184,30 @@ def parse_record(data):
             if size == 0 or code_off + size > len(data):
                 continue
             ndsr_blk += 1
-            entries.append(build_entry(code_off, size, ctrl))
-    return groups, ndsr_rec, ndsr_blk, entries
+            st, h_int, ent = build_entry(code_off, size, ctrl)
+            entries.append(ent)
+            ndsr_items.append((st, h_int))
+        programs.extend(pair_programs_from_stages(ndsr_items))
+    return groups, ndsr_rec, ndsr_blk, entries, programs
+
+
+def write_programs_bin(path, programs):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(struct.pack("<8sII", b"MPRPRG01", len(programs), 0))
+        for vs, fs, gs in programs:
+            f.write(struct.pack("<QQQ", vs, fs, gs))
+    os.replace(tmp, path)
 
 
 def main(argv):
     ap = argparse.ArgumentParser(description="Extract the NVN2 shader blocks embedded in bf2.ard.")
     ap.add_argument("--ard", required=True)
     ap.add_argument("--tsv", required=True, help="the record index from ard_index.py")
-    ap.add_argument("--out", required=True, help="folder for the code/ctrl pairs and manifest.tsv")
+    ap.add_argument("--out", default="", help="folder for the code/ctrl pairs and manifest.tsv (required unless --programs-only)")
+    ap.add_argument("--programs", default="", help="optional output path for paired MPRPRG01 programs.bin")
+    ap.add_argument("--programs-only", action="store_true", help="only write --programs without writing code/ctrl blocks")
     ap.add_argument("--known", default="", help="optional manifest.tsv from a -dump run, for validation")
     ap.add_argument("--jobs", type=int, default=0, help="worker threads for parallel zlib inflation (0 = auto)")
     a = ap.parse_args(argv)
@@ -181,13 +223,23 @@ def main(argv):
         print("       regenerate it with ard_index.py --ard %s" % a.ard, file=sys.stderr)
         return 1
 
+    if a.programs_only and not a.programs:
+        print("ERROR: --programs-only requires --programs", file=sys.stderr)
+        return 2
+    if not a.programs_only and not a.out:
+        print("ERROR: --out is required unless --programs-only is set", file=sys.stderr)
+        return 2
+
     known = load_known(a.known)
     print("records: %d   known blocks: %d%s" % (len(recs), len(known), "" if known else "  (no --known: validation off)"))
 
-    os.makedirs(a.out, exist_ok=True)
+    if not a.programs_only:
+        os.makedirs(a.out, exist_ok=True)
     stat = collections.Counter()
     seen = set()
     manifest_rows = []
+    prog_seen = set()
+    prog_list = []
     lock = threading.Lock()
     tls = threading.local()
     handles = []
@@ -208,6 +260,7 @@ def main(argv):
         l_blocks = 0
         l_known_hit = 0
         l_entries = []
+        l_progs = []
         for idx, off, _name, _unc, comp in batch_items:
             f.seek(off + HEADER)
             try:
@@ -215,15 +268,18 @@ def main(argv):
             except Exception:
                 l_inflate_fail += 1
                 continue
-            groups, ndsr_rec, ndsr_blk, entries = parse_record(data)
+            groups, ndsr_rec, ndsr_blk, entries, programs = parse_record(data)
             l_groups += groups
             l_ndsr_rec += ndsr_rec
             l_ndsr_blk += ndsr_blk
+            for p_idx, prog in enumerate(programs):
+                l_progs.append((idx, p_idx, prog))
             for seq, (code, ctrl, h, row) in enumerate(entries):
                 l_blocks += 1
                 if h in known:
                     l_known_hit += 1
-                l_entries.append((idx, seq, code, ctrl, h, row))
+                if not a.programs_only:
+                    l_entries.append((idx, seq, code, ctrl, h, row))
 
         to_write = []
         new_rows = []
@@ -234,6 +290,10 @@ def main(argv):
             stat["ndsr_blocks"] += l_ndsr_blk
             stat["blocks"] += l_blocks
             stat["known_hit"] += l_known_hit
+            for order_key_0, order_key_1, prog in l_progs:
+                if prog not in prog_seen:
+                    prog_seen.add(prog)
+                    prog_list.append(((order_key_0, order_key_1), prog))
             for idx, seq, code, ctrl, h, row in l_entries:
                 if h in seen:
                     continue
@@ -248,11 +308,12 @@ def main(argv):
                          stat["groups"], stat["blocks"], stat["known_hit"]), flush=True)
                 progress_state["next_mark"] += 10000
 
-        for h, code, ctrl in to_write:
-            with open(os.path.join(a.out, "code_%s.bin" % h), "wb") as g:
-                g.write(code)
-            with open(os.path.join(a.out, "ctrl_%s.bin" % h), "wb") as g:
-                g.write(ctrl)
+        if not a.programs_only:
+            for h, code, ctrl in to_write:
+                with open(os.path.join(a.out, "code_%s.bin" % h), "wb") as g:
+                    g.write(code)
+                with open(os.path.join(a.out, "ctrl_%s.bin" % h), "wb") as g:
+                    g.write(ctrl)
 
     workers = a.jobs if a.jobs > 0 else min(12, max(2, os.cpu_count() or 4))
     batch_size = 400
@@ -272,21 +333,29 @@ def main(argv):
             except OSError:
                 pass
 
-    manifest_rows.sort(key=lambda item: item[0])
-    with open(os.path.join(a.out, "manifest.tsv"), "w", encoding="utf-8", newline="\n") as man:
-        man.write(MANIFEST_COLUMNS)
-        for _, row in manifest_rows:
-            man.write(row)
+    if not a.programs_only:
+        manifest_rows.sort(key=lambda item: item[0])
+        with open(os.path.join(a.out, "manifest.tsv"), "w", encoding="utf-8", newline="\n") as man:
+            man.write(MANIFEST_COLUMNS)
+            for _, row in manifest_rows:
+                man.write(row)
+
+    if a.programs:
+        prog_list.sort(key=lambda item: item[0])
+        write_programs_bin(a.programs, [prog for _, prog in prog_list])
 
     print("done %.0fs" % (time.time() - t0))
     print("  groups  : %d" % stat["groups"])
     print("  blocks  : %d   (inflate failures: %d)" % (stat["blocks"], stat["inflate_fail"]))
     if stat["ndsr_records"]:
         print("  ndsr    : %d record(s), %d program entries" % (stat["ndsr_records"], stat["ndsr_blocks"]))
-    print("  distinct: %d   -> %s" % (len(seen), a.out))
+    if not a.programs_only:
+        print("  distinct: %d   -> %s" % (len(seen), a.out))
+    if a.programs:
+        print("  programs: %d   -> %s" % (len(prog_list), a.programs))
     if known:
         print("  known   : %d of the distinct blocks are hashes the runtime has asked for" % stat["known_hit"])
-    if not seen:
+    if not (a.programs_only and prog_list) and not seen:
         print("ERROR: no embedded block found. Is this a 3.0.1 archive?", file=sys.stderr)
         return 1
     return 0

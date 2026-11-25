@@ -1030,4 +1030,13 @@ bool install_movie_decoder_hle() {
 
 bool movie_decoder_enabled() { return g_enabled; }
 
+bool is_movie_playing() {
+#if NXRT_HAVE_DAV1D
+    std::lock_guard<std::mutex> lk(g_reg_mu);
+    return !g_reg.empty();
+#else
+    return false;
+#endif
+}
+
 }  // namespace nxrt::media
