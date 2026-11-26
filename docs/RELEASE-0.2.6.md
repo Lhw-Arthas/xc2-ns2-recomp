@@ -32,6 +32,7 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 - The game's own limiter can be rewritten to **90 or 120 fps** with a dual clock: game logic keeps its 30 Hz step while presents double or quadruple, and pre-rendered cutscenes stay capped at 60 fps so they keep their timing.
 - Resource-bank teardown now scales with the rate (`(cur_fps + 59) / 60`), which is what stopped the crashes when leaving a cutscene or teleporting at 120 fps.
 - F1 defaults the upscaler to **TAAU at 100 % (native)** with the frame limit on `auto`, and the launcher marks **60 fps as recommended** with 90 / 120 fps as experimental.
+- **Where the idea came from.** Running the game above 60 fps this way is not our invention: the NS1 recompilation ([AksharDP/xc2-recomp](https://github.com/AksharDP/xc2-recomp), MIT) does it by patching the frame-rate word inside the game binary, and [#34](https://github.com/weile10000/xc2-ns2-recomp/issues/34) pointed us at it. What is here is separate code with a different mechanism — **no binary is patched**: the runtime intercepts the vsync-period virtual (`main+0xba1320`) and answers with a rewritten period, giving the render limiter the exact step and the frame-step query a 5-frame moving average. The NS2 addresses were derived for 3.0.1, not carried over. Thank you to both.
 
 ### 3. Boot shader preparation and a faster replay path (`3b54fc3`, `3198860`, `7a6fbd8`, `2272f83`, `3823a03`)
 - Setup now extracts the game's paired `programs.bin` from **your own `bf2.ard`**, and the runtime builds its graphics pipelines **before the first frame**, sharing the prepared library with the draw-time cache — a new area no longer stutters while pipelines compile.
@@ -115,6 +116,7 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 - 游戏自身的限帧可以改写为 **90 或 120 fps**，采用双时钟：游戏逻辑仍按 30 Hz 步进，而 present 翻倍或翻四倍；预渲染过场封顶 60 fps，保持原有节奏。
 - 资源 bank 的销毁节奏改为随帧率缩放（`(cur_fps + 59) / 60`），这正是修掉「120 fps 下退出过场或传送时崩溃」的那一笔。
 - F1 默认超分器为 **TAAU 100%（原生）**、帧率上限 `auto`；启动器把 **60 fps 标为推荐**，90 / 120 fps 标为实验性。
+- **这个思路的来源**：把游戏跑在 60 fps 以上并不是我们的发明——NS1 版重编译（[AksharDP/xc2-recomp](https://github.com/AksharDP/xc2-recomp)，MIT）通过给游戏二进制里的帧率字打补丁做到这一点，而 [#34](https://github.com/weile10000/xc2-ns2-recomp/issues/34) 把这条线索指给了我们。这里放的是另一套代码、另一种机制：**不改任何二进制**，而是拦截 vsync period 的虚函数（`main+0xba1320`），返回改写后的周期，让渲染限帧器拿到精确步进、让帧步进查询拿到 5 帧滑动平均。NS2 的地址是针对 3.0.1 重新推出来的，不是照搬。两边的贡献都值得感谢。
 
 ### 3. 启动期着色器预热与更快的回放路径（`3b54fc3`、`3198860`、`7a6fbd8`、`2272f83`、`3823a03`）
 - 安装时会从**你自己的 `bf2.ard`** 提取成对的 `programs.bin`，运行时在**首帧之前**就把图形管线建好，并与绘制期的缓存共享——新场景不再因为现编译管线而卡顿。
