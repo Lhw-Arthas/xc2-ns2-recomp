@@ -425,7 +425,12 @@ void poll_write_watch(Region* r) {
     r->armed_hi = w_last;
 
     bool span_done = false;
-    {
+    // [mem] ww_span = 0 turns the coalesced query off and goes back to one GetWriteWatch per 64 KiB granule. The span
+    // query's RESET also clears the watch bits of the unarmed pages it skips, and a caller that then relies on those
+    // pages being reported can miss writes (2026-11-26: a movie whose frames are written on the host and sampled on the
+    // GPU kept showing an old frame). Kept as a switch so it can be bisected from a player's install.
+    static const bool span_enabled = nxrt::config_get_bool("memory", "ww_span", true);
+    if (span_enabled) {
         // Coalesce armed words across gaps <= 1 word (256 KiB) so GetWriteWatch skips dead holes between armed slices.
         constexpr uint64_t kMaxGapWords = 1;
         bool span_ok = true;
@@ -760,6 +765,9 @@ void capture_poll(Region* r, std::vector<uint64_t>& out) {
     r->armed_lo = w_first;
     r->armed_hi = w_last;
 
+    // Same switch as poll_write_watch above ([mem] ww_span).
+    static const bool span_enabled = nxrt::config_get_bool("memory", "ww_span", true);
+    if (span_enabled) {
     // Coalesce armed words across gaps <= 1 word (256 KiB) so GetWriteWatch skips dead holes between armed slices.
     constexpr uint64_t kMaxGapWords = 1;
     bool span_ok = true;
@@ -797,6 +805,7 @@ void capture_poll(Region* r, std::vector<uint64_t>& out) {
         w0 = w1 + 1;
     }
     if (span_ok) return;
+    }   // [mem] ww_span
     // Fallback: one query per 64 KiB reservation when alias window is not a single reservation (e.g. unit tests)
     const uint64_t end = r->base + r->npages * kPage;
     uint64_t g = r->base & ~(kGranuleBytes - 1);
@@ -959,3 +968,4 @@ uint64_t faults() { return g_faults.load(std::memory_order_relaxed); }
 uint64_t fault_waits() { return g_waits.load(std::memory_order_relaxed); }
 
 }  // namespace nxrt::mem::ww
+

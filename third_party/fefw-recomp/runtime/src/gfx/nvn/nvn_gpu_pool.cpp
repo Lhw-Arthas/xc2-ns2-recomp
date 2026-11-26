@@ -1251,6 +1251,16 @@ void cap_filter_gfx_partial(Mirror& m, uint64_t lo, uint64_t hi, std::vector<std
 }
 }  // namespace
 
+// [nvn] mirror_gfx_subpage (default off, PR #72): keep the GPU-owned sub-page bytes out of the capture, so a CPU UBO
+// write on the same 4 KiB page does not overwrite XC2's facial morph vertices with stale host memory. Off by default
+// because it froze movie playback (2026-11-26): the shadow is taken when the SSBO is bound, so host bytes the CPU
+// wrote before that look unchanged, and the capture skips them - the new frame never reaches the mirror. Turn it on
+// once the shadow is taken at the right moment instead.
+static bool gfx_subpage_enabled() {
+    static const bool on = nxrt::config_get_bool("nvn", "mirror_gfx_subpage", false);
+    return on;
+}
+
 BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write, bool gfx_no_wb) {
     MemoryPool* mp = nullptr;
     PoolGpu* pg = nullptr;
@@ -1271,7 +1281,7 @@ BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write, bool
     ++g_cap_binds;
     const uint64_t end_off = std::min<uint64_t>(poff + size, m->npages * kPageBytes);
     if (write) { ++g_cap_wbinds; cap_note_write(m, poff, end_off); }
-    else if (gfx_no_wb) { cap_note_gfx_partial(m, poff, end_off); }
+    else if (gfx_no_wb && gfx_subpage_enabled()) { cap_note_gfx_partial(m, poff, end_off); }
     out.buffer = cb;
     out.offset = poff - c_lo;
     out.avail = c_hi - poff;
