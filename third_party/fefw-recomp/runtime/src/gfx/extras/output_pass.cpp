@@ -23,6 +23,7 @@ struct EncodePush {
     float adj[4];     // picture controls: contrast, saturation, black, gamma
     float scn[4];     // the picture in the scene / final copies' UV: x, y, w, h
     float ui[4];      // x = the UI's brightness over paper white
+    float hx[4];      // x = 1: display-encoded float source with highlights above 1, y = the brightest highlight over paper white, w = 1: clip at 1
 };
 VkShaderModule make_module(VkDevice d, const uint32_t* code, size_t bytes) {
     VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -250,6 +251,10 @@ void OutputPass::encode(VkCommandBuffer cb, VkImageView dst_view, VkFormat dst_f
     pc.ui[1] = p.deband ? 1.0f : 0.0f;
     pc.ui[2] = static_cast<float>(p.pattern.kind);
     pc.ui[3] = p.pattern.peak_nits > 0 ? p.pattern.peak_nits : p.peak_nits;
+    pc.hx[0] = p.src_encoded ? 1.0f : 0.0f;
+    pc.hx[1] = p.highlight_ratio;
+    pc.hx[2] = 0.0f;
+    pc.hx[3] = p.clip_encoded ? 1.0f : 0.0f;
 
     // the UI split reads the presented picture and its copy before the UI at the source size; with no copy, the picture twice
     const VkImageView fin = p.src;

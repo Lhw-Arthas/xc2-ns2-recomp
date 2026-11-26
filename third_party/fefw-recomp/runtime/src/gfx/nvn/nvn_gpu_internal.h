@@ -269,6 +269,8 @@ float tex_scale_wanted(Texture* t);
 // Remakes the image at scale `to`, content blitted over (a render target made unscaled, storage use, a pass mixing scales). Going to 1 is
 // for good. No render pass open.
 bool tex_rescale(Texture* t, Frame& f, float to, const char* why);
+// Remakes an 8-bit RGBA UNORM render target as float16 (content blitted over), so it keeps HDR highlights above 1. No render pass open.
+bool tex_promote_float(Texture* t, Frame& f, const char* why);
 // Records an upload when the texture's memory was not yet uploaded or the CPU wrote it since (and the GPU did not render it).
 // Must be called with no render pass open on `f.cb`. Leaves the image in SHADER_READ_ONLY_OPTIMAL after an upload.
 void tex_ensure_current(Texture* t, Frame& f);

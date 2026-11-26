@@ -63,6 +63,7 @@ const std::string hm = lower(config_get_str("hdr", "mode", "off"));
     s.hdr.ui_white_nits = std::clamp(config_get_double("hdr", "ui_white_nits", 0.0), 0.0, 500.0);
     if (s.hdr.ui_white_nits != 0 && s.hdr.ui_white_nits < 80) s.hdr.ui_white_nits = 80;
     s.hdr.deband = config_get_bool("hdr", "deband", true);
+    s.hdr.style = lower(config_get_str("hdr", "style", "accurate")) == "vivid" ? HdrStyle::Vivid : HdrStyle::Accurate;
 
     const std::string um = lower(config_get_str("upscale", "mode", "off"));
     s.upscale.mode = um == "fsr1" || um == "spatial" ? UpscaleMode::Fsr1 : um == "fsr3" ? UpscaleMode::Fsr3 : um == "dlss" ? UpscaleMode::Dlss : um == "xess" ? UpscaleMode::Xess : um == "nis" ? UpscaleMode::Nis : um == "dlaa" ? UpscaleMode::Dlaa : UpscaleMode::Off;

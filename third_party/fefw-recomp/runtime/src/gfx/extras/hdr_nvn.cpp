@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "extras/hdr_nvn.h"
 
+#include <atomic>
 #include <mutex>
 #include <map>
 #include <set>
 
+#include "nxrt/config.h"
 #include "nxrt/extras.h"
 #include "nxrt/log.h"
 #include "extras/fsr1_spatial.h"
@@ -14,6 +16,13 @@
 namespace nxrt::extras {
 namespace {
 constexpr int kFlagDisplay = 0x1, kFlagCompressible = 0x8;   // NVN_TEXTURE_FLAGS_DISPLAY, NVN_TEXTURE_FLAGS_COMPRESSIBLE
+std::atomic<bool> g_kept{false};   // the XC2 tone map was patched (hdr_highlights_kept)
+std::mutex g_patched_mu;
+std::set<std::string> g_patched;   // hashes of the patched tone-map shaders
+bool keep_highlights_on() {
+    static const bool on = config_get_bool("hdr", "keep_highlights", true);
+    return on;
+}
 }
 
 VkFormat hdr_promote_target(VkFormat chosen, int flags, bool is_2d, uint32_t levels, uint32_t layers, uint32_t samples, bool nvn_srgb) {
@@ -27,16 +36,29 @@ bool hdr_tonemap_variant(const std::vector<uint32_t>& words, const std::string& 
     if (!hdr_scene_active()) return false;
     static std::mutex mu;
     static std::set<std::string> tried;
-    // the curve tone map (Metroid Prime Remastered; small shaders), else the LUT tone map (Pokopia's composite pass)
-    bool lut = false;
+    // the curve tone map (Metroid Prime Remastered; small shaders), else the LUT tone map (Pokopia's composite pass), else the LUT that clips at white (XC2)
+    bool lut = false, scene = false;
     bool ok = words.size() <= 16384 && spirv_hdr_tonemap(words, out);
     if (!ok) ok = lut = spirv_hdr_tonemap_lut(words, hdr_state().peak_ratio, out);
+    if (!ok && keep_highlights_on()) ok = scene = spirv_hdr_tonemap_scene(words, out);
+    if (scene) g_kept.store(true);
     std::lock_guard<std::mutex> lk(mu);
+    if (ok) {
+        std::lock_guard<std::mutex> pk(g_patched_mu);
+        g_patched.insert(hash);
+    }
     if (tried.insert(hash).second && ok)
-        NXLOG_I("hdr", "tone-map shader %s: HDR variant made (%s, peak ratio %.2f)", hash.c_str(), lut ? "LUT highlights extended" : "curve",
-                static_cast<double>(hdr_state().peak_ratio));
+        NXLOG_I("hdr", "tone-map shader %s: HDR variant made (%s, peak ratio %.2f)", hash.c_str(),
+                scene ? "scene highlights" : lut ? "LUT highlights extended" : "curve", static_cast<double>(hdr_state().peak_ratio));
     return ok;
 }
+
+bool hdr_tonemap_patched(const std::string& hash) {
+    std::lock_guard<std::mutex> lk(g_patched_mu);
+    return g_patched.count(hash) != 0;
+}
+
+bool hdr_highlights_kept() { return g_kept.load(std::memory_order_relaxed) && hdr_scene_active(); }
 
 bool hdr_is_tonemap(const std::vector<uint32_t>& words, const std::string& hash) {
     static std::mutex mu;

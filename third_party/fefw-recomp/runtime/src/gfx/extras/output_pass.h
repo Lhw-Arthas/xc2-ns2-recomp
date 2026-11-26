@@ -35,6 +35,9 @@ struct OutputParams {
     OutputKind out = OutputKind::Sdr8;       // what the destination carries
     float paper_white_nits = 203, peak_nits = 1000;
     float expand_ratio = 1.0f;               // > 1.0: expand display-referred [0,1] highlights toward peak_nits in HDR modes
+    bool src_encoded = false;                // float source holding display-encoded values, highlights above 1 (the game's kept highlights)
+    float highlight_ratio = 1.0f;            // with src_encoded: the brightest highlight over paper white (HDR modes)
+    bool clip_encoded = false;               // with src_encoded: clip at 1 as the 8-bit picture was (for the stretched look)
     VkImageView scene = VK_NULL_HANDLE;      // src before the UI was drawn (same size, SHADER_READ_ONLY_OPTIMAL): the UI is not expanded
     float ui_scale = 1.0f;                   // HDR: the UI's brightness over paper white (needs scene)
     bool deband = false;                     // HDR: noise of one step on an 8-bit source, so the stretched picture shows no bands

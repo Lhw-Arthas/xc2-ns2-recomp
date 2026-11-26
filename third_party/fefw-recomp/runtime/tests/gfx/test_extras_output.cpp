@@ -1004,6 +1004,54 @@ NXTEST(hdr10_ui_brightness) {
     }
 }
 
+// The game's kept highlights (src_encoded): a float source with display-encoded values above 1 is decoded (sRGB up to 1, a 2.2 power above),
+// the part above paper white is fitted under highlight_ratio; below 1 nothing changes.
+NXTEST(hdr10_kept_highlights) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    const float enc[8] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 4.0f};
+    REQUIRE(upload_source(r, VK_FORMAT_R16G16B16A16_SFLOAT, 8, 8, pack_half_rgba(8, 8, [&](uint32_t x, uint32_t, float* v) {
+                              v[0] = v[1] = v[2] = enc[x];
+                          })));
+    REQUIRE(make_dst(r, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 8, 8, 4));
+    auto srgb = [](double e) { return e <= 0.04045 ? e / 12.92 : std::pow((e + 0.055) / 1.055, 2.4); };
+    struct Case { float ratio; bool clip, deband; };
+    for (const Case c : {Case{3.0f, false, false}, Case{1.0f, false, false}, Case{5.0f, false, false}, Case{5.0f, true, false}, Case{5.0f, false, true}}) {
+        const float ratio = c.ratio;
+        hdr::OutputParams p = base_params(r, 8, 8);
+        p.out = hdr::OutputKind::Hdr10;
+        p.src_linear = true;
+        p.src_encoded = true;
+        p.highlight_ratio = ratio;
+        p.clip_encoded = c.clip;
+        p.deband = c.deband;   // its noise must leave the highlights above white alone
+        p.paper_white_nits = 200.0f;
+        p.peak_nits = 1000.0f;
+        std::vector<uint8_t> got;
+        CHECK_EQ(run_pass(r, p, &got), 2);
+        std::vector<float> lin;
+        REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, got.data(), 8, 8, 200.0f, &lin, nullptr, nullptr, nullptr));
+        for (uint32_t x = 0; x < 8; ++x) {
+            double want = c.clip ? srgb(std::min(enc[x], 1.0f)) : enc[x] <= 1.0f ? srgb(enc[x]) : std::pow(enc[x], 2.2);
+            if (want > 1.0) {
+                const double a = std::max(ratio - 1.0, 1e-4);
+                want = 1.0 + a * (1.0 - std::exp(-(want - 1.0) / a));
+            }
+            const double g = lin[(3 * 8 + x) * 3 + 1];
+            std::printf("    ratio %.1f, clip %d, deband %d, encoded %.2f: %.4f (want %.4f)\n", ratio, c.clip ? 1 : 0, c.deband ? 1 : 0, enc[x], g, want);
+            CHECK(close_to(g, want, 0.02, c.deband ? 0.01 : 0.003));
+        }
+    }
+}
+
 // Debanding: noise of at most one 8-bit step on the sRGB code, averaging to the plain picture; pure black and white exactly as without it.
 NXTEST(hdr10_deband) {
     Rig r;

@@ -21,6 +21,12 @@ bool hdr_tonemap_variant(const std::vector<uint32_t>& words, const std::string& 
 // True when `words` is the game's tone-map fragment shader (the structural match of hdr_tonemap_patch.h); cached by hash. Independent of the HDR scene.
 bool hdr_is_tonemap(const std::vector<uint32_t>& words, const std::string& hash);
 
+// True once a clipping LUT tone map (XC2) was given its HDR variant ([hdr] keep_highlights): the game's 8-bit post targets after it (the upscaler's
+// output, the window) are then made float16 so the highlights above 1 reach the output pass.
+bool hdr_highlights_kept();
+// True when the fragment shader with this hash was given an HDR variant (hdr_tonemap_variant).
+bool hdr_tonemap_patched(const std::string& hash);
+
 // Scene upscaler (S14): the game renders the 3D scene below the output size ([upscale] scene_scale, the game's dynamic-resolution path) and its tone-map
 // pass reads that small HDR target and writes the full-size window texture. With FSR 1 or NIS on, the replay runs that upscaler on the HDR target first and the
 // tone-map draw reads the result instead of the small target (the game's bilinear filter is bypassed).
