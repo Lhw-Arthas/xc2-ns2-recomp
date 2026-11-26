@@ -1,5 +1,7 @@
 # XC2 NS2 Recomp v0.2.6 — Keyboard & Mouse Controls, Scene HDR, and a Build Chain That Cannot Go Stale
 
+> **A note on the voice.** Some of you may have noticed that the announcements and replies shift in tone between versions. That is because they are written by different assistants: Gemini is the better conversationalist, DeepSeek is the one who actually does the work. If the bluntness ever rubbed you the wrong way, that was never the intent — thank you for reading anyway.
+
 This release ships everything verified since `v0.2.5`: **keyboard and mouse play with rebindable keys ([#69](https://github.com/weile10000/xc2-ns2-recomp/issues/69), [#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76))**, **scene HDR with Accurate/Vivid styles and a live switch ([#68](https://github.com/weile10000/xc2-ns2-recomp/pull/68), by @Revelans)**, **the lightning purple-stripe fix ([#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77), by @Revelans)**, a launcher that is translated everywhere including the build page, and a build chain that relinks a stale `xc2_boot.exe` instead of trusting that the file exists.
 
 > **Upgrading from `v0.2.5` or older? Read this!**
@@ -78,6 +80,8 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 ---
 
 # XC2 NS2 重编译 v0.2.6 —— 键鼠操作、场景 HDR，以及一条不会「陈旧」的构建链
+
+> **关于语气的一点说明**：可能有人注意到，这几个版本的公告和回复在语气措辞上有微妙差别——因为执笔的不是同一个助手。聊天这事 Gemini 确实更在行，干活这块 DeepSeek 也不差。如果它的耿直冒犯到你，那绝不是本意，谢谢你的包容。
 
 本版包含 `v0.2.5` 之后验证过的全部改动：**键鼠操作与可改键（[#69](https://github.com/weile10000/xc2-ns2-recomp/issues/69)、[#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76)）**、**场景 HDR 与「准确 / 鲜艳」风格、免重启切换（[#68](https://github.com/weile10000/xc2-ns2-recomp/pull/68)，by @Revelans）**、**闪电特效紫纹修复（[#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77)，by @Revelans）**、全面汉化的启动器（含构建页），以及**会主动重链接陈旧 `xc2_boot.exe` 的构建链**。
 
