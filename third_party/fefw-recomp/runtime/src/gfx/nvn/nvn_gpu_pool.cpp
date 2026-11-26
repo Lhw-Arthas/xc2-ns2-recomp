@@ -569,6 +569,12 @@ struct Mirror {
     // [nvn] mirror_capture + mirror_gfx_storage_writeback = 0: GPU-written graphics SSBO boundary sub-pages (keyed by page index, under g_cap_mu)
     // so neighbouring CPU UBO writes on the same 4 KiB page do not overwrite unchanged GPU-owned bytes (e.g. XC2 facial morph vertices) with stale host memory.
     std::unordered_map<uint64_t, std::vector<GfxPartial>> gfx_partial;
+    // [nvn] mirror_gfx_subpage: the bytes the mirror last received from us, per page of interest, and which pages are of
+    // interest (those a graphics SSBO ever touched a sub-range of). The shadow has to be what the mirror actually holds:
+    // taking the host bytes when the SSBO is bound made a CPU write that happened just before the bind look like "the
+    // GPU's version", so the capture skipped it and the new frame never reached the mirror (movie playback froze).
+    std::unordered_map<uint64_t, std::vector<uint8_t>> uploaded;
+    std::unordered_set<uint64_t> interest;
 };
 namespace { std::mutex g_cap_mu; uint64_t g_cap_next_id = 0; }   // [nvn] mirror_capture: g_mirrors changes vs game-thread captures
 
@@ -1179,13 +1185,19 @@ void cap_note_gfx_partial(Mirror* m, uint64_t lo, uint64_t hi) {
         vec.erase(std::remove_if(vec.begin(), vec.end(), [&](const GfxPartial& e) {
             return e.lo < sub_hi && sub_lo < e.hi;
         }), vec.end());
+        m->interest.insert(page);
+        // The shadow is what the mirror last received for this page, not what the host holds now: a CPU write just before
+        // the bind would otherwise look like the GPU's own version and be skipped. Without a record yet there is nothing
+        // to compare against, so nothing is registered and the next capture copies the page and records it.
+        auto it = m->uploaded.find(page);
+        if (it == m->uploaded.end() || it->second.size() != kPageBytes) return;
         GfxPartial gp;
         gp.lo = sub_lo;
         gp.hi = sub_hi;
         gp.last_seen = ser;
         const size_t n = static_cast<size_t>(sub_hi - sub_lo);
         gp.shadow.resize(n);
-        std::memcpy(gp.shadow.data(), m->pg->base + sub_lo, n);
+        std::memcpy(gp.shadow.data(), it->second.data() + (sub_lo - page * kPageBytes), n);
         vec.push_back(std::move(gp));
     };
 
@@ -1403,6 +1415,17 @@ std::shared_ptr<void> mirror_capture_take() {
                     break;
                 }
                 std::memcpy(static_cast<uint8_t*>(a->buf.mapped) + a->used, m.pg->base + sp_lo, static_cast<size_t>(len));
+                // What the mirror is about to receive, per page of interest: this is the shadow the next registration
+                // compares against (see register_sub). Only pages a graphics SSBO touched a sub-range of are kept.
+                if (!m.interest.empty()) {
+                    const uint64_t p_first = sp_lo / kPageBytes, p_last = (sp_hi - 1) / kPageBytes;
+                    for (uint64_t p = p_first; p <= p_last; ++p) {
+                        if (!m.interest.count(p)) continue;
+                        auto& rec = m.uploaded[p];
+                        rec.resize(kPageBytes);
+                        std::memcpy(rec.data(), m.pg->base + p * kPageBytes, kPageBytes);
+                    }
+                }
                 cap->runs.push_back({mp, m.cap_id, sp_lo, sp_hi, a, a->used});
                 a->used += (len + 255) & ~uint64_t{255};
                 g_cap_take_bytes.fetch_add(static_cast<int64_t>(len), std::memory_order_relaxed);
@@ -2641,3 +2664,4 @@ uint64_t mirror_device_vram() { return be::gpu::device_vram_cached(); }
 
 VramLiveInfo vram_live_info() { return be::gpu::vram_live_info_impl(); }
 }  // namespace nxrt::nvn
+
