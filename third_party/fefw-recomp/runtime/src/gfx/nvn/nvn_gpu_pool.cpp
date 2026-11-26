@@ -1153,15 +1153,18 @@ bool cap_note_write(Mirror* m, uint64_t lo, uint64_t hi) {
 // share their unaligned < 4 KiB head/tail pages with neighbouring per-frame CPU UBOs: CPU writes to those UBOs dirty the
 // whole 4 KiB page and capture overwrites the morph vertices with stale rest-pose host memory.
 // Rather than skipping capture via memcmp (which breaks CPU same-value resets such as movie draw-once gate 1c5c6103b8077dba
-// resetting 16 B from 100000.0f back to 0.0f), track live vertex buffer ranges (kReadVertex) on the render thread and emit
-// normal write-back + in-flight exclusion (cap_note_write) ONLY for the unaligned < 4 KiB head/tail boundary sub-pages of
-// graphics-written SSBOs that overlap a live vertex buffer.
+// resetting 16 B from 100000.0f back to 0.0f), track live per-vertex VB ranges (kReadVertex, divisor == 0) on the render thread
+// and emit normal write-back + in-flight exclusion (cap_note_write) ONLY for the unaligned < 4 KiB head/tail boundary sub-pages
+// of graphics-written SSBOs that overlap a live per-vertex VB and have no actively CPU-written interior full pages.
+// Excluding instanced streams (kReadVertexInst, divisor > 0) and active CPU-written interior pages keeps CPU+GPU particle
+// buffers (4b4ac1c47435416a, bound as instanced billboard VBs in Fonsett sky clouds) out of write-back.
 struct PendingGfxSub { Mirror* m; uint64_t cap_id, lo, hi; };
 uint64_t g_sub_gfx_ser = 0;
 std::vector<PendingGfxSub> g_sub_gfx_partials;   // render thread: current submission's partial SSBO boundaries not yet matched to a VB
 constexpr uint64_t kVbBucketShift = 20;          // 1 MiB buckets
 constexpr uint64_t kVbMaxBytes = 16ull << 20;    // ignore whole-pool / huge VB binds
 constexpr uint64_t kVbStaleSerials = 512;        // ~8 s at 60 fps
+constexpr uint32_t kSubpageInteriorCpuWindow = 8; // presents: skip write-back if any interior full page was CPU-written recently
 
 bool gfx_subpage_enabled() {
     static const bool on = nxrt::config_get_bool("nvn", "mirror_gfx_subpage", true);
@@ -1244,6 +1247,16 @@ void cap_note_gfx_vb_subpage(Mirror* m, uint64_t lo, uint64_t hi) {
     for (const SeenKey& k : seen)
         if (k.cap_id == m->cap_id && k.lo == lo && k.hi == hi) return;
     seen.push_back({m->cap_id, lo, hi});
+
+    // Skip CPU+GPU hybrid buffers whose interior full pages are actively written by the CPU (e.g. particle spawn rings).
+    if (p_last >= p_first + 2) {
+        const uint32_t now = presents_now();
+        const uint32_t cpu_stamp = now ? now : 1;
+        for (uint64_t p = p_first + 1; p < p_last; ++p) {
+            const uint32_t w = m->cpu_wr_at[static_cast<size_t>(p)];
+            if (w != 0 && cpu_stamp >= w && cpu_stamp - w <= kSubpageInteriorCpuWindow) return;
+        }
+    }
 
     if (g_sub_gfx_ser != ser) { g_sub_gfx_ser = ser; g_sub_gfx_partials.clear(); }
 
@@ -1480,6 +1493,9 @@ void mirror_capture_begin(Frame& f) {
     g_cap_next.reset();
     const uint64_t done_now = poll_completed();
     const uint64_t done = cap ? std::min(cap->done, done_now) : done_now;
+    const uint32_t now_p = presents_now();
+    const uint32_t cpu_stamp = now_p ? now_p : 1;
+    const bool track_cpu_wr = gfx_subpage_enabled();
     static std::vector<uint64_t> pages;
     static std::vector<std::pair<uint64_t, uint64_t>> excl;
     bool barrier = false;
@@ -1489,6 +1505,10 @@ void mirror_capture_begin(Frame& f) {
         for (const CapRun& r : cap->runs) {
             if (r.m != last) { last = r.m; alive = mirror_alive(r.m, r.id) && mirror_has_any_chunk(*r.m); if (alive) excl_for(r.m, cap->done, excl); }
             if (!alive) continue;
+            if (track_cpu_wr) {
+                const uint64_t p0 = r.lo / kPageBytes, p1 = std::min<uint64_t>((r.hi + kPageBytes - 1) / kPageBytes, r.m->npages);
+                for (uint64_t p = p0; p < p1; ++p) r.m->cpu_wr_at[static_cast<size_t>(p)] = cpu_stamp;
+            }
             cap_put(f.cb, barrier, *r.m, r.a->buf.buffer, r.src, r.lo, r.hi, excl);
             g_cap_poll += static_cast<int64_t>(r.hi - r.lo);
         }
@@ -1529,6 +1549,9 @@ void mirror_capture_begin(Frame& f) {
                 continue;
             }
             std::memcpy(u.ptr, m.pg->base + lo, static_cast<size_t>(hi - lo));
+            if (track_cpu_wr) {
+                for (size_t k = i; k < j; ++k) m.cpu_wr_at[static_cast<size_t>(pages[k])] = cpu_stamp;
+            }
             g_cap_poll += static_cast<int64_t>(hi - lo);
             cap_put(f.cb, barrier, m, u.buffer, u.offset, lo, hi, excl);
             i = j;
