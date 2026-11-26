@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Assembles the portable tree: the launcher, the runtime as a DLL, and the two tools that compile the lifted code, so
 # a player unpacks it and needs nothing installed - no MSVC, no Windows SDK, no Python, no .NET, no Zig.
 #
@@ -16,6 +16,19 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # the checkout
+
+# Refuse to touch a folder something is running from. The copy step deletes the destination first, so a launcher
+# started from an older package made the build die half way and left a 294 MB stump where a 645 MB package was
+# (2026-11-26) - a guard here costs nothing and turns that into one clear sentence.
+$outFull = if ($Out) { [System.IO.Path]::GetFullPath($Out) } else { '' }
+if ($outFull) {
+    $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -and $_.Path.StartsWith($outFull, [System.StringComparison]::OrdinalIgnoreCase) } catch { $false }
+    })
+    if ($busy.Count -gt 0) {
+        throw ("$($busy[0].ProcessName).exe (pid $($busy[0].Id)) is running from $outFull - close it first, or pick another -Out")
+    }
+}
 if (-not $Out) { $Out = Join-Path (Split-Path -Parent $root) 'XC2-package' }
 if (-not $Zig) {
     if ($env:XC2_ZIG) {
