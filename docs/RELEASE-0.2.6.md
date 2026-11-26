@@ -4,6 +4,8 @@
 
 This release ships everything verified since `v0.2.5`: **keyboard and mouse play with rebindable keys ([#69](https://github.com/weile10000/xc2-ns2-recomp/issues/69), [#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76))**, **scene HDR with Accurate/Vivid styles and a live switch ([#68](https://github.com/weile10000/xc2-ns2-recomp/pull/68), by @Revelans)**, **the lightning purple-stripe fix ([#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77), by @Revelans)**, a launcher that is translated everywhere including the build page, and a build chain that relinks a stale `xc2_boot.exe` instead of trusting that the file exists.
 
+**Using the NVIDIA app's DLSS model override?** Models **M** and **L** draw black lines; clear the override for this game and they go away — see the first item under Known issues.
+
 **Every item below links back to the issue or pull request it came from** — that is where fixes start, and several of them exist only because someone took the time to write one up. If something goes wrong, open an issue and attach a report from the Play page: the log, the frame times and the freeze / device-lost dumps in it are what make a fix possible when we do not own your hardware.
 
 > **Upgrading from `v0.2.5` or older? Read this!**
@@ -76,7 +78,7 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 
 ## Known issues
 
-- **NVIDIA black lines with DLSS/Streamline ([#74](https://github.com/weile10000/xc2-ns2-recomp/issues/74))**: still open. Reported on 40/50-series cards; a reproduction attempt on an RTX 3080 Laptop found no lines and 0 NaN/Inf in 16 dumps, so it looks driver- or generation-specific. FSR 3 and TAAU are unaffected — use one of those on NVIDIA if you see them.
+- **NVIDIA black lines with DLSS — it is the DLSS model override ([#74](https://github.com/weile10000/xc2-ns2-recomp/issues/74))**: **not this build.** The lines come from the **NVIDIA app's DLSS model override**, and only models **M** and **L** draw them; with the override cleared (the driver's default model) the picture is clean. The reporter confirmed it on their own card after an RTX 3080 Laptop run showed no lines and 0 NaN/Inf in 16 dumps with the default model. **If you see the lines, clear the override for this game**; FSR 3 and TAAU are unaffected either way.
 - **Device loss on NVIDIA ([#32](https://github.com/weile10000/xc2-ns2-recomp/issues/32), [#41](https://github.com/weile10000/xc2-ns2-recomp/issues/41))**: the failures happen inside `nvoglv64.dll`; we only have an AMD card here and cannot reproduce them. This release adds the diagnostics needed to correlate them with the pipeline prewarm, and `[nvn] shader_prepare = off` / `[nvn] pool_mirror_mb` remain available as A/B switches.
 - **Frame Generation side effects**: frame interpolation may cause subtle mouth/eye flicker in close-ups, and a cutscene can freeze under FG without producing a freeze report (the interpolated frames keep the watchdog satisfied).
 - **Add-on heavy scenes and first-run pipeline compile**: Torna / add-on areas stay heavier than base game areas, and the first launch per driver compiles Vulkan pipelines.
@@ -88,6 +90,8 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 > **关于语气的一点说明**：可能有人注意到，这几个版本的公告和回复在语气措辞上有微妙差别——因为执笔的不是同一个助手。聊天这事 Gemini 确实更在行，干活这块 DeepSeek 也不差。如果它的耿直冒犯到你，那绝不是本意，谢谢你的包容。
 
 本版包含 `v0.2.5` 之后验证过的全部改动：**键鼠操作与可改键（[#69](https://github.com/weile10000/xc2-ns2-recomp/issues/69)、[#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76)）**、**场景 HDR 与「准确 / 鲜艳」风格、免重启切换（[#68](https://github.com/weile10000/xc2-ns2-recomp/pull/68)，by @Revelans）**、**闪电特效紫纹修复（[#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77)，by @Revelans）**、全面汉化的启动器（含构建页），以及**会主动重链接陈旧 `xc2_boot.exe` 的构建链**。
+
+**用了 NVIDIA app 的 DLSS 模型覆盖？** 模型 **M** 和 **L** 会画黑线，把这个游戏的覆盖清掉就没了——见「已知问题」第一条。
 
 **下面每一条都链回了它来自的 issue 或 PR**——修复都是从那里开始的，其中好几项只是因为有人愿意花时间写清楚才存在。遇到问题欢迎开 issue，并附上「游玩」页生成的报告：里面的日志、帧时间和冻结/设备丢失转储，是我们没有你的硬件也能定位问题的前提。
 
@@ -161,7 +165,7 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 
 ## 已知问题
 
-- **N 卡 DLSS/Streamline 下的黑线（[#74](https://github.com/weile10000/xc2-ns2-recomp/issues/74)）**：仍未解决。报告集中在 40/50 系；在 RTX 3080 Laptop 上的复现尝试未出现黑线，16 份 dump 里 0 个 NaN/Inf，因此更像是驱动或特定代际的问题。FSR 3 与 TAAU 不受影响，N 卡上遇到就用这两个。
+- **N 卡 DLSS 黑线——是 DLSS 模型覆盖导致的（[#74](https://github.com/weile10000/xc2-ns2-recomp/issues/74)）**：**不是本版的问题。** 黑线来自 **NVIDIA app 的 DLSS 模型覆盖**，而且只有 **模型 M 和 L** 会画出来；把覆盖清掉（回到驱动默认模型）画面就干净。报告者本人已在自家卡上确认；另有一次 RTX 3080 Laptop 的复现，默认模型下 16 份 dump 里 0 个 NaN/Inf、无黑线。**看到黑线就把这个游戏的覆盖清掉**；FSR 3 与 TAAU 无论哪种情况都不受影响。
 - **N 卡设备丢失（[#32](https://github.com/weile10000/xc2-ns2-recomp/issues/32)、[#41](https://github.com/weile10000/xc2-ns2-recomp/issues/41)）**：故障发生在 `nvoglv64.dll` 内部，本地只有 A 卡，无法复现。本版加入了把它与管线预热关联起来所需的诊断；`[nvn] shader_prepare = off` 与 `[nvn] pool_mirror_mb` 仍可作为 A/B 开关使用。
 - **帧生成的副作用**：帧插值可能让近景的嘴部/眼部出现轻微闪烁；开启帧生成时过场有可能冻住且不产生冻结报告（插值帧让 watchdog 一直满足）。
 - **追加内容重场景与首次管线编译**：黄金之国等追加场景仍比本篇更重；每换一次驱动，首次启动会编译 Vulkan 管线。
