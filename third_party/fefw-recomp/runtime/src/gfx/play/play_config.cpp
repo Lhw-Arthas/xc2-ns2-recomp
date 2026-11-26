@@ -107,6 +107,7 @@ bool pick_word(const std::string& k, const std::string& v, const std::vector<con
 // The words the file uses for the display extras enums, indexed by the enum value (the first word of each list is the default's).
 const std::vector<const char*> kHdrModeWords = {"off", "auto", "on", "native"};
 const std::vector<const char*> kHdrFormatWords = {"auto", "hdr10", "scrgb"};
+const std::vector<const char*> kHdrStyleWords = {"accurate", "vivid"};
 const std::vector<const char*> kUpscaleWords = {"off", "fsr1", "fsr3", "dlss", "xess", "nis", "dlaa"};
 const std::vector<const char*> kUpscaleQualityWords = {"native", "quality", "balanced", "performance", "ultra_performance", "custom"};
 const std::vector<const char*> kLatencyWords = {"off", "auto", "on", "boost"};
@@ -533,6 +534,12 @@ bool apply_fixed(Sec sec, const std::string& k, const std::string& v, Settings* 
             if (k == "highlight_boost") return set_real(0.0, 2.0, &h.highlight_boost);
             if (k == "ui_white_nits") return set_zero_or_real(80.0, 500.0, &h.ui_white_nits);
             if (k == "deband") return set_bool(&h.deband);
+            if (k == "style") {
+                int i = 0;
+                if (!pick_word(k, v, kHdrStyleWords, &i, msg)) return false;
+                h.style = static_cast<extras::HdrStyle>(i);
+                return true;
+            }
             break;
         }
         case Sec::Upscale: {
@@ -995,6 +1002,7 @@ std::string format_settings(const Settings& s) {
     kv("highlight_boost", num_exact(s.extras.hdr.highlight_boost));
     kv("ui_white_nits", num_exact(s.extras.hdr.ui_white_nits));
     kv("deband", flag(s.extras.hdr.deband));
+    kv("style", kHdrStyleWords[static_cast<int>(s.extras.hdr.style)]);
 
     o += "\n[upscale]\n";
     kv("mode", kUpscaleWords[static_cast<int>(s.extras.upscale.mode)]);

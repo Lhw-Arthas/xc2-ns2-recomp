@@ -42,6 +42,7 @@
 #include "nvn_gpu_internal.h"
 #include "nvn_tess_gen.h"
 #include "nxrt/lowlat.h"
+#include "extras/hdr_live.h"
 #include "extras/hdr_nvn.h"
 #include "extras/fsr1_spatial.h"
 #include "extras/spatial_upscaler.h"
@@ -1012,6 +1013,7 @@ float attach_targets(bool fix) {
         if (fix) {
             const float want = tex_scale_wanted(ts[i]);
             if (want != tex_scale(ts[i])) tex_rescale(ts[i], *F, want, "used as a render target");
+            if (ts[i]->is_display && extras::hdr_highlights_kept()) tex_promote_float(ts[i], *F, "the window");   // the game's highlights above 1
         }
         const float sc = tex_scale(ts[i]);
         lo = lo == 0.0f ? sc : std::min(lo, sc);
@@ -2075,6 +2077,7 @@ void prepare_textures(const ProgLayout& pl) {
     for (Texture* t : need_storage) {
         if (tex_scale(t) != 1.0f && std::find(g_storage_unscale.begin(), g_storage_unscale.end(), t) != g_storage_unscale.end())
             tex_rescale(t, *F, 1.0f, "bound as a storage image");   // imageStore coordinates are not scaled (Ryujinx: ResScaleUnsupported)
+        if (t->is_display && extras::hdr_highlights_kept()) tex_promote_float(t, *F, "the window");
         tex_ensure_current(t, *F);
         tex_transition(t, *F, VK_IMAGE_LAYOUT_GENERAL);
         tex_mark_gpu_written(t);
@@ -3501,6 +3504,7 @@ bool build_key(GraphicsKey& key, VkPrimitiveTopology topo) {
                                     uses_src1(static_cast<VkBlendFactor>(key.blend_src_a[i])) || uses_src1(static_cast<VkBlendFactor>(key.blend_dst_a[i]))))
             key.dual_src = 1;
     }
+    key.sdr_tone_map = extras::hdr_shown_as_sdr() && S.stage[kFragment] && extras::hdr_tonemap_patched(S.stage[kFragment]->hash) ? 1 : 0;
     key.xfb = g_xfb_active && device().features().transform_feedback && S.stage[kVertex] && xfb_stride(S.stage[kVertex]) ? 1 : 0;
     key.depth_format = P.depth_fmt;
     key.stencil_format = P.has_stencil ? P.depth_fmt : VK_FORMAT_UNDEFINED;

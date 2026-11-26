@@ -18,6 +18,7 @@
 #include "nxrt/lowlat.h"
 #include "nxrt/platform.h"
 #include "extras/framegen.h"
+#include "extras/hdr_live.h"
 #include "extras/hdr_capture.h"
 #include "extras/hdr_math.h"
 #include "extras/win_display.h"
@@ -161,6 +162,8 @@ struct Renderer::Impl {
     VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
     // display extras (S14)
     extras::OutputKind wanted = extras::OutputKind::Sdr8;     // what the settings and the surface asked for at creation
+    bool offer10 = false, offer_sc = false;                   // the HDR swapchain flavours the surface offered at the decision
+    extras::OutputKind built_kind = extras::OutputKind::Sdr8; // what the last swapchain was made for (live [hdr] mode / format)
     extras::OutputKind kind = extras::OutputKind::Sdr8;       // what the swapchain in use carries
     VkColorSpaceKHR color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     uint32_t format_serial = 0;
@@ -268,7 +271,9 @@ struct Renderer::Impl {
             hs.output = k;
             if (k == extras::OutputKind::Sdr8) hs.peak_ratio = 1.0f;
             extras::hdr_set_state(hs);
+            if (k != extras::OutputKind::Sdr8) extras::hdr_refresh_levels();   // back from SDR: the peak ratio of the settings
         }
+        extras::set_hdr_shown_as_sdr(extras::hdr_state().scene_hdr && k == extras::OutputKind::Sdr8);
     }
 
     // The swapchain's HDR metadata (VK_EXT_hdr_metadata): the display's peak; in [hdr] mode = native the content levels are the game's own
@@ -310,9 +315,12 @@ struct Renderer::Impl {
         hs.game_max_fall = prev.game_max_fall;
         hs.game_display_max_nits = prev.game_display_max_nits;
         hs.metadata_serial = prev.metadata_serial + 1;
-        const bool forced = es.hdr.mode == extras::HdrMode::On || es.hdr.mode == extras::HdrMode::Native;   // Native: the game's HDR TV path, forced like On
+        // Started with HDR (auto / on): the HDR scene is set up, and [hdr] mode / format then pick the output live (live_kind). Started with
+        // off: nothing of it is set up (no cost); HDR needs a restart.
+        const extras::HdrMode mode = es.hdr.mode;
+        const bool forced = mode == extras::HdrMode::On || mode == extras::HdrMode::Native;   // Native: the game's HDR TV path, forced like On
         wanted = extras::OutputKind::Sdr8;
-        if (es.hdr.mode != extras::HdrMode::Off) {
+        if (mode != extras::HdrMode::Off) {
             bool o10 = false, osc = false;
             extras::DisplayHdrInfo di;
             if (headless) {
@@ -330,13 +338,15 @@ struct Renderer::Impl {
                 NXLOG_I(kTag, "HDR: surface offers HDR10 %s, scRGB %s; display %s: hdr %s, peak %.0f nits, SDR white %.0f nits (%s)", o10 ? "yes" : "no", osc ? "yes" : "no",
                         di.monitor, di.hdr_enabled ? "on" : "off", di.max_nits, di.sdr_white_nits, di.how);
             }
-            if (!headless && es.hdr.mode == extras::HdrMode::Auto && !(di.valid && di.hdr_enabled)) {
+            if (!headless && mode == extras::HdrMode::Auto && !(di.valid && di.hdr_enabled)) {
                 // the NVIDIA driver lists HDR10 and scRGB surface formats whether or not Windows HDR is on for the monitor, so "auto" needs Windows' own answer
                 if (o10 || osc) NXLOG_I(kTag, "HDR: the surface lists HDR formats but Windows does not report HDR on for this monitor (%s): SDR output (set [hdr] mode = on to force HDR)", di.how);
                 o10 = osc = false;
             }
             const bool pick10 = es.hdr.format == extras::HdrFormat::Hdr10 ? o10 : es.hdr.format == extras::HdrFormat::ScRgb ? false : o10;
             const bool pickSc = es.hdr.format == extras::HdrFormat::ScRgb ? osc : es.hdr.format == extras::HdrFormat::Hdr10 ? false : (!o10 && osc);
+            offer10 = o10;
+            offer_sc = osc;
             if (pick10) wanted = extras::OutputKind::Hdr10;
             else if (pickSc) wanted = extras::OutputKind::ScRgb;
             hs.scene_hdr = wanted != extras::OutputKind::Sdr8 || forced;
@@ -352,6 +362,7 @@ struct Renderer::Impl {
         }
         hs.output = extras::OutputKind::Sdr8;     // the swapchain sets the real one
         extras::hdr_set_state(hs);
+        extras::set_hdr_shown_as_sdr(hs.scene_hdr && kind == extras::OutputKind::Sdr8);   // a swapchain made before this decision
         NXLOG_I(kTag, "HDR: mode %d, scene %s, wanted output %s, paper white %.0f nits, peak %.0f nits, peak ratio %.2f", static_cast<int>(es.hdr.mode), hs.scene_hdr ? "HDR" : "SDR",
                 extras::output_kind_name(wanted), hs.paper_white_nits, hs.peak_nits, hs.peak_ratio);
     }
@@ -376,8 +387,21 @@ struct Renderer::Impl {
         return ok;
     }
 
+    // The output the settings ask for now: SDR with [hdr] mode = off, else the [hdr] format among what the surface offered (live)
+    extras::OutputKind live_kind() const {
+        if (wanted == extras::OutputKind::Sdr8 || headless) return wanted;
+        const extras::Settings es = extras::settings();
+        if (es.hdr.mode == extras::HdrMode::Off) return extras::OutputKind::Sdr8;
+        if (es.hdr.format == extras::HdrFormat::Hdr10 && offer10) return extras::OutputKind::Hdr10;
+        if (es.hdr.format == extras::HdrFormat::ScRgb && offer_sc) return extras::OutputKind::ScRgb;
+        if (es.hdr.format == extras::HdrFormat::Auto) return offer10 ? extras::OutputKind::Hdr10 : offer_sc ? extras::OutputKind::ScRgb : wanted;
+        return wanted;
+    }
+
     bool recreate(uint32_t want_w, uint32_t want_h) {
         dev->wait_idle();
+        built_kind = live_kind();
+        const extras::OutputKind wanted = built_kind;
         if (headless) {
             destroy_targets();
             extent = {want_w, want_h};
@@ -680,6 +704,7 @@ bool Renderer::begin_frame(FrameInfo* out) {
         s.last_px_w = pw;
         s.last_px_h = ph;
     }
+    if (s.wanted != extras::OutputKind::Sdr8 && s.live_kind() != s.built_kind) s.dirty = true;   // [hdr] mode / format changed (live)
     if (s.dirty && !s.recreate(static_cast<uint32_t>(pw), static_cast<uint32_t>(ph))) {
         s.st.skipped++;
         return false;

@@ -473,7 +473,7 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
     Impl& s = *o->impl_;
     s.ctx = ctx;
     s.color_format = ctx.renderer->format();
-    if (ctx.renderer->output_kind() != extras::OutputKind::Sdr8) {
+    if (ctx.renderer->output_kind() != extras::OutputKind::Sdr8 || extras::hdr_state().scene_hdr) {
         // HDR swapchain: ImGui draws into an RGBA8 target that the composite maps onto the swapchain (see draw)
         if (s.composite.init(*ctx.device)) {
             s.hdr = true;
@@ -1737,8 +1737,8 @@ void Overlay::draw(const FrameInfo& f) {
         s.last_frame = now;
         return;
     }
-    const bool hdr_frame = s.hdr && f.hdr_output;
-    if (s.hdr && !f.hdr_output) return;      // the display left HDR mode: the RGBA8 overlay pipeline does not match the SDR swapchain, so no overlay until the next start
+    // made for HDR: the overlay always goes through the RGBA8 target, and the composite writes it as HDR or, after a switch to SDR, as SDR
+    const bool hdr_frame = s.hdr;
     if (hdr_frame && !s.composite.ensure_target(f.extent)) return;
     std::lock_guard<std::mutex> lk(s.mu);
     ImGuiContext* prev = ImGui::GetCurrentContext();
@@ -1789,7 +1789,8 @@ void Overlay::draw(const FrameInfo& f) {
         const extras::HdrState hs = extras::hdr_state();
         s.composite.begin_overlay(f.cmd);
         render_into(s.composite.target_view(), VK_ATTACHMENT_LOAD_OP_CLEAR);
-        s.composite.composite(f.cmd, f.view, f.format, f.extent, s.ctx.renderer->output_kind(), hs.paper_white_nits, hs.peak_nits);
+        s.composite.composite(f.cmd, f.view, f.format, f.extent, f.hdr_output ? s.ctx.renderer->output_kind() : extras::OutputKind::Sdr8,
+                              hs.paper_white_nits, hs.peak_nits);
     } else {
         render_into(f.view, VK_ATTACHMENT_LOAD_OP_LOAD);
     }

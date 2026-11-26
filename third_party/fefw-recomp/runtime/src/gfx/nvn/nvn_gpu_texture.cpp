@@ -54,6 +54,7 @@ static std::set<struct TexGpu*> g_live_set;
 
 struct TexGpu {
     bool promoted = false;                              // HDR scene pipeline: an 8-bit sRGB render target kept as RGBA16F (src/gfx/extras/hdr_nvn.h)
+    bool float_tried = false;                           // tex_promote_float could not make the float16 image
     gfx::Image img;                                     // the image; created without a view (views are cached below)
     const FormatInfo* fmt = nullptr;
     VkFormat format = VK_FORMAT_UNDEFINED;              // the image format: the NVN one, its fallback, or BC7 for ASTC
@@ -1600,32 +1601,14 @@ float tex_scale_wanted(Texture* t) {
     return attachment_scale(*t);
 }
 
-// Remakes the image at another scale (Ryujinx scales a texture when it becomes a render target and blacklists one that cannot be
-// scaled). The content is blitted over when the format allows it (otherwise it starts undefined). Going to 1 is for good. The old image
-// and its views are destroyed after the frames that use them.
-bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
-    TexGpu* g = tex_or_null(t);
-    if (!g || g->scale == to) return false;
-    if (to != 1.0f && (g->scale_blocked || g->transcoded || is_block_format(g->format))) return false;
-    Shape s = shape_of(*t);
-    if (to != 1.0f) {
-        s.base.width = static_cast<uint32_t>(std::lround(s.base.width * to));
-        s.base.height = static_cast<uint32_t>(std::lround(s.base.height * to));
-    }
-    gfx::Image ni;
-    std::string err;
-    if (device().create_image(make_desc(s, g->format, g->usage, base_flags(s, g->format)), &ni, &err) != VK_SUCCESS) {
-        NXLOG_W(kTag, "texture %u: cannot remake it at %ux%u (%s): it keeps scale %.3f", t->id, s.base.width, s.base.height, err.c_str(), g->scale);
-        if (to == 1.0f) g->scale_blocked = true;
-        return false;
-    }
-    static int logged = 0;
-    if (logged++ < 60)
-        NXLOG_I(kTag, "texture %u: %s %dx%d now rendered at %ux%u (%s)", t->id, g->fmt ? g->fmt->name : "?", t->b.width, t->b.height, s.base.width, s.base.height, why);
-    VkFormatProperties fp = {};
+// Puts `ni` (shape s, format nf) in place of the texture's image, the content blitted over when the formats allow it. The old image and its
+// views are destroyed after the frames that use them.
+static void swap_image(Texture* t, TexGpu* g, Frame& f, const Shape& s, const gfx::Image& ni, VkFormat nf) {
+    VkFormatProperties fp = {}, fq = {};
     vkGetPhysicalDeviceFormatProperties(device().physical(), g->format, &fp);
-    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-    const bool can_blit = g->layout != VK_IMAGE_LAYOUT_UNDEFINED && s.samples <= 1 && (fp.optimalTilingFeatures & need) == need &&
+    vkGetPhysicalDeviceFormatProperties(device().physical(), nf, &fq);
+    const bool can_blit = g->layout != VK_IMAGE_LAYOUT_UNDEFINED && s.samples <= 1 && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) &&
+                          (fq.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) &&
                           (g->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && (g->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     VkImageLayout nl = VK_IMAGE_LAYOUT_UNDEFINED;
     if (can_blit) {
@@ -1661,9 +1644,60 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     g->img = ni;
     g->base = s.base;
     g->layout = nl;
+    pool_texture_remade(t);
+}
+
+// Remakes the image at another scale (Ryujinx scales a texture when it becomes a render target and blacklists one that cannot be
+// scaled). The content is blitted over when the format allows it (otherwise it starts undefined). Going to 1 is for good. The old image
+// and its views are destroyed after the frames that use them.
+bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
+    TexGpu* g = tex_or_null(t);
+    if (!g || g->scale == to) return false;
+    if (to != 1.0f && (g->scale_blocked || g->transcoded || is_block_format(g->format))) return false;
+    Shape s = shape_of(*t);
+    if (to != 1.0f) {
+        s.base.width = static_cast<uint32_t>(std::lround(s.base.width * to));
+        s.base.height = static_cast<uint32_t>(std::lround(s.base.height * to));
+    }
+    gfx::Image ni;
+    std::string err;
+    if (device().create_image(make_desc(s, g->format, g->usage, base_flags(s, g->format)), &ni, &err) != VK_SUCCESS) {
+        NXLOG_W(kTag, "texture %u: cannot remake it at %ux%u (%s): it keeps scale %.3f", t->id, s.base.width, s.base.height, err.c_str(), g->scale);
+        if (to == 1.0f) g->scale_blocked = true;
+        return false;
+    }
+    static int logged = 0;
+    if (logged++ < 60)
+        NXLOG_I(kTag, "texture %u: %s %dx%d now rendered at %ux%u (%s)", t->id, g->fmt ? g->fmt->name : "?", t->b.width, t->b.height, s.base.width, s.base.height, why);
+    swap_image(t, g, f, s, ni, g->format);
     g->scale = to;
     if (to == 1.0f) g->scale_blocked = true;
-    pool_texture_remade(t);
+    return true;
+}
+
+bool tex_promote_float(Texture* t, Frame& f, const char* why) {
+    TexGpu* g = tex_or_null(t);
+    if (!g || g->promoted || g->float_tried || g->format != VK_FORMAT_R8G8B8A8_UNORM || g->type != VK_IMAGE_TYPE_2D || g->levels != 1 || g->layers != 1 || g->sparse) return false;
+    constexpr VkFormat kFloat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    Shape s = shape_of(*t);
+    if (s.samples > 1) return false;
+    s.base = g->base;   // the scaled size
+    const VkImageCreateFlags flags = base_flags(s, kFloat);
+    gfx::Image ni;
+    std::string err;
+    if (!device().image_supported(make_desc(s, kFloat, g->usage, flags)) ||
+        device().create_image(make_desc(s, kFloat, g->usage, flags), &ni, &err) != VK_SUCCESS) {
+        NXLOG_W(kTag, "texture %u: cannot keep it as float16 (%s): it stays 8-bit", t->id, err.empty() ? "usage not supported" : err.c_str());
+        g->float_tried = true;   // not tried again
+        return false;
+    }
+    NXLOG_I(kTag, "texture %u: %s %ux%u now float16 for the HDR scene (%s)", t->id, g->fmt ? g->fmt->name : "?", s.base.width, s.base.height, why);
+    swap_image(t, g, f, s, ni, kFloat);
+    g->format = kFloat;
+    g->promoted = true;
+    g->mutable_fmt = srgb_partner(kFloat) != VK_FORMAT_UNDEFINED || bit_alias_class(kFloat);
+    g->sampled_formats.clear();
+    g->last_sampled_fmt = VK_FORMAT_MAX_ENUM;
     return true;
 }
 

@@ -16,6 +16,7 @@
 #include "nxrt/movie_vdec.h"
 #include "extras/output_pass.h"
 #include "extras/framegen.h"
+#include "extras/hdr_nvn.h"
 #include "extras/hdr_pattern.h"
 #include "nvn_framegen.h"
 #include "nvn_hdr_ui.h"
@@ -172,19 +173,22 @@ void present_on_render_thread(Window* w, int index, bool again) {
     f.serial = current_serial();
     const extras::HdrState hs = extras::hdr_state();
     VkImageView src = VK_NULL_HANDLE;
-    bool decoded = false;
+    bool decoded = false, encoded = false;   // sRGB view of 8-bit bytes / float16 window with display-encoded highlights above 1
     {
         NXFT("present.transition");
         tex_transition(t, f, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         // the HDR output pass encodes a scene-linear source; an 8-bit window texture is display-referred, so it is read through
         // its sRGB view there (one decode, no second gamma). The SDR path copies the bytes unchanged, as the console does.
         src = hs.scene_hdr ? tex_present_view_linear(t, &decoded) : tex_present_view(t);
-        static bool told = false;
-        if (hs.scene_hdr && !told) {
+        encoded = hs.scene_hdr && extras::hdr_highlights_kept() && tex_vk_format(t) == VK_FORMAT_R16G16B16A16_SFLOAT;
+        static bool told = false, told_encoded = false;
+        if (hs.scene_hdr && (!told || (encoded && !told_encoded))) {
             told = true;
+            told_encoded = encoded;
             NXLOG_I("nvn", "present: window texture %s is %s on the HDR output path", t->fmt ? t->fmt->name : "?",
-                    decoded ? (hs.peak_ratio > 1.001f ? "display-referred (sRGB view + highlight expansion)" : "display-referred (sampled through its sRGB view)")
-                            : "scene-linear (sampled as is)");
+                    encoded ? "display-referred float16 with the game's highlights (decoded and fitted in the output pass)"
+                    : decoded ? (hs.peak_ratio > 1.001f ? "display-referred (sRGB view + highlight expansion)" : "display-referred (sampled through its sRGB view)")
+                              : "scene-linear (sampled as is)");
         }
     }
     NXFT("present.record");
@@ -209,7 +213,7 @@ void present_on_render_thread(Window* w, int index, bool again) {
     // HDR scene / HDR swapchain / FSR 1 or NIS / picture controls go through the output pass (S14); everything else is the plain present pass of the SDR path
     const extras::PictureLive pic = extras::picture_live();
     extras::OutputPass* op = output_pass();
-    const HdrUiFrame hdr_ui = hdr_ui_frame(t, f, again, hs, decoded);
+    const HdrUiFrame hdr_ui = hdr_ui_frame(t, f, again, hs, decoded || encoded);
     auto draw_picture = [&](VkImageView from, VkImageView to) {   // also frame generation's HUD-less colour (nvn_framegen.h)
         if (op && (hs.scene_hdr || hs.output != extras::OutputKind::Sdr8 || extras::upscale_mode() == extras::UpscaleMode::Fsr1 ||
                    extras::upscale_mode() == extras::UpscaleMode::Nis || pic.active)) {
@@ -223,10 +227,16 @@ void present_on_render_thread(Window* w, int index, bool again) {
             prm.out = hs.output;
             prm.paper_white_nits = hs.paper_white_nits;
             prm.peak_nits = hs.peak_nits;
-            prm.expand_ratio = (decoded && hs.scene_hdr && hs.output != extras::OutputKind::Sdr8) ? hs.peak_ratio : 1.0f;
+            const bool vivid = extras::settings().hdr.style == extras::HdrStyle::Vivid;
+            const bool stretch = decoded || (encoded && vivid);   // the 8-bit picture stretched (also from the float window)
+            prm.expand_ratio = (stretch && hs.scene_hdr && hs.output != extras::OutputKind::Sdr8) ? hs.peak_ratio : 1.0f;
+            prm.src_encoded = encoded;
+            prm.clip_encoded = encoded && vivid;
+            // Accurate: the game's highlights as they are, up to the display's peak
+            prm.highlight_ratio = hs.paper_white_nits > 0.0f ? std::max(hs.peak_nits / hs.paper_white_nits, 1.0f) : 1.0f;
             prm.scene = from == src ? hdr_ui.scene : VK_NULL_HANDLE;
             prm.ui_scale = hdr_ui.ui_scale;
-            prm.deband = decoded && extras::settings().hdr.deband;
+            prm.deband = (decoded || encoded) && extras::settings().hdr.deband;
             prm.pattern = extras::hdr_pattern();
             prm.fsr1 = extras::upscale_mode() == extras::UpscaleMode::Fsr1;
             prm.nis = extras::upscale_mode() == extras::UpscaleMode::Nis;
