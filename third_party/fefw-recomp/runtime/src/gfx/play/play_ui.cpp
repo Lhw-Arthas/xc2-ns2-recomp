@@ -1127,7 +1127,8 @@ void tab_graphics(const LiveStatus& live, Page& p, float bottom_h) {
     }
     if (card_button("pic_vivid", "鲜艳通透预设", "Preset: Vivid",
                     "适度提升通透度：对比度 1.10、饱和度 1.15、黑位 -0.03，可有效消除画面灰蒙感，实时生效。",
-                    "Modest boost: contrast 1.10, saturation 1.15, black level -0.03. Live preview.")) {
+                    "Modest boost: contrast 1.10, saturation 1.15, black level -0.03. Live preview.",
+                    pic.vivid() ? tr("当前", "Active") : "")) {
         if (extras::picture_preset("vivid", &pic)) {
             extras::set_picture_live(pic);
             mark(p);

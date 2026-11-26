@@ -79,6 +79,12 @@ struct PictureSettings {
     double black = 0.0;        // -0.5 .. 0.25: below 0 pulls the blacks down (the signal at -black becomes black), above 0 lifts them; white stays
     double gamma = 1.0;        // 0.5 .. 2: mid-tone brightness (signal^(1/gamma)); above 1 brightens
     bool neutral() const { return contrast == 1.0 && saturation == 1.0 && black == 0.0 && gamma == 1.0; }
+    // The "vivid" preset's own values (picture_preset below), so the F1 page can badge its button like the neutral
+    // one. Compared with a tolerance: these numbers come back from controls.ini as text.
+    bool vivid() const {
+        const auto close = [](double a, double b) { const double d = a - b; return d < 1e-6 && d > -1e-6; };
+        return close(contrast, 1.10) && close(saturation, 1.15) && close(black, -0.03) && close(gamma, 1.0);
+    }
 };
 // The named presets ([picture] preset): "neutral" and "vivid". False for any other name (*out unchanged).
 inline bool picture_preset(const std::string& name, PictureSettings* out) {   // inline: the launcher's settings code uses it without nxrt_gfx
