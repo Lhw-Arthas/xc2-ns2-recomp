@@ -4,6 +4,8 @@
 
 This release ships everything verified since `v0.2.5`: **keyboard and mouse play with rebindable keys ([#69](https://github.com/weile10000/xc2-ns2-recomp/issues/69), [#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76))**, **scene HDR with Accurate/Vivid styles and a live switch ([#68](https://github.com/weile10000/xc2-ns2-recomp/pull/68), by @Revelans)**, **the lightning purple-stripe fix ([#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77), by @Revelans)**, a launcher that is translated everywhere including the build page, and a build chain that relinks a stale `xc2_boot.exe` instead of trusting that the file exists.
 
+**Every item below links back to the issue or pull request it came from** — that is where fixes start, and several of them exist only because someone took the time to write one up. If something goes wrong, open an issue and attach a report from the Play page: the log, the frame times and the freeze / device-lost dumps in it are what make a fix possible when we do not own your hardware.
+
 > **Upgrading from `v0.2.5` or older? Read this!**
 > 1. **One click**: `xc2-launcher.exe` → **About → Check now → Install update**, or extract `XC2-package-dist-0.2.6.zip` over your install folder.
 > 2. **The first Set up after upgrading rebuilds `xc2_boot.exe` once** (5–10 minutes on a normal desktop). The build chain now relinks whenever the runtime changed, because an old exe next to a new `xc2_rt.dll` is a mixed build — that is the class of bug behind "it looked broken until I rebuilt it". Later runs skip the step.
@@ -20,11 +22,11 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 
 ## What's new
 
-### 1. Keyboard & mouse play (`#69`, `#76`, `play_engine`, `play_ui`, `xc2_boot`)
+### 1. Keyboard & mouse play ([#69](https://github.com/weile10000/xc2-ns2-recomp/issues/69), [#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76), `play_engine`, `play_ui`, `xc2_boot`)
 - **Mouse look**: raw relative input, no acceleration, captured while the game has focus and released when the F1 page opens. Gain is `[mouse] stick_scale` in `controls.ini`, exposed as a live slider in F1.
 - **Bindable keys through the runtime's play-mode engine** instead of a hardcoded table: WASD move, IJKL look, `E` / left click / `Return` confirm, `Space` / `Backspace` / `Esc` cancel, right click lock-on, `1`–`4` = Y / A / B / X, `Q` / `R` = ZL / ZR, `F` / `G` = L / R, `Tab` = `+`, `M` = left-stick click, wheel = d-pad up/down.
 - **F1 rebind page**: every action lists its keys as buttons — click one to capture a new key, `×` removes it, `+` adds another. A key that already drives something else **unbinds the other action** and the notice names it, so one input never does two things. A separate **Reset keys** button restores the factory bindings without touching any other setting.
-- **Stick calibration (`#76`)**: both sticks show the raw value they report at rest, with "Set centre here" and two fine sliders. The measured centre is subtracted from the raw axis **before** the dead zone — a dead zone cannot fix a stick that rests off zero, which is what turns "push back" into a slow walk. Defaults are 0, so a healthy pad is unaffected.
+- **Stick calibration ([#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76))**: both sticks show the raw value they report at rest, with "Set centre here" and two fine sliders. The measured centre is subtracted from the raw axis **before** the dead zone — a dead zone cannot fix a stick that rests off zero, which is what turns "push back" into a slow walk. Defaults are 0, so a healthy pad is unaffected.
 
 ### 2. 90 / 120 fps, and a 60 fps cutscene cap (`7485963`, `c0dac09`, `7a6fbd8`, `93e36cf`)
 - The game's own limiter can be rewritten to **90 or 120 fps** with a dual clock: game logic keeps its 30 Hz step while presents double or quadruple, and pre-rendered cutscenes stay capped at 60 fps so they keep their timing.
@@ -40,10 +42,10 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 - New `[hdr] style` (`accurate` / `vivid`) and `[hdr] keep_highlights`, and the HDR switch now applies **without restarting**.
 - `[hdr] mode` still defaults to `off`: nothing changes for players who do not use HDR.
 
-### 4. Scene HDR, Accurate/Vivid styles, live toggle (`#68`, by @Revelans)
-### 5. Visual fixes (`#77`, `#72`, by @Revelans and @UrsineBear)
-- **Lightning purple stripes (`#77`, by @Revelans)**: the level-0 block depth of non-sparse 3D textures is sized to the slice count instead of always 16, and a packaged layout's byte 0 supplies the 3D block shape. XC2's `256x128x8` BC4 lightning flipbook was laid out over 16 slices instead of 8, so the GPU read the wrong texels.
-- **Facial morph flicker under mirror capture (`#72`, by @UrsineBear)**: when `[nvn] mirror_gfx_storage_writeback = 0`, graphics-stage SSBO writes stay in the device-local mirror, so host RAM still holds the pre-morph bytes. An SSBO whose head or tail shares a 4 KiB page with a per-frame CPU-written UBO had those bytes overwritten with stale host memory on the next capture. The page range is now split around the byte ranges the GPU owns, and that arithmetic has its own test group (`gfx_nvn_capture_spans`, seven cases).
+### 4. Scene HDR, Accurate/Vivid styles, live toggle ([#68](https://github.com/weile10000/xc2-ns2-recomp/pull/68) by @Revelans, [#57](https://github.com/weile10000/xc2-ns2-recomp/issues/57))
+### 5. Visual fixes ([#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77), [#72](https://github.com/weile10000/xc2-ns2-recomp/pull/72), by @Revelans and @UrsineBear)
+- **Lightning purple stripes ([#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77), by @Revelans)**: the level-0 block depth of non-sparse 3D textures is sized to the slice count instead of always 16, and a packaged layout's byte 0 supplies the 3D block shape. XC2's `256x128x8` BC4 lightning flipbook was laid out over 16 slices instead of 8, so the GPU read the wrong texels.
+- **Facial morph flicker under mirror capture ([#72](https://github.com/weile10000/xc2-ns2-recomp/pull/72), by @UrsineBear)**: when `[nvn] mirror_gfx_storage_writeback = 0`, graphics-stage SSBO writes stay in the device-local mirror, so host RAM still holds the pre-morph bytes. An SSBO whose head or tail shares a 4 KiB page with a per-frame CPU-written UBO had those bytes overwritten with stale host memory on the next capture. The page range is now split around the byte ranges the GPU owns, and that arithmetic has its own test group (`gfx_nvn_capture_spans`, seven cases).
 
 ### 6. Launcher
 - **Language switch in the top-right corner**, the same idea as the F1 menu: the label is the language it switches to, and it keeps your scroll position. The Settings row stays.
@@ -85,6 +87,8 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 
 本版包含 `v0.2.5` 之后验证过的全部改动：**键鼠操作与可改键（[#69](https://github.com/weile10000/xc2-ns2-recomp/issues/69)、[#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76)）**、**场景 HDR 与「准确 / 鲜艳」风格、免重启切换（[#68](https://github.com/weile10000/xc2-ns2-recomp/pull/68)，by @Revelans）**、**闪电特效紫纹修复（[#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77)，by @Revelans）**、全面汉化的启动器（含构建页），以及**会主动重链接陈旧 `xc2_boot.exe` 的构建链**。
 
+**下面每一条都链回了它来自的 issue 或 PR**——修复都是从那里开始的，其中好几项只是因为有人愿意花时间写清楚才存在。遇到问题欢迎开 issue，并附上「游玩」页生成的报告：里面的日志、帧时间和冻结/设备丢失转储，是我们没有你的硬件也能定位问题的前提。
+
 > **从 `v0.2.5` 或更早升级？请先看这里**
 > 1. **一键更新**：`xc2-launcher.exe` → **关于 → 检查更新 → 安装更新**；或把 `XC2-package-dist-0.2.6.zip` 解压覆盖到安装目录。
 > 2. **升级后第一次「开始构建」会重新链接一次 `xc2_boot.exe`**（普通台式机约 5–10 分钟）。构建链现在只要运行时变了就重链接——旧的 exe 配新的 `xc2_rt.dll` 是混合构建，这正是「我重新构建了一下就好了」那类问题的根源。之后不再重复。
@@ -101,11 +105,11 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 
 ## 本版变化
 
-### 1. 键鼠操作（`#69`、`#76`、`play_engine`、`play_ui`、`xc2_boot`）
+### 1. 键鼠操作（[#69](https://github.com/weile10000/xc2-ns2-recomp/issues/69)、[#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76)、`play_engine`、`play_ui`、`xc2_boot`）
 - **鼠标转视角**：原始相对位移、无加速度；游戏获得焦点时捕获指针，打开 F1 时释放。灵敏度是 `controls.ini` 里的 `[mouse] stick_scale`，F1 里有实时滑块。
 - **按键走运行时的 play 模式绑定引擎**，不再是硬编码表：WASD 移动、IJKL 视角、`E`/左键/回车=确认、空格/退格/Esc=取消、右键=锁定、`1`–`4`=Y/A/B/X、`Q`/`R`=ZL/ZR、`F`/`G`=L/R、`Tab`=加号、`M`=左摇杆按下、滚轮=十字键上下。
 - **F1 改键页**：每个动作把它所有的键列成按钮——点一下就进入捕获，`×` 删除，`+` 再加一个。若按下的键已经被别的动作占用，**那条旧绑定会被解绑**，提示里会点名，保证一个输入不会同时干两件事。另有独立的**「恢复默认按键」**，只重置键位、不动其他设置。
-- **摇杆校准（`#76`）**：左右两杆都会显示静止时上报的原始值，配「以此为中位」和两个微调滑块。测得的中位**在死区之前**从原始轴减掉——死区治不了「静止时轴心偏移」，那正是「往后走变成慢走」的原因。默认值为 0，健康手柄完全不受影响。
+- **摇杆校准（[#76](https://github.com/weile10000/xc2-ns2-recomp/issues/76)）**：左右两杆都会显示静止时上报的原始值，配「以此为中位」和两个微调滑块。测得的中位**在死区之前**从原始轴减掉——死区治不了「静止时轴心偏移」，那正是「往后走变成慢走」的原因。默认值为 0，健康手柄完全不受影响。
 
 ### 2. 90 / 120 fps 与过场 60 fps 封顶（`7485963`、`c0dac09`、`7a6fbd8`、`93e36cf`）
 - 游戏自身的限帧可以改写为 **90 或 120 fps**，采用双时钟：游戏逻辑仍按 30 Hz 步进，而 present 翻倍或翻四倍；预渲染过场封顶 60 fps，保持原有节奏。
@@ -121,10 +125,10 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 - 新增 `[hdr] style`（`accurate` / `vivid`）与 `[hdr] keep_highlights`，HDR 开关**不再需要重启**。
 - `[hdr] mode` 默认仍是 `off`：不用 HDR 的玩家完全不受影响。
 
-### 4. 场景 HDR、「准确 / 鲜艳」风格与免重启切换（`#68`，by @Revelans）
-### 5. 画面修复（`#77`、`#72`，by @Revelans 与 @UrsineBear）
-- **闪电特效紫色条纹（`#77`，by @Revelans）**：非 sparse 3D 纹理的 level-0 块深度改为按切片数取（原来恒为 16），packaged layout 的 byte 0 提供 3D 块形状。XC2 那张 `256x128x8` 的 BC4 闪电 flipbook 被按 16 层排布而不是 8 层，GPU 读到了错位的纹素。
-- **镜像捕获下的面部形变闪烁（`#72`，by @UrsineBear）**：当 `[nvn] mirror_gfx_storage_writeback = 0` 时，图形阶段的 SSBO 写入留在设备本地镜像里，主机内存仍持有形变前的字节。若该 SSBO 的首部或尾部与一个每帧被 CPU 写入的 UBO 共享同一个 4 KiB 页，下次捕获就会用陈旧的主机内存覆盖这些字节。现在会按 GPU 拥有的字节区间切分页范围，这段算术有独立测试组（`gfx_nvn_capture_spans`，7 个用例）。
+### 4. 场景 HDR、「准确 / 鲜艳」风格与免重启切换（[#68](https://github.com/weile10000/xc2-ns2-recomp/pull/68) by @Revelans、[#57](https://github.com/weile10000/xc2-ns2-recomp/issues/57)）
+### 5. 画面修复（[#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77)、[#72](https://github.com/weile10000/xc2-ns2-recomp/pull/72)，by @Revelans 与 @UrsineBear）
+- **闪电特效紫色条纹（[#77](https://github.com/weile10000/xc2-ns2-recomp/pull/77)，by @Revelans）**：非 sparse 3D 纹理的 level-0 块深度改为按切片数取（原来恒为 16），packaged layout 的 byte 0 提供 3D 块形状。XC2 那张 `256x128x8` 的 BC4 闪电 flipbook 被按 16 层排布而不是 8 层，GPU 读到了错位的纹素。
+- **镜像捕获下的面部形变闪烁（[#72](https://github.com/weile10000/xc2-ns2-recomp/pull/72)，by @UrsineBear）**：当 `[nvn] mirror_gfx_storage_writeback = 0` 时，图形阶段的 SSBO 写入留在设备本地镜像里，主机内存仍持有形变前的字节。若该 SSBO 的首部或尾部与一个每帧被 CPU 写入的 UBO 共享同一个 4 KiB 页，下次捕获就会用陈旧的主机内存覆盖这些字节。现在会按 GPU 拥有的字节区间切分页范围，这段算术有独立测试组（`gfx_nvn_capture_spans`，7 个用例）。
 
 ### 6. 启动器
 - **右上角语言切换**，和 F1 里那个同一个思路：按钮显示的是「要切过去的语言」，并且不会把你弹回页面顶部。设置页的语言项保留。
