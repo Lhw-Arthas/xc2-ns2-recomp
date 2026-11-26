@@ -29,8 +29,9 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 - New `[hdr] style` (`accurate` / `vivid`) and `[hdr] keep_highlights`, and the HDR switch now applies **without restarting**.
 - `[hdr] mode` still defaults to `off`: nothing changes for players who do not use HDR.
 
-### 3. Lightning purple stripes (`#77`, by @Revelans)
-- The level-0 block depth of non-sparse 3D textures is sized to the slice count instead of always 16, and a packaged layout's byte 0 supplies the 3D block shape. XC2's `256x128x8` BC4 lightning flipbook was laid out over 16 slices instead of 8, so the GPU read the wrong texels.
+### 3. Visual fixes (`#77`, `#72`, by @Revelans and @UrsineBear)
+- **Lightning purple stripes (`#77`, by @Revelans)**: the level-0 block depth of non-sparse 3D textures is sized to the slice count instead of always 16, and a packaged layout's byte 0 supplies the 3D block shape. XC2's `256x128x8` BC4 lightning flipbook was laid out over 16 slices instead of 8, so the GPU read the wrong texels.
+- **Facial morph flicker under mirror capture (`#72`, by @UrsineBear)**: when `[nvn] mirror_gfx_storage_writeback = 0`, graphics-stage SSBO writes stay in the device-local mirror, so host RAM still holds the pre-morph bytes. An SSBO whose head or tail shares a 4 KiB page with a per-frame CPU-written UBO had those bytes overwritten with stale host memory on the next capture. The page range is now split around the byte ranges the GPU owns, and that arithmetic has its own test group (`gfx_nvn_capture_spans`, seven cases).
 
 ### 4. Launcher
 - **Language switch in the top-right corner**, the same idea as the F1 menu: the label is the language it switches to, and it keeps your scroll position. The Settings row stays.
@@ -94,8 +95,9 @@ This release ships everything verified since `v0.2.5`: **keyboard and mouse play
 - 新增 `[hdr] style`（`accurate` / `vivid`）与 `[hdr] keep_highlights`，HDR 开关**不再需要重启**。
 - `[hdr] mode` 默认仍是 `off`：不用 HDR 的玩家完全不受影响。
 
-### 3. 闪电特效紫色条纹（`#77`，by @Revelans）
-- 非 sparse 3D 纹理的 level-0 块深度改为按切片数取（原来恒为 16），packaged layout 的 byte 0 提供 3D 块形状。XC2 那张 `256x128x8` 的 BC4 闪电 flipbook 被按 16 层排布而不是 8 层，GPU 读到了错位的纹素。
+### 3. 画面修复（`#77`、`#72`，by @Revelans 与 @UrsineBear）
+- **闪电特效紫色条纹（`#77`，by @Revelans）**：非 sparse 3D 纹理的 level-0 块深度改为按切片数取（原来恒为 16），packaged layout 的 byte 0 提供 3D 块形状。XC2 那张 `256x128x8` 的 BC4 闪电 flipbook 被按 16 层排布而不是 8 层，GPU 读到了错位的纹素。
+- **镜像捕获下的面部形变闪烁（`#72`，by @UrsineBear）**：当 `[nvn] mirror_gfx_storage_writeback = 0` 时，图形阶段的 SSBO 写入留在设备本地镜像里，主机内存仍持有形变前的字节。若该 SSBO 的首部或尾部与一个每帧被 CPU 写入的 UBO 共享同一个 4 KiB 页，下次捕获就会用陈旧的主机内存覆盖这些字节。现在会按 GPU 拥有的字节区间切分页范围，这段算术有独立测试组（`gfx_nvn_capture_spans`，7 个用例）。
 
 ### 4. 启动器
 - **右上角语言切换**，和 F1 里那个同一个思路：按钮显示的是「要切过去的语言」，并且不会把你弹回页面顶部。设置页的语言项保留。
