@@ -16,6 +16,8 @@
 // closed ends the process without running the shutdown path. The same thread logs a summary line every 30 s.
 #include <algorithm>
 #include <array>
+
+#include "nxrt/diag.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -476,6 +478,25 @@ PrewarmStats prewarm_stats() {
     std::lock_guard<std::mutex> lk(g_mu);
     return g_stats;
 }
+
+// A device loss or a freeze report should say whether the prewarm was still building. #32 lost the device 40 s into a
+// boss fight, right while the workers had 6242 pipeline parts to build, and nothing in the report could show that - it
+// only showed the driver stack. This line goes into both dumps through diag_add_report().
+static std::string prewarm_report() {
+    const PrewarmStats s = prewarm_stats();
+    const uint64_t done = s.built + s.claimed;
+    const uint64_t outstanding = s.queued > done ? s.queued - done : 0;
+    char buf[320];
+    std::snprintf(buf, sizeof buf,
+                  "pipeline prewarm: %llu queued, %llu built ahead (%llu failed), %llu taken by draws, %llu built by the draw,"
+                  " %llu still outstanding%s\n",
+                  static_cast<unsigned long long>(s.queued), static_cast<unsigned long long>(s.built),
+                  static_cast<unsigned long long>(s.failed), static_cast<unsigned long long>(s.taken),
+                  static_cast<unsigned long long>(s.claimed), static_cast<unsigned long long>(outstanding),
+                  outstanding ? " (the workers were still building when this was written)" : "");
+    return buf;
+}
+const bool prewarm_report_registered = (diag_add_report(prewarm_report), true);
 
 // The game set a program's shaders: its recorded pipelines go first in line. Programs with both a vertex and a fragment shader also get
 // their shader parts queued by the pipeline-library side when the key file has nothing for them.
