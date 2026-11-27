@@ -977,10 +977,12 @@ def step_shaders_package(r, repo, install, py, jobs):
     # only the headless pass is redone; the marker therefore carries the runtime signature it was made against.
     sig = install_runtime_signature(install)
     prefill_stamp = install / "build" / "prefill-stamp.json"
-    if prefilled.is_file() and not link_stamp_matches(prefill_stamp, sig):
+    prefill_stale = prefilled.is_file() and not link_stamp_matches(prefill_stamp, sig)
+    if prefill_stale:
         r.log("  the runtime changed since the shader prefill; running that pass again (the cache is kept)")
-        prefilled = install / "build" / "prefilled.stale"   # keep the old marker for the log, but do not trust it
-    if scanned and prefilled.is_file():
+        if not r.dry:
+            prefilled.unlink(missing_ok=True)
+    if scanned and prefilled.is_file() and not prefill_stale:
         return r.end_step("shaders", started, True, "the shader cache is already there")
     if not scanned:
         tool = first_file(repo / "tools" / "shader" / "cache" / "build_cache.py", repo / "tools" / "shader-cache" / "build_cache.py")

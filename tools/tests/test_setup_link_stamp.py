@@ -64,6 +64,50 @@ class LinkStampTest(unittest.TestCase):
         self.assertIsNone(self.setup.runtime_signature(self.dir / "nope.dll"))
         self.assertFalse(self.setup.link_stamp_matches(self.stamp, None))
 
+    def test_stale_prefill_marker_rechecks_real_path_after_upgrade(self):
+        """Regression for #83: after a runtime upgrade, step_shaders_package must check build/prefilled, not .stale."""
+        install = pathlib.Path(tempfile.mkdtemp())
+        (install / "runtime").mkdir(parents=True)
+        (install / "runtime" / "xc2_rt.dll").write_bytes(b"new-runtime" * 32)
+        spirv = install / "shader_cache" / "spirv"
+        spirv.mkdir(parents=True)
+        (spirv / "results.tsv").write_text("ok\n", encoding="utf-8")
+        (spirv / "0001.spv").write_bytes(b"\x03\x02\x23\x07")
+        (install / "build").mkdir(parents=True)
+        (install / "build" / "prefilled").write_text("old\n", encoding="utf-8")
+        (install / "build" / "prefill-stamp.json").write_text(json.dumps({"size": 1, "mtime": 1}), encoding="utf-8")
+
+        class FakeRunner:
+            dry = False
+            def __init__(self):
+                self.logs = []
+                self.ended = None
+            def step(self, name): return 0.0
+            def log(self, msg): self.logs.append(msg)
+            def note_progress(self, msg): pass
+            def run(self, *args, **kwargs): return 0
+            def end_step(self, name, started, ok, note=""):
+                self.ended = (name, ok, note)
+                return ok
+
+        runner = FakeRunner()
+        orig_prefill = self.setup.prefill_package
+        def fake_prefill(r, repo, inst, py, harness, sp, jobs=0):
+            (inst / "build" / "prefilled").write_text("0 collected: nothing was missing\n", encoding="utf-8")
+            return ""
+        self.setup.prefill_package = fake_prefill
+        try:
+            ok = self.setup.step_shaders_package(runner, ROOT, install, pathlib.Path("python"), jobs=2)
+        finally:
+            self.setup.prefill_package = orig_prefill
+
+        self.assertTrue(ok)
+        self.assertTrue((install / "build" / "prefilled").is_file())
+        self.assertTrue(self.setup.link_stamp_matches(
+            install / "build" / "prefill-stamp.json",
+            self.setup.install_runtime_signature(install),
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()
