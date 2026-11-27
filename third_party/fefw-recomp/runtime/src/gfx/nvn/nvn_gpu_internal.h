@@ -152,7 +152,7 @@ void pool_shutdown();             // destroys every imported pool still alive an
 // and mirror_begin_submit before anything else of a submission (it records the copies of the pages draws wanted; on = this submission may
 // read copies).
 bool mirror_enabled();
-enum ReadUse { kReadVertex = 0, kReadIndex = 1, kReadUniform = 2 };
+enum ReadUse { kReadVertex = 0, kReadIndex = 1, kReadUniform = 2, kReadVertexInst = 3 };
 enum WriteUse { kWriteStorage = 0, kWriteXfb = 1, kWriteImageCopy = 2, kWriteUpdate = 3, kWriteFill = 4, kWriteCopy = 5 };
 BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use);
 // The device-local copy of [gpu_address, +size) for the compute shadows (nvn_replay.cpp): its chunk and offset (buf null: no copy for it, or the
@@ -173,7 +173,7 @@ void mirror_end_submit();   // [nvn] mirror_cpu_snapshot: no submission is recor
 void mirror_destroy(PoolGpu* p);
 // [nvn] mirror_capture (nvn_gpu_pool.cpp): every GPU access to a mirrored pool goes through its copy, filled from submit-time captures
 bool mirror_capture_on();
-BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write, bool gfx_no_wb = false);
+BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write, bool gfx_no_wb = false, bool is_vertex = false);
 void mirror_capture_update(VkCommandBuffer cb, uint64_t gpu_address, const void* data, uint32_t size);
 void mirror_capture_begin(Frame& f);
 std::shared_ptr<void> mirror_capture_take();          // game thread, in the submit call (null: no submit-time capture)

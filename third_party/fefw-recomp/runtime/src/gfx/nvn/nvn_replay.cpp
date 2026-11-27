@@ -4909,7 +4909,7 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
                 const VkDeviceSize want_stride = static_cast<VkDeviceSize>(S.stream[binding].stride);
                 if (!((vb_dirty_mask >> binding) & 1u) && cur.valid && cur.nvn_addr == vb.addr && cur.nvn_size == vb.size && cur.stride == want_stride)
                     continue;
-                BufRef br = vb.addr ? resolve_read(vb.addr, vb.size, kReadVertex) : BufRef{dummy_buffer(), 0, 65536, false, true};
+                BufRef br = vb.addr ? resolve_read(vb.addr, vb.size, S.stream[binding].divisor > 0 ? kReadVertexInst : kReadVertex) : BufRef{dummy_buffer(), 0, 65536, false, true};
                 vbuf[binding] = br.buffer;
                 voff[binding] = br.offset;
                 vsize[binding] = vb.size ? std::min<VkDeviceSize>(vb.size, br.avail) : br.avail;
