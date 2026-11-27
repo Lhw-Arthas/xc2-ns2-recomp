@@ -67,7 +67,7 @@
 // is written with, and every one of them can be changed in the F1 page (controls.ini is the file that page edits).
 static const char* const kXc2SettingsText = R"INI(
 [meta]
-defaults_rev = 12
+defaults_rev = 13
 
 [bindings.all]
 # movement: WASD and the arrow keys
@@ -104,12 +104,15 @@ R = btn_zr
 # the shoulders
 F = btn_l
 G = btn_r
-# menu (Tab); Esc stays cancel (B), which is what people expect. M carries the left-stick click (it was on V).
+# menu (Tab), map / minus (V); Esc stays cancel (B), which is what people expect. M carries the left-stick click.
 Tab = btn_plus
+V = btn_minus
 M = btn_lstick
-# the wheel scrolls: one notch is one d-pad step (menus, lists, the arts palette)
+# the wheel scrolls up/down; Z/C drive d-pad left/right (blade switch, party commands, menus)
 WheelUp = dpad_up
 WheelDown = dpad_down
+Z = dpad_left
+C = dpad_right
 # stick clicks (the left one sits on M, see above)
 Left Ctrl = btn_rstick
 
@@ -118,6 +121,10 @@ Left Ctrl = btn_rstick
 # menu_cursor on, the game's touch path takes the left click before the binding sees it, and Mouse1 = btn_a does
 # nothing (issue #69). Set it back to 1 to use the mouse as a pointer in menus.
 menu_cursor = 0
+
+[display]
+# 16x anisotropic filtering keeps angled ground/distant textures sharp at negligible GPU cost (issue #79).
+anisotropy = 16
 )INI";
 
 // The `all` layer, not `play`: play mode takes the engine's context from the game table's frame callback, and XC2
@@ -149,6 +156,9 @@ static const nxrt::play::GameDefaultAddition kXc2Additions[] = {
     {11, nxrt::play::Ctx::All, "M", nxrt::play::Act::BtnLStick},
     {10, nxrt::play::Ctx::All, "WheelUp", nxrt::play::Act::DpadUp},
     {10, nxrt::play::Ctx::All, "WheelDown", nxrt::play::Act::DpadDown},
+    {13, nxrt::play::Ctx::All, "Z", nxrt::play::Act::DpadLeft},
+    {13, nxrt::play::Ctx::All, "C", nxrt::play::Act::DpadRight},
+    {13, nxrt::play::Ctx::All, "V", nxrt::play::Act::BtnMinus},
     {9, nxrt::play::Ctx::All, "1", nxrt::play::Act::BtnY},
     {9, nxrt::play::Ctx::All, "2", nxrt::play::Act::BtnA},
     {9, nxrt::play::Ctx::All, "3", nxrt::play::Act::BtnB},
@@ -205,6 +215,7 @@ static const nxrt::play::GameVocabulary& xc2_vocabulary() {
 // (rev 12) was on by default until the keyboard/mouse scheme made it take the left click.
 static const nxrt::play::GameDefaultChange kXc2Changes[] = {
     {12, "mouse", "menu_cursor", "1", "0"},
+    {13, "display", "anisotropy", "0", "16"},
 };
 
 static const nxrt::play::GameDefaults& xc2_play_defaults() {
@@ -432,7 +443,8 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
     // Mouse camera: capture the pointer (relative mode, raw and unaccelerated counts) while the game has the focus and no
     // page is open, and turn the counts into right-stick deflection for this frame. The game's own camera curve runs on top,
     // which is why this drives the stick instead of a yaw angle. [xc2] mouse_capture = 0 leaves the pointer to the game.
-    static const bool mouse_cam = nxrt::config_get_bool("xc2", "mouse_capture", true);
+    static const bool ini_mouse_cam = nxrt::config_get_bool("xc2", "mouse_capture", true);
+    const bool mouse_cam = ini_mouse_cam && nxrt::play::live_pad_config().mouse_camera_capture;
     // The gain is the F1 page's [mouse] stick_scale (controls.ini), read live so its slider needs no restart.
     static const bool mouse_invert_y = nxrt::config_get_bool("xc2", "mouse_invert_y", false);
     static bool mouse_held = false;
@@ -662,17 +674,18 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
         py = std::clamp(py - pcfg.ls_center_y, -32767, 32767);
         prx = std::clamp(prx - pcfg.rs_center_x, -32767, 32767);
         pry = std::clamp(pry - pcfg.rs_center_y, -32767, 32767);
-        auto apply_deadzone = [](int &sx, int &sy, float dz) {
+        auto apply_deadzone = [](int &sx, int &sy, float dz, float max_travel) {
             const float fx = static_cast<float>(sx) / 32767.0f;
             const float fy = static_cast<float>(sy) / 32767.0f;
             const float mag = std::sqrt(fx * fx + fy * fy);
             if (mag <= dz || dz >= 0.99f) { sx = 0; sy = 0; return; }
-            const float sc = (std::min)(1.0f, (mag - dz) / (1.0f - dz)) / mag;
+            const float span = (std::max)(0.05f, max_travel - dz);
+            const float sc = (std::min)(1.0f, (mag - dz) / span) / mag;
             sx = std::clamp(static_cast<int>(std::lround(fx * sc * 32767.0f)), -32767, 32767);
             sy = std::clamp(static_cast<int>(std::lround(fy * sc * 32767.0f)), -32767, 32767);
         };
-        apply_deadzone(px, py, pcfg.stick_deadzone);
-        apply_deadzone(prx, pry, pcfg.right_deadzone);
+        apply_deadzone(px, py, pcfg.stick_deadzone, pcfg.stick_max);
+        apply_deadzone(prx, pry, pcfg.right_deadzone, 1.0f);
         if (prx || pry) {
             prx = std::clamp(static_cast<int>(std::lround(static_cast<float>(prx) * pcfg.look_sens)), -32767, 32767);
             pry = std::clamp(static_cast<int>(std::lround(static_cast<float>(pry) * pcfg.look_sens)), -32767, 32767);

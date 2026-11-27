@@ -323,6 +323,7 @@ bool apply_fixed(Sec sec, const std::string& k, const std::string& v, Settings* 
             }
             if (k == "invert_y") return set_bool(&s->mouse.invert_y);
             if (k == "invert_x") return set_bool(&s->mouse.invert_x);
+            if (k == "camera_capture") return set_bool(&s->mouse.camera_capture);
             if (k == "menu_cursor") return set_bool(&s->mouse.menu_cursor);
             if (k == "stick_scale") {
                 double x = 8.0;
@@ -920,6 +921,7 @@ std::string format_settings(const Settings& s) {
     if (s.mouse.alt_pitch_rad != s.mouse.alt_yaw_rad) kv(key_alt_pitch(), num(s.mouse.alt_pitch_rad));   // a vertical of its own, after the pair
     kv("invert_y", flag(s.mouse.invert_y));
     kv("invert_x", flag(s.mouse.invert_x));
+    kv("camera_capture", flag(s.mouse.camera_capture));
     kv("menu_cursor", flag(s.mouse.menu_cursor));
     kv("stick_scale", num(s.mouse.stick_scale));
     kv(key_wheel_cycles(), flag(s.mouse.wheel_cycles));

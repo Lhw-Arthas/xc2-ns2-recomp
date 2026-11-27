@@ -1422,6 +1422,12 @@ void tab_controls(UiHost& host, const LiveStatus& live, Page& p, float bottom_h)
                       "Filters minor left-stick drift near centre.", &pad.stick_deadzone, 0.0, 0.50, 0.02, "%.2f", false, true)) {
         mark(p);
     }
+    if (card_slider_f("ls_max", "左摇杆满推量程", "Left stick outer range",
+                      "达到满速奔跑所需的推杆幅度（0.50 ~ 1.00，实时生效）。如果摇杆推到底只报 0.90 导致人物只能慢走，调低此项即可。",
+                      "Stick travel that counts as full deflection (0.50 - 1.00, live). Lower this if full tilt only reaches ~0.9 and makes the character walk.",
+                      &pad.stick_max, 0.50, 1.00, 0.02, "%.2f", false, true)) {
+        mark(p);
+    }
     if (card_slider_f("rs_dz", "右摇杆死区", "Right stick dead zone",
                       "过滤右摇杆（旋转视角）中心轻微漂移。",
                       "Filters minor right-stick drift near centre.", &pad.right_deadzone, 0.0, 0.50, 0.02, "%.2f", false, true)) {
@@ -1474,6 +1480,12 @@ void tab_controls(UiHost& host, const LiveStatus& live, Page& p, float bottom_h)
         mark(p);
     }
     card_group("鼠标 (应用后实时生效)", "Mouse (Live)");
+    if (card_toggle("mouse_cap", "鼠标锁定视角", "Mouse camera capture",
+                    "开启：游戏聚焦时锁定指针并旋转视角。关闭：释放鼠标指针，适合纯手柄或窗口多任务（实时生效）。",
+                    "On: capture pointer for mouse camera while focused. Off: leave the cursor free (applies live).",
+                    &p.edit.mouse.camera_capture, false, true)) {
+        mark(p);
+    }
     if (card_slider_f("mouse_scale", "鼠标灵敏度", "Mouse sensitivity",
                       "鼠标移动多少计数让右摇杆满偏：数值越小转得越快（1 ~ 60）。",
                       "Mouse counts for a fully deflected right stick: smaller turns faster (1 - 60).",
@@ -1542,10 +1554,13 @@ void tab_controls(UiHost& host, const LiveStatus& live, Page& p, float bottom_h)
                 if (b.ctx != Ctx::All && b.ctx != Ctx::Menu) continue;   // the layers that apply while the game runs
                 rows.push_back(i);
             }
-            if (rows.empty()) continue;
             ++shown;
             ImGui::TextUnformatted(act_label(a));
             ImGui::SameLine(230.0f);
+            if (rows.empty()) {
+                ImGui::TextColored(kDimText, "%s", tr("（未绑定）", "(unbound)"));
+                ImGui::SameLine();
+            }
             for (int idx : rows) {
                 ImGui::PushID(idx);
                 const std::string nm = pretty_input(p.edit.bindings[static_cast<std::size_t>(idx)].in);

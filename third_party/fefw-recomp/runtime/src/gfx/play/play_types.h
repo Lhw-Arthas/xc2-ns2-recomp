@@ -119,6 +119,7 @@ struct MouseSettings {
     bool invert_y = false;                         // false: mouse up looks up
     bool invert_x = false;
     double stick_scale = 8.0;                      // keyboard/mouse camera: mouse counts for a fully deflected right stick (smaller turns faster)
+    bool camera_capture = true;                    // capture pointer (relative mode) for mouse camera while focused (issue #78)
     bool menu_cursor = true;                       // in menus the mouse is a pointer: cursor, hover, click, right click, wheel
     bool wheel_cycles = true;                       // the wheel cycles set A (mpr: the beams; the SetANext / SetAPrev bindings stay either way)
 };

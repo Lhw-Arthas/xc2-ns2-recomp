@@ -279,8 +279,10 @@ struct G {
     std::atomic<bool> pad_cfg_label_abxy{false};
     std::atomic<float> pad_cfg_ls_dz{0.10f};
     std::atomic<float> pad_cfg_rs_dz{0.10f};
+    std::atomic<float> pad_cfg_stick_max{1.0f};
     std::atomic<float> pad_cfg_look_sens{1.0f};
     std::atomic<float> mouse_cfg_stick_scale{8.0f};
+    std::atomic<bool> mouse_cfg_camera_capture{true};
     std::atomic<int> pad_cfg_ls_cx{0}, pad_cfg_ls_cy{0}, pad_cfg_rs_cx{0}, pad_cfg_rs_cy{0};
     std::atomic<float> pad_raw_ls_x{0.0f}, pad_raw_ls_y{0.0f}, pad_raw_rs_x{0.0f}, pad_raw_rs_y{0.0f};
     std::atomic<bool> pad_cfg_invert_y{false};
@@ -351,6 +353,7 @@ void publish_live_pad_config(const PadSettings& p) {
     st.pad_cfg_label_abxy.store(p.label_abxy, std::memory_order_relaxed);
     st.pad_cfg_ls_dz.store(static_cast<float>(std::clamp(p.stick_deadzone, 0.0, 0.5)), std::memory_order_relaxed);
     st.pad_cfg_rs_dz.store(static_cast<float>(std::clamp(p.right_deadzone, 0.0, 0.5)), std::memory_order_relaxed);
+    st.pad_cfg_stick_max.store(static_cast<float>(std::clamp(p.stick_max, 0.5, 1.0)), std::memory_order_relaxed);
     st.pad_cfg_look_sens.store(static_cast<float>(std::clamp(p.look_sens, 0.25, 3.0)), std::memory_order_relaxed);
     st.pad_cfg_invert_y.store(p.invert_y, std::memory_order_relaxed);
     st.pad_cfg_rumble.store(p.rumble, std::memory_order_relaxed);
@@ -362,7 +365,9 @@ void publish_live_pad_config(const PadSettings& p) {
 }
 
 void publish_live_mouse_config(const MouseSettings& m) {
-    g().mouse_cfg_stick_scale.store(static_cast<float>(std::clamp(m.stick_scale, 1.0, 200.0)), std::memory_order_relaxed);
+    G& st = g();
+    st.mouse_cfg_stick_scale.store(static_cast<float>(std::clamp(m.stick_scale, 1.0, 200.0)), std::memory_order_relaxed);
+    st.mouse_cfg_camera_capture.store(m.camera_capture, std::memory_order_relaxed);
 }
 
 // The F1 render quality: the upscaler's input as a share of the output height (table in nxrt/render_quality.h).
@@ -1667,8 +1672,10 @@ LivePadConfig live_pad_config() {
     c.label_abxy = st.pad_cfg_label_abxy.load(std::memory_order_relaxed);
     c.stick_deadzone = st.pad_cfg_ls_dz.load(std::memory_order_relaxed);
     c.right_deadzone = st.pad_cfg_rs_dz.load(std::memory_order_relaxed);
+    c.stick_max = st.pad_cfg_stick_max.load(std::memory_order_relaxed);
     c.look_sens = st.pad_cfg_look_sens.load(std::memory_order_relaxed);
     c.mouse_stick_scale = st.mouse_cfg_stick_scale.load(std::memory_order_relaxed);
+    c.mouse_camera_capture = st.mouse_cfg_camera_capture.load(std::memory_order_relaxed);
     c.ls_center_x = st.pad_cfg_ls_cx.load(std::memory_order_relaxed);
     c.ls_center_y = st.pad_cfg_ls_cy.load(std::memory_order_relaxed);
     c.raw_ls_x = st.pad_raw_ls_x.load(std::memory_order_relaxed);

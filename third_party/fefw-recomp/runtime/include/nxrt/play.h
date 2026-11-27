@@ -68,8 +68,10 @@ struct LivePadConfig {
     bool label_abxy = false;
     float stick_deadzone = 0.10f;
     float right_deadzone = 0.10f;
+    float stick_max = 1.0f;                 // left stick outer-range scale (0.5..1.0; issue #76)
     float look_sens = 1.0f;
-    float mouse_stick_scale = 8.0f;   // keyboard/mouse camera: mouse counts for a full right-stick deflection
+    float mouse_stick_scale = 8.0f;         // keyboard/mouse camera: mouse counts for a full right-stick deflection
+    bool mouse_camera_capture = true;       // live toggle from F1 Mouse group (issue #78)
     int ls_center_x = 0, ls_center_y = 0;   // left-stick centre from the F1 calibration, subtracted before the dead zone
     float raw_ls_x = 0, raw_ls_y = 0;       // the left stick as the pad reports it, for the calibration readout
     int rs_center_x = 0, rs_center_y = 0;
