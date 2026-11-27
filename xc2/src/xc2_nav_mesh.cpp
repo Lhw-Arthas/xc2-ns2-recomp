@@ -1,0 +1,742 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "xc2_nav_mesh.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "nxrt/log.h"
+
+// Use the repo's vendored MIT miniz (inflate only, zero extra build targets).
+#define MINIZ_NO_STDIO
+#define MINIZ_NO_ARCHIVE_APIS
+#define MINIZ_NO_ARCHIVE_WRITING_APIS
+#define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
+#define MINIZ_NO_DEFLATE_APIS
+#include "../../third_party/nxrecomp/tools/setup/third_party/miniz/miniz.c"
+
+namespace xc2::nav {
+namespace {
+
+constexpr const char* kTag = "nav.mesh";
+
+inline uint16_t rd_u16(const uint8_t* p) {
+    uint16_t v = 0;
+    std::memcpy(&v, p, 2);
+    return v;
+}
+inline uint32_t rd_u32(const uint8_t* p) {
+    uint32_t v = 0;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+inline int32_t rd_i32(const uint8_t* p) {
+    int32_t v = 0;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+inline uint64_t rd_u64(const uint8_t* p) {
+    uint64_t v = 0;
+    std::memcpy(&v, p, 8);
+    return v;
+}
+inline float rd_f32(const uint8_t* p) {
+    float v = 0.f;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+
+bool xbc1_decompress(const uint8_t* src, size_t src_len, std::vector<uint8_t>& out) {
+    if (src_len < 0x30 || std::memcmp(src, "xbc1", 4) != 0) return false;
+    const uint32_t unc_sz = rd_u32(src + 0x08);
+    const uint32_t comp_sz = rd_u32(src + 0x0C);
+    if (unc_sz == 0 || unc_sz > 64u * 1024u * 1024u) return false;
+    if (0x30ull + comp_sz > src_len) return false;
+    out.resize(unc_sz);
+    const size_t got = tinfl_decompress_mem_to_mem(
+        out.data(), unc_sz, src + 0x30, comp_sz, TINFL_FLAG_PARSE_ZLIB_HEADER);
+    if (got == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED || got != unc_sz) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+// ---- Minimal bf2.arh ('arh1') trie decoder (read-only, cached once per session) ----
+struct ArhEntry {
+    uint64_t offset = 0;
+    uint32_t comp = 0;
+    uint32_t unc = 0;
+    uint32_t flags = 0;
+};
+
+struct ArhIndex {
+    bool loaded = false;
+    std::filesystem::path ard_path;
+    std::unordered_map<std::string, ArhEntry> by_path;  // lower-case normalized path ("/map/ma05a.winvhe")
+};
+
+std::string to_lower_ascii(std::string s) {
+    for (char& ch : s) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    return s;
+}
+
+bool load_arh_index(const std::filesystem::path& romfs_dir, ArhIndex& out) {
+    out.loaded = true;
+    const auto arh_path = romfs_dir / "bf2.arh";
+    out.ard_path = romfs_dir / "bf2.ard";
+    std::ifstream f(arh_path, std::ios::binary);
+    if (!f) {
+        NXLOG_W(kTag, "bf2.arh not found under %s", romfs_dir.string().c_str());
+        return false;
+    }
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (buf.size() < 0x28 || std::memcmp(buf.data(), "arh1", 4) != 0) return false;
+
+    const uint32_t str_off  = rd_u32(buf.data() + 0x0C);
+    const uint32_t str_sz   = rd_u32(buf.data() + 0x10);
+    const uint32_t trie_off = rd_u32(buf.data() + 0x14);
+    const uint32_t trie_sz  = rd_u32(buf.data() + 0x18);
+    const uint32_t ent_off  = rd_u32(buf.data() + 0x1C);
+    const uint32_t ent_cnt  = rd_u32(buf.data() + 0x20);
+    const uint32_t key      = rd_u32(buf.data() + 0x24);
+
+    if (str_off < 0x28 || str_sz < 4 || trie_off < 0x28 || trie_sz < 8 ||
+        str_off + str_sz > buf.size() || trie_off + trie_sz > buf.size() ||
+        ent_off + static_cast<uint64_t>(ent_cnt) * 24ull > buf.size()) {
+        return false;
+    }
+
+    constexpr uint32_t kTrieXor = 0x0C0CACACu;
+    auto xor4 = [](std::vector<uint8_t>& d, uint32_t k32) {
+        const uint8_t kb[4] = {
+            static_cast<uint8_t>(k32 & 0xFF),
+            static_cast<uint8_t>((k32 >> 8) & 0xFF),
+            static_cast<uint8_t>((k32 >> 16) & 0xFF),
+            static_cast<uint8_t>((k32 >> 24) & 0xFF),
+        };
+        for (size_t i = 0; i < d.size(); ++i) d[i] ^= kb[i & 3];
+    };
+
+    std::vector<uint8_t> dec_str(buf.begin() + str_off, buf.begin() + str_off + str_sz);
+    std::vector<uint8_t> dec_trie(buf.begin() + trie_off, buf.begin() + trie_off + trie_sz);
+    xor4(dec_str, key ^ kTrieXor ^ 0xFFFFFFFFu);
+    xor4(dec_trie, key ^ kTrieXor);
+
+    const size_t trie_n = dec_trie.size() / 8;
+    auto trie_a = [&](size_t i) -> int32_t { return rd_i32(dec_trie.data() + i * 8); };
+    auto trie_b = [&](size_t i) -> int32_t { return rd_i32(dec_trie.data() + i * 8 + 4); };
+    const uint8_t* ents = buf.data() + ent_off;
+
+    for (size_t node = 1; node < trie_n; ++node) {
+        const int32_t a = trie_a(node);
+        const int32_t b = trie_b(node);
+        if (b >= 0) continue;
+        const int32_t par = -b - 1;
+        if (par < 0 || static_cast<size_t>(par) >= trie_n) continue;
+        const int32_t pa = trie_a(static_cast<size_t>(par));
+        if (pa >= 0) continue;
+        const int32_t edge = (-pa - 1) ^ static_cast<int32_t>(node);
+        if (edge < 0 || edge >= 256) continue;
+
+        std::string tail;
+        uint32_t entry_idx = UINT32_MAX;
+        if (a > 0) {
+            size_t nul = static_cast<size_t>(a) + 1;
+            while (nul < dec_str.size() && dec_str[nul] != 0) ++nul;
+            if (nul + 5 > dec_str.size()) continue;
+            tail.assign(reinterpret_cast<const char*>(dec_str.data() + a + 1), nul - (static_cast<size_t>(a) + 1));
+            entry_idx = rd_u32(dec_str.data() + nul + 1);
+        } else if (edge == 0 && a < 0) {
+            entry_idx = static_cast<uint32_t>(-a - 1);
+        } else {
+            continue;
+        }
+        if (entry_idx >= ent_cnt) continue;
+
+        // Walk parent chain back to root (note: .winvhe / .winvda share prefix ".winv" in trie, so check full path after walking)
+        std::string rev;
+        size_t cur = node;
+        bool ok = true;
+        for (int steps = 0; cur > 0; ++steps) {
+            if (steps > 512) { ok = false; break; }
+            const int32_t cb = trie_b(cur);
+            if (cb >= 0) { ok = false; break; }
+            const int32_t p = -cb - 1;
+            if (p < 0 || static_cast<size_t>(p) >= trie_n) { ok = false; break; }
+            const int32_t pa2 = trie_a(static_cast<size_t>(p));
+            if (pa2 >= 0) { ok = false; break; }
+            const int32_t ch = (-pa2 - 1) ^ static_cast<int32_t>(cur);
+            if (ch < 0 || ch >= 256) { ok = false; break; }
+            if (ch != 0) rev.push_back(static_cast<char>(ch));
+            cur = static_cast<size_t>(p);
+        }
+        if (!ok) continue;
+        std::reverse(rev.begin(), rev.end());
+        const std::string full = to_lower_ascii(rev + tail);
+        if (full.find(".winvhe") == std::string::npos && full.find(".winvda") == std::string::npos) continue;
+
+        const uint8_t* ep = ents + static_cast<size_t>(entry_idx) * 24;
+        ArhEntry ae;
+        ae.offset = rd_u64(ep + 0x00);
+        ae.comp   = rd_u32(ep + 0x08);
+        ae.unc    = rd_u32(ep + 0x0C);
+        ae.flags  = rd_u32(ep + 0x10);
+        out.by_path[full] = ae;
+    }
+
+    NXLOG_I(kTag, "indexed %zu navmesh archive files from bf2.arh", out.by_path.size());
+    return !out.by_path.empty();
+}
+
+// ---- Walkable Polygon Graph + Spatial Grid + A* ----
+struct PolyNode {
+    NavVec3 center;
+    uint32_t edge_start = 0;
+    uint16_t edge_count = 0;
+};
+
+struct PolyEdge {
+    uint32_t to = 0;
+    float weight = 0.f;
+    NavVec3 mid;  // midpoint of shared portal edge
+};
+
+struct QuantPt {
+    int32_t x, y, z;
+    bool operator==(const QuantPt& o) const { return x == o.x && y == o.y && z == o.z; }
+    bool operator<(const QuantPt& o) const {
+        if (x != o.x) return x < o.x;
+        if (y != o.y) return y < o.y;
+        return z < o.z;
+    }
+};
+
+struct EdgeKey {
+    QuantPt a, b;
+    bool operator==(const EdgeKey& o) const { return a == o.a && b == o.b; }
+};
+
+struct EdgeKeyHash {
+    size_t operator()(const EdgeKey& k) const noexcept {
+        uint64_t h = 14695981039346656037ull;
+        auto mix = [&](int32_t v) {
+            h ^= static_cast<uint64_t>(static_cast<uint32_t>(v));
+            h *= 1099511628211ull;
+        };
+        mix(k.a.x); mix(k.a.y); mix(k.a.z);
+        mix(k.b.x); mix(k.b.y); mix(k.b.z);
+        return static_cast<size_t>(h);
+    }
+};
+
+struct CellKey {
+    int32_t cx, cz;
+    bool operator==(const CellKey& o) const { return cx == o.cx && cz == o.cz; }
+};
+
+struct CellKeyHash {
+    size_t operator()(const CellKey& c) const noexcept {
+        return static_cast<size_t>(static_cast<uint64_t>(static_cast<uint32_t>(c.cx)) * 73856093ull ^
+                                   static_cast<uint64_t>(static_cast<uint32_t>(c.cz)) * 19349663ull);
+    }
+};
+
+struct MapNavMesh {
+    std::string map_res;
+    std::vector<PolyNode> polys;
+    std::vector<PolyEdge> edges;
+    std::unordered_map<CellKey, std::vector<uint32_t>, CellKeyHash> grid;  // 8m x 8m XZ spatial hash
+    static constexpr float kCellSize = 8.0f;
+
+    int32_t find_nearest(NavVec3 p) const {
+        if (polys.empty()) return -1;
+        const int32_t gx = static_cast<int32_t>(std::floor(p.x / kCellSize));
+        const int32_t gz = static_cast<int32_t>(std::floor(p.z / kCellSize));
+        int32_t best = -1;
+        float best_d2 = 1e30f;
+
+        // Expand ring search in 8m cells (0..6 -> up to 48m radius) for O(1) lookup.
+        for (int rad = 0; rad <= 6; ++rad) {
+            for (int dx = -rad; dx <= rad; ++dx) {
+                for (int dz = -rad; dz <= rad; ++dz) {
+                    if (rad > 0 && std::abs(dx) != rad && std::abs(dz) != rad) continue;
+                    auto it = grid.find({gx + dx, gz + dz});
+                    if (it == grid.end()) continue;
+                    for (uint32_t pid : it->second) {
+                        const NavVec3& c = polys[pid].center;
+                        const float ddx = c.x - p.x;
+                        const float ddy = (c.y - p.y) * 2.2f;  // bias toward matching floor elevation
+                        const float ddz = c.z - p.z;
+                        const float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                        if (d2 < best_d2) {
+                            best_d2 = d2;
+                            best = static_cast<int32_t>(pid);
+                        }
+                    }
+                }
+            }
+            if (best >= 0 && best_d2 < (rad + 1) * (rad + 1) * kCellSize * kCellSize) break;
+        }
+        // Fallback linear scan if player/target is far outside NavMesh bounds
+        if (best < 0) {
+            for (size_t i = 0; i < polys.size(); ++i) {
+                const NavVec3& c = polys[i].center;
+                const float ddx = c.x - p.x, ddy = (c.y - p.y) * 2.2f, ddz = c.z - p.z;
+                const float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                if (d2 < best_d2) { best_d2 = d2; best = static_cast<int32_t>(i); }
+            }
+        }
+        return best;
+    }
+};
+
+inline QuantPt quantize_pt(NavVec3 v) {
+    return {
+        static_cast<int32_t>(std::lround(v.x * 4.0f)),
+        static_cast<int32_t>(std::lround(v.y * 4.0f)),
+        static_cast<int32_t>(std::lround(v.z * 4.0f)),
+    };
+}
+
+bool build_map_navmesh(const ArhIndex& arh, const std::string& map_res, MapNavMesh& out) {
+    const auto t0 = std::chrono::steady_clock::now();
+    out = MapNavMesh{};
+    out.map_res = map_res;
+
+    const std::string res_lo = to_lower_ascii(map_res);
+    const std::string he_key = "/map/" + res_lo + ".winvhe";
+    const std::string da_key = "/map/" + res_lo + ".winvda";
+    auto it_he = arh.by_path.find(he_key);
+    auto it_da = arh.by_path.find(da_key);
+    if (it_he == arh.by_path.end() || it_da == arh.by_path.end()) {
+        NXLOG_I(kTag, "no navmesh archive entry for %s", map_res.c_str());
+        return false;
+    }
+
+    std::ifstream ard(arh.ard_path, std::ios::binary);
+    if (!ard) return false;
+
+    // 1. Read & decompress .winvhe
+    std::vector<uint8_t> he_raw;
+    {
+        const ArhEntry& e = it_he->second;
+        const size_t read_sz = (e.flags == 2) ? (0x30u + e.comp) : (e.comp ? e.comp : e.unc);
+        std::vector<uint8_t> tmp(read_sz);
+        ard.seekg(static_cast<std::streamoff>(e.offset), std::ios::beg);
+        if (!ard.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(read_sz))) return false;
+        if (e.flags == 2) {
+            if (!xbc1_decompress(tmp.data(), tmp.size(), he_raw)) return false;
+        } else {
+            he_raw = std::move(tmp);
+        }
+    }
+    if (he_raw.size() < 0x40 || std::memcmp(he_raw.data(), "NVMS", 4) != 0) return false;
+
+    const uint32_t tile_tbl_off = rd_u32(he_raw.data() + 0x08);
+    const uint32_t tile_cnt     = rd_u32(he_raw.data() + 0x0C);
+    if (tile_tbl_off + static_cast<uint64_t>(tile_cnt) * 16ull > he_raw.size()) return false;
+
+    // 2. Decompress all NVPT tiles from .winvda and collect polygons + quantized shared edges
+    struct EdgeRef {
+        uint32_t poly_id;
+        NavVec3 mid;
+    };
+    std::unordered_map<EdgeKey, std::vector<EdgeRef>, EdgeKeyHash> edge_map;
+    edge_map.reserve(131072);
+    out.polys.reserve(32768);
+
+    const uint64_t da_base = it_da->second.offset;
+    uint32_t tiles_ok = 0;
+    std::vector<uint8_t> comp_buf;
+    std::vector<uint8_t> tile_raw;
+    std::vector<NavVec3> verts;
+
+    for (uint32_t ti = 0; ti < tile_cnt; ++ti) {
+        const uint8_t* te = he_raw.data() + tile_tbl_off + static_cast<size_t>(ti) * 16;
+        const uint32_t off_da = rd_u32(te + 0x04);
+        const uint32_t unc_sz = rd_u32(te + 0x08);
+        if (off_da == 0 || unc_sz == 0) continue;
+
+        uint8_t thdr[0x30];
+        ard.seekg(static_cast<std::streamoff>(da_base + off_da), std::ios::beg);
+        if (!ard.read(reinterpret_cast<char*>(thdr), 0x30)) continue;
+        if (std::memcmp(thdr, "xbc1", 4) != 0) continue;
+        const uint32_t t_comp = rd_u32(thdr + 0x0C);
+        if (t_comp == 0 || t_comp > 16u * 1024u * 1024u) continue;
+        comp_buf.resize(0x30u + t_comp);
+        std::memcpy(comp_buf.data(), thdr, 0x30);
+        if (!ard.read(reinterpret_cast<char*>(comp_buf.data() + 0x30), t_comp)) continue;
+        if (!xbc1_decompress(comp_buf.data(), comp_buf.size(), tile_raw)) continue;
+        if (tile_raw.size() < 0x70 || std::memcmp(tile_raw.data(), "NVPT", 4) != 0) continue;
+        ++tiles_ok;
+
+        const uint32_t poly_off = rd_u32(tile_raw.data() + 0x28);
+        const uint32_t poly_cnt = rd_u32(tile_raw.data() + 0x2C);
+        const uint32_t vert_off = rd_u32(tile_raw.data() + 0x30);
+        const uint32_t vert_cnt = rd_u32(tile_raw.data() + 0x34);
+        const float ox = rd_f32(tile_raw.data() + 0x5C);
+        const float oy = rd_f32(tile_raw.data() + 0x60);
+        const float oz = rd_f32(tile_raw.data() + 0x64);
+        const float sc = rd_f32(tile_raw.data() + 0x68);
+        if (vert_off + static_cast<uint64_t>(vert_cnt) * 6ull > tile_raw.size()) continue;
+        if (poly_off + static_cast<uint64_t>(poly_cnt) * 8ull > tile_raw.size()) continue;
+
+        verts.resize(vert_cnt);
+        for (uint32_t vi = 0; vi < vert_cnt; ++vi) {
+            const uint8_t* vp = tile_raw.data() + vert_off + static_cast<size_t>(vi) * 6;
+            verts[vi] = {ox + rd_u16(vp) * sc, oy + rd_u16(vp + 2) * sc, oz + rd_u16(vp + 4) * sc};
+        }
+
+        for (uint32_t pi = 0; pi < poly_cnt; ++pi) {
+            const uint8_t* pd = tile_raw.data() + poly_off + static_cast<size_t>(pi) * 8;
+            const uint8_t vc = pd[0];
+            const uint32_t idx_off = rd_u32(pd + 4);
+            if (vc < 3 || vc > 32 || idx_off + static_cast<uint64_t>(vc) * 2ull > tile_raw.size()) continue;
+
+            NavVec3 pts[32];
+            uint32_t npts = 0;
+            float sx = 0.f, sy = 0.f, sz = 0.f;
+            for (uint8_t k = 0; k < vc; ++k) {
+                const uint16_t vi = rd_u16(tile_raw.data() + idx_off + static_cast<size_t>(k) * 2);
+                if (vi >= vert_cnt) { npts = 0; break; }
+                pts[npts++] = verts[vi];
+                sx += verts[vi].x;
+                sy += verts[vi].y;
+                sz += verts[vi].z;
+            }
+            if (npts < 3) continue;
+
+            const uint32_t pid = static_cast<uint32_t>(out.polys.size());
+            const float inv = 1.0f / static_cast<float>(npts);
+            PolyNode node;
+            node.center = {sx * inv, sy * inv, sz * inv};
+            out.polys.push_back(node);
+
+            const int32_t gx = static_cast<int32_t>(std::floor(node.center.x / MapNavMesh::kCellSize));
+            const int32_t gz = static_cast<int32_t>(std::floor(node.center.z / MapNavMesh::kCellSize));
+            out.grid[{gx, gz}].push_back(pid);
+
+            for (uint32_t k = 0; k < npts; ++k) {
+                const NavVec3& p0 = pts[k];
+                const NavVec3& p1 = pts[(k + 1) % npts];
+                QuantPt qa = quantize_pt(p0);
+                QuantPt qb = quantize_pt(p1);
+                if (qa == qb) continue;
+                EdgeKey ek = (qa < qb) ? EdgeKey{qa, qb} : EdgeKey{qb, qa};
+                NavVec3 mid{(p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f, (p0.z + p1.z) * 0.5f};
+                edge_map[ek].push_back({pid, mid});
+            }
+        }
+    }
+
+    // 3. Build compact CSR adjacency list
+    std::vector<std::vector<PolyEdge>> adj(out.polys.size());
+    size_t shared_edges = 0;
+    for (const auto& kv : edge_map) {
+        const auto& refs = kv.second;
+        if (refs.size() < 2 || refs.size() > 6) continue;
+        ++shared_edges;
+        for (size_t i = 0; i < refs.size(); ++i) {
+            for (size_t j = i + 1; j < refs.size(); ++j) {
+                const uint32_t a = refs[i].poly_id;
+                const uint32_t b = refs[j].poly_id;
+                if (a == b) continue;
+                const NavVec3& ca = out.polys[a].center;
+                const NavVec3& cb = out.polys[b].center;
+                const float w = std::sqrt((ca.x - cb.x) * (ca.x - cb.x) +
+                                          (ca.y - cb.y) * (ca.y - cb.y) +
+                                          (ca.z - cb.z) * (ca.z - cb.z));
+                adj[a].push_back({b, w, refs[i].mid});
+                adj[b].push_back({a, w, refs[i].mid});
+            }
+        }
+    }
+
+    out.edges.reserve(shared_edges * 2);
+    for (size_t i = 0; i < out.polys.size(); ++i) {
+        out.polys[i].edge_start = static_cast<uint32_t>(out.edges.size());
+        out.polys[i].edge_count = static_cast<uint16_t>(std::min<size_t>(adj[i].size(), 65535u));
+        for (size_t k = 0; k < out.polys[i].edge_count; ++k) {
+            out.edges.push_back(adj[i][k]);
+        }
+    }
+
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    NXLOG_I(kTag, "loaded %s: %u tiles, %zu polys, %zu shared edges in %.1f ms",
+            map_res.c_str(), tiles_ok, out.polys.size(), shared_edges, ms);
+    return !out.polys.empty();
+}
+
+// Smooth portal polyline gently (Laplacian + min spacing) while preserving start/end and ground elevation.
+void smooth_path(std::vector<NavVec3>& pts) {
+    if (pts.size() <= 2) return;
+    // 2 passes of gentle 3-point smoothing on XZ (lighter on Y to hug terrain elevation closely)
+    std::vector<NavVec3> tmp = pts;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (size_t i = 1; i + 1 < pts.size(); ++i) {
+            tmp[i].x = pts[i - 1].x * 0.25f + pts[i].x * 0.5f + pts[i + 1].x * 0.25f;
+            tmp[i].y = pts[i - 1].y * 0.15f + pts[i].y * 0.7f + pts[i + 1].y * 0.15f;
+            tmp[i].z = pts[i - 1].z * 0.25f + pts[i].z * 0.5f + pts[i + 1].z * 0.25f;
+        }
+        pts.swap(tmp);
+    }
+    // Thin out dense points closer than 1.8m so ribbon segments stay clean and uniform
+    std::vector<NavVec3> out;
+    out.reserve(pts.size());
+    out.push_back(pts.front());
+    for (size_t i = 1; i + 1 < pts.size(); ++i) {
+        const NavVec3& prev = out.back();
+        const float dx = pts[i].x - prev.x, dy = pts[i].y - prev.y, dz = pts[i].z - prev.z;
+        if (dx * dx + dy * dy + dz * dz >= 3.24f) {
+            out.push_back(pts[i]);
+        }
+    }
+    out.push_back(pts.back());
+    pts.swap(out);
+}
+
+bool solve_astar(const MapNavMesh& mesh, NavVec3 start_p, NavVec3 goal_p,
+                 std::vector<NavVec3>& out_pts, float& out_len) {
+    out_pts.clear();
+    out_len = 0.f;
+    const int32_t s_id = mesh.find_nearest(start_p);
+    const int32_t g_id = mesh.find_nearest(goal_p);
+    if (s_id < 0 || g_id < 0) return false;
+    if (s_id == g_id) {
+        out_pts.push_back(start_p);
+        out_pts.push_back(goal_p);
+        out_len = std::sqrt((goal_p.x - start_p.x) * (goal_p.x - start_p.x) +
+                            (goal_p.y - start_p.y) * (goal_p.y - start_p.y) +
+                            (goal_p.z - start_p.z) * (goal_p.z - start_p.z));
+        return true;
+    }
+
+    const size_t N = mesh.polys.size();
+    const NavVec3 gc = mesh.polys[g_id].center;
+    auto heur = [&](uint32_t pid) -> float {
+        const NavVec3& c = mesh.polys[pid].center;
+        return std::sqrt((c.x - gc.x) * (c.x - gc.x) +
+                         (c.y - gc.y) * (c.y - gc.y) +
+                         (c.z - gc.z) * (c.z - gc.z));
+    };
+
+    struct QItem {
+        float f;
+        float g;
+        uint32_t id;
+        bool operator>(const QItem& o) const { return f > o.f; }
+    };
+
+    std::vector<float> gscore(N, 1e30f);
+    std::vector<int32_t> parent(N, -1);
+    std::vector<NavVec3> parent_mid(N);
+    std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pq;
+
+    gscore[s_id] = 0.f;
+    pq.push({heur(static_cast<uint32_t>(s_id)), 0.f, static_cast<uint32_t>(s_id)});
+
+    bool found = false;
+    uint32_t expanded = 0;
+    while (!pq.empty() && expanded < 40000u) {
+        const QItem cur = pq.top();
+        pq.pop();
+        if (cur.g > gscore[cur.id]) continue;
+        if (static_cast<int32_t>(cur.id) == g_id) {
+            found = true;
+            break;
+        }
+        ++expanded;
+        const PolyNode& pn = mesh.polys[cur.id];
+        for (uint16_t k = 0; k < pn.edge_count; ++k) {
+            const PolyEdge& e = mesh.edges[pn.edge_start + k];
+            const float ng = cur.g + e.weight;
+            if (ng < gscore[e.to]) {
+                gscore[e.to] = ng;
+                parent[e.to] = static_cast<int32_t>(cur.id);
+                parent_mid[e.to] = e.mid;
+                pq.push({ng + heur(e.to), ng, e.to});
+            }
+        }
+    }
+
+    if (!found) return false;
+
+    // Snap start/goal Y onto the walkable NavMesh floor so the guide line never floats up to cam_tgt.
+    const NavVec3 s_ground{start_p.x, mesh.polys[s_id].center.y, start_p.z};
+    const NavVec3 g_ground{goal_p.x, mesh.polys[g_id].center.y, goal_p.z};
+    out_pts.push_back(g_ground);
+    int32_t cur = g_id;
+    while (cur != s_id && cur >= 0) {
+        out_pts.push_back(parent_mid[cur]);
+        cur = parent[cur];
+    }
+    out_pts.push_back(s_ground);
+    std::reverse(out_pts.begin(), out_pts.end());
+    smooth_path(out_pts);
+
+    float total = 0.f;
+    for (size_t i = 1; i < out_pts.size(); ++i) {
+        const float dx = out_pts[i].x - out_pts[i - 1].x;
+        const float dy = out_pts[i].y - out_pts[i - 1].y;
+        const float dz = out_pts[i].z - out_pts[i - 1].z;
+        total += std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    out_len = total;
+    return true;
+}
+
+// ---- Background worker singleton ----
+struct WorkerState {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::thread thr;
+    bool running = false;
+    bool stop_req = false;
+
+    std::filesystem::path romfs_dir;
+    std::string req_map;
+    NavVec3 req_start{};
+    NavVec3 req_goal{};
+    uint64_t req_gen = 0;
+
+    // Last submitted coords for throttling
+    std::string last_sub_map;
+    NavVec3 last_sub_start{};
+    NavVec3 last_sub_goal{};
+    std::chrono::steady_clock::time_point last_sub_time{};
+
+    // Output snapshot
+    PathResult result;
+};
+
+WorkerState& ws() {
+    static WorkerState s;
+    return s;
+}
+
+void worker_loop() {
+    ArhIndex arh;
+    MapNavMesh mesh;
+    std::string failed_map;
+    uint64_t done_gen = 0;
+
+    while (true) {
+        std::string map_res;
+        NavVec3 start_p{}, goal_p{};
+        std::filesystem::path romfs;
+        {
+            std::unique_lock<std::mutex> lk(ws().mu);
+            ws().cv.wait(lk, [&] { return ws().stop_req || ws().req_gen != done_gen; });
+            if (ws().stop_req) break;
+            done_gen = ws().req_gen;
+            map_res = ws().req_map;
+            start_p = ws().req_start;
+            goal_p = ws().req_goal;
+            romfs = ws().romfs_dir;
+        }
+
+        if (map_res.empty()) continue;
+
+        if (!arh.loaded) {
+            load_arh_index(romfs, arh);
+        }
+
+        if (mesh.map_res != map_res && failed_map != map_res) {
+            if (!build_map_navmesh(arh, map_res, mesh)) {
+                failed_map = map_res;
+                mesh = MapNavMesh{};
+                std::lock_guard<std::mutex> lk(ws().mu);
+                ws().result = PathResult{};
+                ws().result.map_res = map_res;
+                ws().result.loaded = true;
+                ws().result.reachable = false;
+                continue;
+            }
+            failed_map.clear();
+        }
+
+        if (mesh.map_res != map_res || mesh.polys.empty()) continue;
+
+        PathResult pr;
+        pr.map_res = map_res;
+        pr.loaded = true;
+        pr.poly_count = mesh.polys.size();
+        pr.reachable = solve_astar(mesh, start_p, goal_p, pr.points, pr.path_len);
+
+        std::lock_guard<std::mutex> lk(ws().mu);
+        ws().result = std::move(pr);
+    }
+}
+
+}  // namespace
+
+void mesh_init(const std::string& romfs_dir) {
+    std::lock_guard<std::mutex> lk(ws().mu);
+    ws().romfs_dir = std::filesystem::path(romfs_dir);
+    if (!ws().running) {
+        ws().stop_req = false;
+        ws().running = true;
+        ws().thr = std::thread(worker_loop);
+    }
+}
+
+void mesh_shutdown() {
+    std::thread to_join;
+    {
+        std::lock_guard<std::mutex> lk(ws().mu);
+        if (!ws().running) return;
+        ws().stop_req = true;
+        to_join = std::move(ws().thr);
+        ws().running = false;
+    }
+    ws().cv.notify_all();
+    if (to_join.joinable()) to_join.join();
+}
+
+void mesh_update_and_get(const std::string& map_res, NavVec3 player, NavVec3 goal, PathResult& out) {
+    const auto now = std::chrono::steady_clock::now();
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lk(ws().mu);
+        if (ws().running && !map_res.empty()) {
+            const float dp = std::sqrt((player.x - ws().last_sub_start.x) * (player.x - ws().last_sub_start.x) +
+                                       (player.y - ws().last_sub_start.y) * (player.y - ws().last_sub_start.y) +
+                                       (player.z - ws().last_sub_start.z) * (player.z - ws().last_sub_start.z));
+            const float dg = std::sqrt((goal.x - ws().last_sub_goal.x) * (goal.x - ws().last_sub_goal.x) +
+                                       (goal.y - ws().last_sub_goal.y) * (goal.y - ws().last_sub_goal.y) +
+                                       (goal.z - ws().last_sub_goal.z) * (goal.z - ws().last_sub_goal.z));
+            const auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - ws().last_sub_time).count();
+            const bool changed = (map_res != ws().last_sub_map) || (dg > 2.0f) || (dp > 2.5f && dt_ms >= 200);
+            if (changed) {
+                ws().req_map = map_res;
+                ws().req_start = player;
+                ws().req_goal = goal;
+                ws().last_sub_map = map_res;
+                ws().last_sub_start = player;
+                ws().last_sub_goal = goal;
+                ws().last_sub_time = now;
+                ++ws().req_gen;
+                wake = true;
+            }
+        }
+        out = ws().result;
+    }
+    if (wake) ws().cv.notify_one();
+}
+
+}  // namespace xc2::nav

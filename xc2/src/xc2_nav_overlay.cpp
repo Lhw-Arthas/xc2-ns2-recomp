@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "xc2_nav_overlay.h"
+#include "xc2_nav_mesh.h"
 
 #include <algorithm>
 #include <atomic>
@@ -30,6 +31,7 @@ constexpr uint64_t kObjManagerSingleton  = 0x11b3f70;  // ptr -> +0x420228 bitma
 constexpr uint64_t kMenuLocationSingleton = 0x11ac248; // ptr -> cat 4 (+0x18..+0x2C), cat 0..3 (+0x48 + cat*0x430)
 constexpr uint64_t kGmkManagerSingleton   = 0x1070978; // ptr -> +0xF358/+0xF360 GmkSet* vector -> +0x1B8 GmkList*[] ('LDMK')
 constexpr uint64_t kDataBdatSingleton     = 0x0f2d290; // ptr -> +0x10 + idx*8 decrypted BDAT table pointers (526 entries)
+constexpr uint32_t kBdatIdxFldMapList     = 93u;       // [93]  (0x05d) FLD_maplist ("resource" -> "ma05a", etc.)
 constexpr uint32_t kBdatIdxFldLandmarkMsg = 443u;      // [443] (0x1bb) fld_landmark (active language landmark names)
 constexpr uint32_t kFourCcLdmk            = 0x4b4d444cu; // 'LDMK' (TGmkList<GmkLandmark>)
 
@@ -74,7 +76,7 @@ bool safe_read_bytes(uint64_t addr, void* dst, size_t n) {
 }
 
 std::atomic<uint64_t> g_main_base{0};
-std::atomic<bool> g_enabled{true};
+std::atomic<int> g_mode{2};   // 2 = Beacons + Ground Guide Line, 1 = Beacons Only, 0 = Off
 std::atomic<bool> g_debug{false};
 std::atomic<int64_t> g_toast_until_ms{0};
 
@@ -380,6 +382,29 @@ bool read_landmark_localized_name(uint64_t mb, const LandmarkInfo& lm, char* out
     return out[0] != '\0';
 }
 
+bool read_map_resource_name(uint64_t mb, uint32_t map_id, char* out, size_t out_n) {
+    if (!out || out_n < 2 || map_id == 0) return false;
+    out[0] = '\0';
+    uint64_t bdat_mgr = 0, map_tbl = 0;
+    if (!safe_read(mb + off301::kDataBdatSingleton, bdat_mgr) || !bdat_mgr) return false;
+    if (!safe_read(bdat_mgr + 0x10ull + static_cast<uint64_t>(off301::kBdatIdxFldMapList) * 8ull, map_tbl) || !map_tbl) {
+        return false;
+    }
+    uint16_t voff = 0;
+    uint8_t typ = 0;
+    uint64_t row = 0;
+    uint32_t str_tbl_off = 0, str_tbl_sz = 0, str_off = 0;
+    if (!safe_read(map_tbl + 0x18, str_tbl_off) || !safe_read(map_tbl + 0x1C, str_tbl_sz)) return false;
+    const uint64_t tbl_end = static_cast<uint64_t>(str_tbl_off) + static_cast<uint64_t>(str_tbl_sz);
+    if (tbl_end < 0x20ull || tbl_end > 64ull * 1024ull * 1024ull) return false;
+    if (!bdat_find_column(map_tbl, "resource", voff, typ) || !bdat_row_addr(map_tbl, map_id, row)) return false;
+    if (!safe_read(row + voff, str_off) || str_off == 0 || str_off >= tbl_end) return false;
+    const size_t max_read = static_cast<size_t>(std::min<uint64_t>(out_n - 1, tbl_end - str_off));
+    if (max_read == 0 || !safe_read_bytes(map_tbl + str_off, out, max_read)) return false;
+    out[max_read] = '\0';
+    return out[0] != '\0';
+}
+
 void collect_landmarks(uint64_t mb, std::vector<LandmarkInfo>& out) {
     uint64_t gmk_mgr = 0;
     if (!safe_read(mb + off301::kGmkManagerSingleton, gmk_mgr) || !gmk_mgr) return;
@@ -597,8 +622,10 @@ void draw_edge_arrow(const nxrt::gfx::HudCanvas& c, float sx, float sy, float sc
 void draw_toast(const nxrt::gfx::HudCanvas& c, float scale) {
     const int64_t until = g_toast_until_ms.load(std::memory_order_relaxed);
     if (until <= 0 || now_ms() > until) return;
-    const bool on = g_enabled.load(std::memory_order_relaxed);
-    const char* msg = on ? "3D 任务指引：已开启 (F3)" : "3D 任务指引：已关闭 (F3)";
+    const int mode = g_mode.load(std::memory_order_relaxed);
+    const char* msg = (mode == 2) ? "3D 任务指引：信标 + 地面引导线 (F3)"
+                    : (mode == 1) ? "3D 任务指引：仅 3D 信标 (F3)"
+                                  : "3D 任务指引：已关闭 (F3)";
     const float sz = 16.f * scale;
     float tw = 0.f, th = 0.f;
     c.measure_text(sz, msg, &tw, &th);
@@ -606,8 +633,104 @@ void draw_toast(const nxrt::gfx::HudCanvas& c, float scale) {
     const float x0 = (static_cast<float>(c.width) - tw) * 0.5f - pad_x;
     const float y0 = 56.f * scale;
     c.rect_filled(x0, y0, x0 + tw + 2.f * pad_x, y0 + th + 2.f * pad_y, 0x0B1018D8u, 6.f * scale);
-    c.rect(x0, y0, x0 + tw + 2.f * pad_x, y0 + th + 2.f * pad_y, on ? 0x4FC3F7CCu : 0x90A4AEAAu, 6.f * scale, 1.f);
-    c.text_outlined(x0 + pad_x, y0 + pad_y, sz, on ? 0xE1F5FEFFu : 0xCFD8DCFFu, 0x000000CCu, msg);
+    c.rect(x0, y0, x0 + tw + 2.f * pad_x, y0 + th + 2.f * pad_y, mode > 0 ? 0x4FC3F7CCu : 0x90A4AEAAu, 6.f * scale, 1.f);
+    c.text_outlined(x0 + pad_x, y0 + pad_y, sz, mode > 0 ? 0xE1F5FEFFu : 0xCFD8DCFFu, 0x000000CCu, msg);
+}
+
+// Clip a 3D world segment against the camera near plane (clip.w >= kNearW) and project to screen.
+bool clip_and_project_seg(const float m[16], const NavVec3& a, const NavVec3& b,
+                          float W, float H, float& sx0, float& sy0, float& sx1, float& sy1) {
+    constexpr float kNearW = 0.35f;
+    auto to_clip = [&](const NavVec3& v, float out[4]) {
+        out[0] = v.x * m[0] + v.y * m[4] + v.z * m[8]  + m[12];
+        out[1] = v.x * m[1] + v.y * m[5] + v.z * m[9]  + m[13];
+        out[2] = v.x * m[2] + v.y * m[6] + v.z * m[10] + m[14];
+        out[3] = v.x * m[3] + v.y * m[7] + v.z * m[11] + m[15];
+    };
+    float c0[4], c1[4];
+    to_clip(a, c0);
+    to_clip(b, c1);
+    const bool in0 = (c0[3] >= kNearW);
+    const bool in1 = (c1[3] >= kNearW);
+    if (!in0 && !in1) return false;
+    if (!in0 || !in1) {
+        const float denom = c0[3] - c1[3];
+        if (std::fabs(denom) < 1e-6f) return false;
+        const float t = std::clamp((c0[3] - kNearW) / denom, 0.f, 1.f);
+        float cm[4];
+        for (int i = 0; i < 4; ++i) cm[i] = c0[i] + (c1[i] - c0[i]) * t;
+        if (!in0) std::memcpy(c0, cm, sizeof cm);
+        else      std::memcpy(c1, cm, sizeof cm);
+    }
+    if (c0[3] < 1e-4f || c1[3] < 1e-4f) return false;
+    sx0 = (c0[0] / c0[3] * 0.5f + 0.5f) * W;
+    sy0 = (0.5f - c0[1] / c0[3] * 0.5f) * H;
+    sx1 = (c1[0] / c1[3] * 0.5f + 0.5f) * W;
+    sy1 = (0.5f - c1[1] / c1[3] * 0.5f) * H;
+    // Reject wildly off-screen segments
+    if ((sx0 < -W && sx1 < -W) || (sx0 > 2.f * W && sx1 > 2.f * W) ||
+        (sy0 < -H && sy1 < -H) || (sy0 > 2.f * H && sy1 > 2.f * H)) return false;
+    return true;
+}
+
+void draw_ground_guide_line(const nxrt::gfx::HudCanvas& c, const float vp[16],
+                            const Vec3& player, const std::vector<NavVec3>& pts,
+                            uint32_t base_col, float scale) {
+    if (pts.size() < 2) return;
+    const float W = static_cast<float>(c.width);
+    const float H = static_cast<float>(c.height);
+    const float lift = 0.50f;  // lift 50 cm above walkable NavMesh so ribbon floats cleanly over grass
+
+    // Animated pulse phase moving forward along the path (18 m/s)
+    const double t_sec = static_cast<double>(now_ms()) * 0.001;
+    const float pulse_phase = static_cast<float>(std::fmod(t_sec * 18.0, 12.0));
+
+    float accum_d = 0.f;
+    for (size_t i = 0; i + 1 < pts.size(); ++i) {
+        NavVec3 p0{pts[i].x, pts[i].y + lift, pts[i].z};
+        NavVec3 p1{pts[i + 1].x, pts[i + 1].y + lift, pts[i + 1].z};
+        const float seg_len = std::sqrt((p1.x - p0.x) * (p1.x - p0.x) +
+                                        (p1.y - p0.y) * (p1.y - p0.y) +
+                                        (p1.z - p0.z) * (p1.z - p0.z));
+        const float mx = (p0.x + p1.x) * 0.5f - player.x;
+        const float my = (p0.y + p1.y) * 0.5f - player.y;
+        const float mz = (p0.z + p1.z) * 0.5f - player.z;
+        const float dist = std::sqrt(mx * mx + my * my + mz * mz);
+
+        // Fade out gently beyond 220m so distant mountain silhouettes stay clean,
+        // and skip the first 1.8m right under the player's body.
+        const float path_mid = accum_d + seg_len * 0.5f;
+        if (dist > 260.f || path_mid < 1.8f) {
+            accum_d += seg_len;
+            continue;
+        }
+        float alpha = 1.0f;
+        if (dist > 140.f) alpha = std::clamp(1.0f - (dist - 140.f) / 120.f, 0.15f, 1.0f);
+        if (path_mid < 4.5f) alpha *= std::clamp((path_mid - 1.8f) / 2.7f, 0.15f, 1.0f);
+
+        float sx0, sy0, sx1, sy1;
+        if (clip_and_project_seg(vp, p0, p1, W, H, sx0, sy0, sx1, sy1)) {
+            const float near_boost = std::clamp(1.35f - dist * 0.008f, 0.65f, 1.35f);
+            const uint32_t a_out = static_cast<uint32_t>(alpha * 155.f) & 0xFFu;
+            const uint32_t a_core = static_cast<uint32_t>(alpha * 225.f) & 0xFFu;
+            c.line(sx0, sy0, sx1, sy1, 0x04121E00u | a_out, 5.5f * scale * near_boost);
+            c.line(sx0, sy0, sx1, sy1, (base_col & 0xFFFFFF00u) | a_core, 2.8f * scale * near_boost);
+
+            // Flowing bright bead every 12 m along the path gliding toward the objective
+            const float d0 = std::fmod(accum_d - pulse_phase + 12000.f, 12.0f);
+            if (seg_len > 0.1f && d0 < seg_len) {
+                const float frac = d0 / seg_len;
+                const float bx = sx0 + (sx1 - sx0) * frac;
+                const float by = sy0 + (sy1 - sy0) * frac;
+                if (bx >= 16.f && bx <= W - 16.f && by >= 16.f && by <= H - 16.f) {
+                    const float br = 4.2f * scale * near_boost;
+                    c.circle_filled(bx, by, br + 1.5f * scale, 0x04121E00u | a_out);
+                    c.circle_filled(bx, by, br, 0xFFFFFF00u | a_core);
+                }
+            }
+        }
+        accum_d += seg_len;
+    }
 }
 
 }  // namespace
@@ -616,28 +739,36 @@ void init(uint64_t main_base) {
     g_main_base.store(main_base, std::memory_order_relaxed);
     const bool en = nxrt::config_get_bool("xc2", "nav_overlay", true);
     const bool dbg = nxrt::config_get_bool("xc2", "nav_debug", false);
-    g_enabled.store(en, std::memory_order_relaxed);
+    g_mode.store(en ? 2 : 0, std::memory_order_relaxed);
     g_debug.store(dbg, std::memory_order_relaxed);
-    NXLOG_I(kTag, "3D nav overlay ready (main=0x%llx, enabled=%d, debug=%d, toggle=F3)",
-            static_cast<unsigned long long>(main_base), en ? 1 : 0, dbg ? 1 : 0);
+    const std::string romfs = nxrt::config_get_str("fs", "romfs", "game/romfs");
+    mesh_init(romfs);
+    NXLOG_I(kTag, "3D nav overlay ready (main=0x%llx, mode=%d, debug=%d, romfs=%s, toggle=F3)",
+            static_cast<unsigned long long>(main_base), en ? 2 : 0, dbg ? 1 : 0, romfs.c_str());
+}
+
+void shutdown() {
+    mesh_shutdown();
 }
 
 void toggle() {
-    const bool next = !g_enabled.load(std::memory_order_relaxed);
-    g_enabled.store(next, std::memory_order_relaxed);
-    g_toast_until_ms.store(now_ms() + 2200, std::memory_order_relaxed);
-    NXLOG_I(kTag, "3D nav overlay %s (F3)", next ? "ON" : "OFF");
+    const int cur = g_mode.load(std::memory_order_relaxed);
+    const int next = (cur == 2) ? 1 : (cur == 1) ? 0 : 2;
+    g_mode.store(next, std::memory_order_relaxed);
+    g_toast_until_ms.store(now_ms() + 2400, std::memory_order_relaxed);
+    NXLOG_I(kTag, "3D nav overlay mode=%d (F3)", next);
 }
 
 bool enabled() {
-    return g_enabled.load(std::memory_order_relaxed);
+    return g_mode.load(std::memory_order_relaxed) > 0;
 }
 
 void draw(const nxrt::gfx::HudCanvas& c) {
     if (c.width < 320 || c.height < 240) return;
     const float scale = std::clamp(static_cast<float>(c.height) / 1080.f, 0.75f, 2.25f);
     draw_toast(c, scale);
-    if (!g_enabled.load(std::memory_order_relaxed)) return;
+    const int mode = g_mode.load(std::memory_order_relaxed);
+    if (mode <= 0) return;
 
     const uint64_t mb = g_main_base.load(std::memory_order_relaxed);
     if (!mb) return;
@@ -720,6 +851,19 @@ void draw(const nxrt::gfx::HudCanvas& c) {
         }
     }
 
+    // 4b. Tier-3 async NavMesh ground guide line (mode == 2, non-blocking).
+    PathResult nav_path;
+    char map_res[32] = {};
+    if (mode >= 2 && !markers.empty() && read_map_resource_name(mb, map_id, map_res, sizeof map_res)) {
+        mesh_update_and_get(map_res,
+                            {player.x, player.y, player.z},
+                            {markers[0].pos.x, markers[0].pos.y, markers[0].pos.z},
+                            nav_path);
+        if (nav_path.reachable && nav_path.map_res == map_res && nav_path.points.size() >= 2) {
+            draw_ground_guide_line(c, vp, player, nav_path.points, kind_color(markers[0].kind), scale);
+        }
+    }
+
     // 5. Project and draw markers (draw secondary markers first so primary sits on top).
     const float W = static_cast<float>(c.width);
     const float H = static_cast<float>(c.height);
@@ -752,13 +896,20 @@ void draw(const nxrt::gfx::HudCanvas& c) {
 
     // 6. Optional debug telemetry strip ([xc2] nav_debug = 1).
     if (g_debug.load(std::memory_order_relaxed)) {
-        char dbg[256];
+        char dbg[320];
         if (!markers.empty()) {
+            char pinfo[64] = {};
+            if (nav_path.reachable && nav_path.map_res == map_res) {
+                std::snprintf(pinfo, sizeof pinfo, " | path=%.0fm(%zu)", nav_path.path_len, nav_path.points.size());
+            } else if (map_res[0]) {
+                std::snprintf(pinfo, sizeof pinfo, " | mesh=%s(%s)", map_res, nav_path.loaded ? "unreach" : "loading");
+            }
             std::snprintf(dbg, sizeof dbg,
-                          "NAV map=%u | P(%.1f, %.1f, %.1f) | T0(%.1f, %.1f, %.1f) d=%.0fm dy=%+.0fm | loc=%zu lm=%zu",
-                          map_id, player.x, player.y, player.z,
+                          "NAV map=%u(%s) | P(%.1f, %.1f, %.1f) | T0(%.1f, %.1f, %.1f) d=%.0fm dy=%+.0fm | loc=%zu lm=%zu%s",
+                          map_id, map_res[0] ? map_res : "?",
+                          player.x, player.y, player.z,
                           markers[0].pos.x, markers[0].pos.y, markers[0].pos.z,
-                          markers[0].dist, markers[0].dy, markers.size(), landmarks.size());
+                          markers[0].dist, markers[0].dy, markers.size(), landmarks.size(), pinfo);
         } else {
             std::snprintf(dbg, sizeof dbg,
                           "NAV map=%u | P(%.1f, %.1f, %.1f) | loc=0 lm=%zu",

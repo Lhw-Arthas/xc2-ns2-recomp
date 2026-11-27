@@ -12,8 +12,9 @@ namespace xc2::nav {
 
 // Initialize with the guest main module base (typically 0x7100000000) and read [xc2] nav_overlay / nav_debug config.
 void init(uint64_t main_base);
+void shutdown();
 
-// Toggle visibility live (e.g. F3 hotkey); shows a brief on-screen toast and logs the new state.
+// Cycle display mode live (F3 hotkey): 2 = Beacons + Ground Guide Line, 1 = Beacons Only, 0 = Off.
 void toggle();
 bool enabled();
 
