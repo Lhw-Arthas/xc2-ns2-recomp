@@ -1366,7 +1366,7 @@ CapArena* arena_get(uint64_t need) {
     return a;
 }
 void arena_put(CapArena* a) {
-    if (a->buf.size == kArenaBytes) {
+    if (a->buf.size == kArenaBytes && !device().device_lost()) {
         std::lock_guard<std::mutex> lk(g_arena_mu);
         if (g_arena_free.size() < 64) { g_arena_free.push_back(a); return; }
     }
@@ -1380,12 +1380,15 @@ struct MirrorCapture {
     std::vector<CapRun> runs;
     std::vector<std::pair<Mirror*, uint64_t>> lost;   // pages that did not fit: no longer current in the copy
     int64_t ns = 0;
+    ~MirrorCapture() {
+        for (CapArena* a : arenas) arena_put(a);
+    }
 };
 std::shared_ptr<MirrorCapture> g_cap_next;   // render thread: the capture of the submission about to start (mirror_capture_set)
 }  // namespace
 
 std::shared_ptr<void> mirror_capture_take() {
-    if (!mirror_capture_on() || !cap_at_submit()) return nullptr;
+    if (!mirror_capture_on() || !cap_at_submit() || device().device_lost()) return nullptr;
     NXFT_MIN("mirror.take", 500000);
     const auto t0 = std::chrono::steady_clock::now();
     auto cap = std::make_shared<MirrorCapture>();

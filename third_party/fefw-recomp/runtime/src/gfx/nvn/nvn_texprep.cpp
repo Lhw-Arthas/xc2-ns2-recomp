@@ -266,7 +266,7 @@ void worker_main() {
                 bool made = false;
                 {
                     std::lock_guard<std::mutex> slk(s_stage_mu);
-                    made = !s.quiesced.load() &&
+                    made = !s.quiesced.load() && !gpu::device().device_lost() &&
                            gpu::device().create_buffer(res->data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gfx::MemoryUse::Upload, &stage, "nvn staging (prepared)") == VK_SUCCESS &&
                            stage.mapped != nullptr;
                 }

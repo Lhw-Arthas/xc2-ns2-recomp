@@ -21,6 +21,10 @@ This directory is a **modified fork** of `Goldoire/fefw-recomp` (the original Gi
 
 | `file` | date | change |
 |---|---|---|
+| `runtime/src/gfx/nvn/nvn_gpu.cpp` | 2026-11-27 | stop post-`VK_ERROR_DEVICE_LOST` memory explosion (#81, #41): drain `deferred` destroys and free cached upload chunks in `retire()` on `device_lost()`, short-circuit `submit()` / `submit_on_render_thread()` / `serial_done()` on `device_lost()`, drain deferred destroys on `present()` when lost, and only grow a new `VkDescriptorPool` in `Frame::alloc_set()` on `VK_ERROR_OUT_OF_POOL_MEMORY` / `VK_ERROR_FRAGMENTED_POOL` |
+| `runtime/src/gfx/nvn/nvn_gpu_pool.cpp` | 2026-11-27 | skip `mirror_capture_take()` on `device_lost()`, destroy returned `CapArena` buffers immediately when lost instead of caching, and add `~MirrorCapture()` so dropped captures never leak arenas (#81) |
+| `runtime/src/gfx/nvn/nvn_texprep.cpp` | 2026-11-27 | skip VMA staging buffer creation in background `nvn-texprep` workers once `device_lost()` is latched (#81) |
+| `runtime/tests/gfx/test_nvn_texgpu.cpp` | 2026-11-27 | add `device_lost_drains_deferred_and_stops_recording` regression test for post-`DEVICE_LOST` retirement and recording short-circuit (#81, #41) |
 | `runtime/include/nxrt/play.h` | 2026-11-27 | add `LivePadConfig::stick_max` (#76) and `LivePadConfig::mouse_camera_capture` (#78); new `play::publish_raw_left_stick()` / `publish_raw_right_stick()` for the F1 calibration readout; new `play::binding_output()` and `play::set_external_mouse_capture()` |
 | `runtime/src/gfx/play/play.cpp` | 2026-11-27 | publish `pad.stick_max` (#76) and `mouse.camera_capture` (#78) live alongside centre calibration and `mouse.stick_scale`; external mouse capture coordination |
 | `runtime/src/gfx/play/play_types.h` | 2026-11-27 | `MouseSettings::camera_capture` (#78); `PadSettings::ls_center_x/y` and `rs_center_x/y` (stick calibration, issue #76); `MouseSettings::stick_scale` |

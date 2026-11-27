@@ -1488,3 +1488,45 @@ NXTEST(hudless_copy_rules) {
     }
     teardown(r);
 }
+
+// ---- device_lost: stop recording/capturing and drain defer_destroy closures (#81, #41) -----------------------------------------------
+NXTEST(device_lost_drains_deferred_and_stops_recording) {
+    // Validation is disabled here because simulating note_device_lost() on a live VkDevice queries vkGetDeviceFaultInfoEXT,
+    // which the validation layer rejects (VUID-vkGetDeviceFaultInfoEXT-device-07336) when the hardware device is not truly lost.
+    no_cache();
+    DeviceDesc dd;
+    dd.validation = 0;
+    dd.headless = 1;
+    std::string err;
+    std::unique_ptr<Device> dev = Device::create(dd, &err);
+    if (!dev) {
+        CHECK_MSG(false, err);
+        return;
+    }
+    const uint64_t baseline_allocs = dev->memory_stats().allocations;
+    REQUIRE(gpu::init_for_test(*dev, nullptr));
+    {
+        dev->note_device_lost(VK_ERROR_DEVICE_LOST, "unit test simulated device loss");
+        CHECK(dev->device_lost());
+
+        int destroyed = 0;
+        gpu::defer_destroy([&] { ++destroyed; });
+
+        int recorded = 0;
+        const uint64_t s1 = gpu::run_frame_sync([&](Frame&) { ++recorded; });
+        CHECK_EQ(recorded, 0);
+        CHECK_EQ(destroyed, 1);
+        CHECK(gpu::serial_done(s1));
+
+        const uint64_t s2 = gpu::submit({});
+        CHECK(s2 > s1);
+        CHECK(gpu::serial_done(s2));
+        CHECK(gpu::wait_serial(s2, 1000000ull));
+        CHECK(gpu::mirror_capture_take() == nullptr);
+    }
+    gpu::finish();
+    gpu::run_on_render_thread([] { gpu::tex_shutdown(); });
+    gpu::shutdown_for_test();
+    CHECK_EQ(dev->memory_stats().allocations, baseline_allocs);
+    dev.reset();
+}

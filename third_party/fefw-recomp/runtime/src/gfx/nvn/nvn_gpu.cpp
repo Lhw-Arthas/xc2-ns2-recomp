@@ -180,7 +180,11 @@ void drain_pending_destroy() {
 
 void retire(int64_t budget_ns = 0) {
     drain_pending_destroy();
-    const uint64_t done = read_completed();
+    const bool lost = g->dev->device_lost();
+    // Per the Vulkan spec, once VK_ERROR_DEVICE_LOST is observed all previously submitted commands are terminated and
+    // destroying child objects of the lost device remains valid. Without draining here, defer_destroy closures (such as
+    // mirror_capture CapArenas, textures, and pools) leak unboundedly after device loss (#81).
+    const uint64_t done = lost ? UINT64_MAX : read_completed();
     const auto t0 = budget_ns > 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     size_t ran = 0;
     while (!g->deferred.empty() && g->deferred.front().serial <= done) {
@@ -189,7 +193,7 @@ void retire(int64_t budget_ns = 0) {
         g_gauge_deferred.sub(1);
         fn();
         ++ran;
-        if (budget_ns > 0 && ran >= 4 &&
+        if (!lost && budget_ns > 0 && ran >= 4 &&
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count() >= budget_ns)
             break;
     }
@@ -200,7 +204,7 @@ void retire(int64_t budget_ns = 0) {
         if (!s.serial || s.serial > done) continue;
         if (!s.upload_overflow.empty()) {
             for (auto& b : s.upload_overflow) {
-                if (g->upload_pool.size() < kUploadPoolMax) g->upload_pool.push_back(b);
+                if (!lost && g->upload_pool.size() < kUploadPoolMax) g->upload_pool.push_back(b);
                 else g->dev->destroy_buffer(b);
             }
             s.upload_overflow.clear();
@@ -210,6 +214,10 @@ void retire(int64_t budget_ns = 0) {
             for (auto& b : s.extra) g->dev->destroy_buffer(b);
             s.extra.clear();
         }
+    }
+    if (lost && !g->upload_pool.empty()) {
+        for (auto& b : g->upload_pool) g->dev->destroy_buffer(b);
+        g->upload_pool.clear();
     }
 }
 
@@ -613,6 +621,7 @@ void Frame::defer(std::function<void()> fn) {
 }
 
 VkDescriptorSet Frame::alloc_set(VkDescriptorSetLayout layout) {
+    if (g->dev->device_lost()) return VK_NULL_HANDLE;
     Slot& s = *static_cast<Slot*>(slot);
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (s.dpool_cur >= s.dpools.size()) {
@@ -632,6 +641,13 @@ VkDescriptorSet Frame::alloc_set(VkDescriptorSetLayout layout) {
             vk_gauge_descriptor_sets().add(1);
             return set;
         }
+        if (r == VK_ERROR_DEVICE_LOST) {
+            g->dev->note_device_lost(r, "nvn Frame::alloc_set(vkAllocateDescriptorSets)");
+            return VK_NULL_HANDLE;
+        }
+        // Only grow a fresh descriptor pool when the current one is actually full/fragmented; other errors (e.g.
+        // VK_ERROR_OUT_OF_DEVICE_MEMORY) must not spin creating hundreds of multi-megabyte pools (#41).
+        if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) return VK_NULL_HANDLE;
         ++s.dpool_cur;   // exhausted or fragmented: move on to the next pool (created on demand)
     }
     return VK_NULL_HANDLE;
@@ -853,6 +869,23 @@ VkCommandBuffer end_prologue(Slot& s) {
 }
 
 uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint64_t serial = 0) {
+    if (g->dev->device_lost()) {
+        if (!serial) {
+            std::lock_guard<std::mutex> lk(g->qmu);
+            serial = g->reserved.fetch_add(1) + 1;
+        }
+        if (serial > g->submitted) {
+            g->submitted = serial;
+            g->last_submitted.store(serial);
+        }
+        if (serial > g->flushed) {
+            g->flushed = serial;
+            g->flushed_pub.store(serial);
+            after_flush(serial);
+        }
+        retire();
+        return serial;
+    }
     NXFT("replay");
     nxrt::HitchTimer ht_replay(nxrt::kHpRenderReplay);
     const auto t0 = std::chrono::steady_clock::now();
@@ -1095,6 +1128,7 @@ bool async_submit() {
 
 uint64_t submit(const std::vector<Ref<CmdList>>& lists) {
     if (!g) return ++g_idle_serial;
+    if (g->dev->device_lost()) return g->reserved.fetch_add(1) + 1;
     NXFT("submit");
     // [nvn] mirror_capture: the CPU's writes since the last submit are copied now, before the game can write its next frame; capture and
     // queueing under one lock, so captures stay in queue order
@@ -1123,6 +1157,7 @@ void finish() {
 
 bool serial_done(uint64_t serial) {
     if (!g || !serial) return true;
+    if (g->dev->device_lost()) return true;
     if (g->completed.load() >= serial) return true;
     if (read_completed() >= serial) return true;
     want_flush(serial);     // polled: it must reach the GPU to ever complete
@@ -1262,7 +1297,10 @@ void present(Window* window, int index) {
     }();
     if (ahead == 0 || on_render_thread()) {
         Ref<Window> keep = Ref<Window>::share(window);
-        run_on_render_thread([&] { present_on_render_thread(window, index); });
+        run_on_render_thread([&] {
+            present_on_render_thread(window, index);
+            if (g->dev->device_lost()) retire();
+        });
         return;
     }
     {
@@ -1283,6 +1321,7 @@ void present(Window* window, int index) {
             });
             test_throw(g_test_presents);
             present_on_render_thread(keep.get(), index);
+            if (g->dev->device_lost()) retire();
         });
         g_gauge_render_queue.add(1);
     }
