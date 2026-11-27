@@ -23,6 +23,12 @@ struct PathResult {
     size_t poly_count = 0;
 };
 
+struct LvbLandmark {
+    NavVec3 pos;
+    uint32_t hash_id = 0;
+    std::string name;  // e.g. "landmark_ma17a_001"
+};
+
 // Initialize / shut down the background worker (safe to call multiple times).
 void mesh_init(const std::string& romfs_dir);
 void mesh_shutdown();
@@ -30,5 +36,8 @@ void mesh_shutdown();
 // Non-blocking: submits the latest (map_res, player_pos, goal_pos) to the background worker if moved enough,
 // and copies the latest completed PathResult snapshot for the render thread.
 void mesh_update_and_get(const std::string& map_res, NavVec3 player, NavVec3 goal, PathResult& out);
+
+// Cached lightweight lookup of /gmk/<map_res>_landmark.lvb from bf2.arh/bf2.ard (for cross-map nearest skip-travel hints).
+bool mesh_get_map_landmarks(const std::string& map_res, std::vector<LvbLandmark>& out);
 
 }  // namespace xc2::nav

@@ -188,7 +188,9 @@ bool load_arh_index(const std::filesystem::path& romfs_dir, ArhIndex& out) {
         if (!ok) continue;
         std::reverse(rev.begin(), rev.end());
         const std::string full = to_lower_ascii(rev + tail);
-        if (full.find(".winvhe") == std::string::npos && full.find(".winvda") == std::string::npos) continue;
+        const bool is_nav = (full.find(".winvhe") != std::string::npos || full.find(".winvda") != std::string::npos);
+        const bool is_lmk = (full.find("_landmark.lvb") != std::string::npos);
+        if (!is_nav && !is_lmk) continue;
 
         const uint8_t* ep = ents + static_cast<size_t>(entry_idx) * 24;
         ArhEntry ae;
@@ -660,6 +662,10 @@ struct WorkerState {
 
     // Output snapshot
     PathResult result;
+
+    // Cached LVLB landmark lists per map_res (for cross-map nearest skip-travel lookup)
+    std::unordered_map<std::string, std::vector<LvbLandmark>> lvb_cache;
+    ArhIndex lvb_arh;
 };
 
 WorkerState& ws() {
@@ -775,6 +781,82 @@ void mesh_update_and_get(const std::string& map_res, NavVec3 player, NavVec3 goa
         out = ws().result;
     }
     if (wake) ws().cv.notify_one();
+}
+
+bool mesh_get_map_landmarks(const std::string& map_res, std::vector<LvbLandmark>& out) {
+    out.clear();
+    if (map_res.empty()) return false;
+    const std::string res_lo = to_lower_ascii(map_res);
+
+    std::lock_guard<std::mutex> lk(ws().mu);
+    auto cit = ws().lvb_cache.find(res_lo);
+    if (cit != ws().lvb_cache.end()) {
+        out = cit->second;
+        return !out.empty();
+    }
+
+    if (!ws().lvb_arh.loaded && !ws().romfs_dir.empty()) {
+        load_arh_index(ws().romfs_dir, ws().lvb_arh);
+    }
+    const std::string key = "/gmk/" + res_lo + "_landmark.lvb";
+    auto ait = ws().lvb_arh.by_path.find(key);
+    if (ait == ws().lvb_arh.by_path.end()) {
+        ws().lvb_cache[res_lo] = {};
+        return false;
+    }
+
+    std::ifstream ard(ws().lvb_arh.ard_path, std::ios::binary);
+    if (!ard) return false;
+    const ArhEntry& e = ait->second;
+    const size_t read_sz = (e.flags == 2) ? (0x30u + e.comp) : (e.comp ? e.comp : e.unc);
+    std::vector<uint8_t> tmp(read_sz), raw;
+    ard.seekg(static_cast<std::streamoff>(e.offset), std::ios::beg);
+    if (!ard.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(read_sz))) return false;
+    if (e.flags == 2) {
+        if (!xbc1_decompress(tmp.data(), tmp.size(), raw)) return false;
+    } else {
+        raw = std::move(tmp);
+    }
+    if (raw.size() < 0x40 || std::memcmp(raw.data(), "LVLB", 4) != 0) return false;
+
+    // Parse XFRM (stride 0x40: Vec3 pos at +0x00, hash_id at +0x30) and STRG (NUL-terminated names) chunks.
+    std::vector<LvbLandmark> parsed;
+    std::vector<std::string> str_names;
+    size_t pos = 0x20;
+    while (pos + 0x20 <= raw.size()) {
+        const uint32_t csz = rd_u32(raw.data() + pos + 4);
+        const uint32_t cnt = rd_u32(raw.data() + pos + 12);
+        if (csz < 0x20 || pos + csz > raw.size()) break;
+        if (std::memcmp(raw.data() + pos, "XFRM", 4) == 0) {
+            const size_t data_off = pos + 0x20;
+            parsed.reserve(cnt);
+            for (uint32_t i = 0; i < cnt && data_off + static_cast<size_t>(i + 1) * 0x40 <= pos + csz; ++i) {
+                const uint8_t* ep = raw.data() + data_off + static_cast<size_t>(i) * 0x40;
+                LvbLandmark lm;
+                lm.pos = {rd_f32(ep + 0x00), rd_f32(ep + 0x04), rd_f32(ep + 0x08)};
+                lm.hash_id = rd_u32(ep + 0x30);
+                parsed.push_back(std::move(lm));
+            }
+        } else if (std::memcmp(raw.data() + pos, "STRG", 4) == 0) {
+            size_t sp = pos + 0x20;
+            const size_t send = pos + csz;
+            // First byte may be empty string (cnt = entries + 1); collect non-empty NUL strings.
+            while (sp < send) {
+                const char* s = reinterpret_cast<const char*>(raw.data() + sp);
+                size_t len = 0;
+                while (sp + len < send && raw[sp + len] != 0) ++len;
+                if (len > 0) str_names.emplace_back(s, len);
+                sp += len + 1;
+            }
+        }
+        pos += csz;
+    }
+    for (size_t i = 0; i < parsed.size() && i < str_names.size(); ++i) {
+        parsed[i].name = str_names[i];
+    }
+    ws().lvb_cache[res_lo] = parsed;
+    out = std::move(parsed);
+    return !out.empty();
 }
 
 }  // namespace xc2::nav
