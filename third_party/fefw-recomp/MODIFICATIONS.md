@@ -22,7 +22,7 @@ This directory is a **modified fork** of `Goldoire/fefw-recomp` (the original Gi
 | `file` | date | change |
 |---|---|---|
 | `runtime/src/gfx/nvn/nvn_prewarm.cpp` | 2026-11-27 | record and prewarm `uint_samplers` (`uint_tex_patch`) pipelines in player-local `pipeline_keys.bin` (`NXPKEYS2`), eliminating repeated draw-time fragment shader compiles for stencil/integer-sampler shaders |
-| `runtime/src/gfx/nvn/nvn_gpl.cpp` | 2026-11-27 | widen `frames_flowing()` window from 100 ms to 1500 ms so a heavy scene-load upload frame does not disable `gpl_async` and cascade into synchronous fragment-part compiles on the render thread |
+| `runtime/src/gfx/nvn/nvn_gpl.cpp` | 2026-11-27 | widen `frames_flowing()` window from 100 ms to 1500 ms and offload uncached `resolve_stage_modules()` (SPIR-V patching + `vkCreateShaderModule`) onto `gpl_async` background workers so cold scene loads do not stall the render thread |
 | `runtime/include/nxrt/gfx_tuning.h` | 2026-11-27 | declare `nxrt::gfx::prewarm_hwdec_async()` for post-device-init background Vulkan Video / D3D11VA prewarm |
 | `runtime/src/media/video_ffmpeg.cpp` | 2026-11-27 | implement `prewarm_hwdec_async()` (`std::call_once` detached background `ffdec_prewarm()`) |
 | `runtime/src/gfx/vk_device.cpp` | 2026-11-27 | trigger `prewarm_hwdec_async()` after windowed `Device::create()` completes, eliminating the ~100 ms first-cutscene Vulkan Video cold-start hitch without racing driver init (#42) |
