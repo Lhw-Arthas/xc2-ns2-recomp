@@ -66,6 +66,11 @@ add_library(xc2_rt SHARED
     "${XC2_ROOT}/xc2/src/x2_audio301.cpp"
     "${XC2_ROOT}/xc2/src/xc2_nav_overlay.cpp"
     "${XC2_ROOT}/xc2/src/xc2_nav_mesh.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_db.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_director.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_renderer.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_hooks.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_overlay.cpp"
     src/xc2_rt.def)
 target_include_directories(xc2_rt PRIVATE
     "${XC2_ROOT}/third_party/nxrecomp/recomp/include"

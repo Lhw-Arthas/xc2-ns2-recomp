@@ -196,6 +196,12 @@ int shader_backlog() { return g_shader_backlog.load(std::memory_order_relaxed); 
 void HudCanvas::rect_filled(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding) const {
     if (draw_list) static_cast<ImDrawList*>(draw_list)->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), rgba_to_imu32(rgba), rounding);
 }
+void HudCanvas::rect_filled_hgrad(float x0, float y0, float x1, float y1, uint32_t rgba_left, uint32_t rgba_right) const {
+    if (!draw_list) return;
+    const ImU32 cl = rgba_to_imu32(rgba_left);
+    const ImU32 cr = rgba_to_imu32(rgba_right);
+    static_cast<ImDrawList*>(draw_list)->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x1, y1), cl, cr, cr, cl);
+}
 void HudCanvas::rect(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding, float thickness) const {
     if (draw_list) static_cast<ImDrawList*>(draw_list)->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), rgba_to_imu32(rgba), rounding, 0, thickness);
 }
@@ -210,6 +216,56 @@ void HudCanvas::quad_filled(float x0, float y0, float x1, float y1, float x2, fl
 }
 void HudCanvas::quad(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba, float thickness) const {
     if (draw_list) static_cast<ImDrawList*>(draw_list)->AddQuad(ImVec2(x0, y0), ImVec2(x1, y1), ImVec2(x2, y2), ImVec2(x3, y3), rgba_to_imu32(rgba), thickness);
+}
+void HudCanvas::convex_poly_filled(const float* xy, int count, uint32_t rgba) const {
+    if (!draw_list || !xy || count < 3) return;
+    if (count > 32) count = 32;
+    ImVec2 pts[32];
+    for (int i = 0; i < count; ++i) pts[i] = ImVec2(xy[i * 2], xy[i * 2 + 1]);
+    static_cast<ImDrawList*>(draw_list)->AddConvexPolyFilled(pts, count, rgba_to_imu32(rgba));
+}
+void HudCanvas::convex_poly_hgrad(const float* xy, int count, float x_left, float x_right, uint32_t rgba_left, uint32_t rgba_right) const {
+    if (!draw_list || !xy || count < 3) return;
+    if (count > 32) count = 32;
+    auto* dl = static_cast<ImDrawList*>(draw_list);
+    const float span = (x_right > x_left + 1e-4f) ? (x_right - x_left) : 1.0f;
+    const float lr = static_cast<float>((rgba_left >> 24) & 0xFF);
+    const float lg = static_cast<float>((rgba_left >> 16) & 0xFF);
+    const float lb = static_cast<float>((rgba_left >> 8) & 0xFF);
+    const float la = static_cast<float>(rgba_left & 0xFF);
+    const float rr = static_cast<float>((rgba_right >> 24) & 0xFF);
+    const float rg = static_cast<float>((rgba_right >> 16) & 0xFF);
+    const float rb = static_cast<float>((rgba_right >> 8) & 0xFF);
+    const float ra = static_cast<float>(rgba_right & 0xFF);
+    const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+    const int idx_count = (count - 2) * 3;
+    dl->PrimReserve(idx_count, count);
+    const ImDrawIdx vtx_base = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+    for (int i = 0; i < count; ++i) {
+        const float px = xy[i * 2];
+        const float py = xy[i * 2 + 1];
+        float t = (px - x_left) / span;
+        if (t < 0.f) t = 0.f;
+        if (t > 1.f) t = 1.f;
+        const ImU32 col = IM_COL32(
+            static_cast<int>(lr + (rr - lr) * t + 0.5f),
+            static_cast<int>(lg + (rg - lg) * t + 0.5f),
+            static_cast<int>(lb + (rb - lb) * t + 0.5f),
+            static_cast<int>(la + (ra - la) * t + 0.5f));
+        dl->PrimWriteVtx(ImVec2(px, py), uv, col);
+    }
+    for (int i = 2; i < count; ++i) {
+        dl->PrimWriteIdx(vtx_base);
+        dl->PrimWriteIdx(static_cast<ImDrawIdx>(vtx_base + i - 1));
+        dl->PrimWriteIdx(static_cast<ImDrawIdx>(vtx_base + i));
+    }
+}
+void HudCanvas::polyline(const float* xy, int count, uint32_t rgba, bool closed, float thickness) const {
+    if (!draw_list || !xy || count < 2) return;
+    if (count > 32) count = 32;
+    ImVec2 pts[32];
+    for (int i = 0; i < count; ++i) pts[i] = ImVec2(xy[i * 2], xy[i * 2 + 1]);
+    static_cast<ImDrawList*>(draw_list)->AddPolyline(pts, count, rgba_to_imu32(rgba), closed ? ImDrawFlags_Closed : ImDrawFlags_None, thickness);
 }
 void HudCanvas::circle_filled(float cx, float cy, float r, uint32_t rgba, int segments) const {
     if (draw_list) static_cast<ImDrawList*>(draw_list)->AddCircleFilled(ImVec2(cx, cy), r, rgba_to_imu32(rgba), segments);

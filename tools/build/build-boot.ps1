@@ -91,6 +91,11 @@ $objOpus = Join-Path $bd 'x2_opus301.obj'
 $objAudio = Join-Path $bd 'x2_audio301.obj'
 $objNav = Join-Path $bd 'xc2_nav_overlay.obj'
 $objNavMesh = Join-Path $bd 'xc2_nav_mesh.obj'
+$objVoiceDb = Join-Path $bd 'xc2_voice_db.obj'
+$objVoiceDir = Join-Path $bd 'xc2_voice_director.obj'
+$objVoiceRen = Join-Path $bd 'xc2_voice_renderer.obj'
+$objVoiceHooks = Join-Path $bd 'xc2_voice_hooks.obj'
+$objVoiceOvl = Join-Path $bd 'xc2_voice_overlay.obj'
 # The headers of the pinned third-party libraries. CMake's FetchContent extracts them into the build directory
 # (build\runtime-gfx\_deps\<name>-src); an older layout kept them under third_party\deps\src. Look in both, and say
 # what was expected when neither is there: a clean clone that skipped the runtime configure used to fail here with a
@@ -139,6 +144,21 @@ if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_nav_overlay.cpp' }
 & clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\xc2_nav_mesh.cpp') "/Fo$objNavMesh" @defArgs `
     "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
 if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_nav_mesh.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_db.cpp') "/Fo$objVoiceDb" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_db.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_director.cpp') "/Fo$objVoiceDir" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_director.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_renderer.cpp') "/Fo$objVoiceRen" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_renderer.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_hooks.cpp') "/Fo$objVoiceHooks" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_hooks.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_overlay.cpp') "/Fo$objVoiceOvl" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_overlay.cpp' }
 
 # FFmpeg's hardware movie decoder (runtime/src/media/video_ffmpeg.cpp): nxrt.lib references avcodec/avutil when the
 # runtime was configured with NXRT_FFMPEG_DIR, so the link needs the same two import libraries.
@@ -191,7 +211,7 @@ $exe = Join-Path $bd 'xc2_boot.exe'
 # backtrace instead of printing bare offsets. Without it a dump says "xc2_boot+0x8383d" and nothing else - and the PDB of this
 # exe is 492 MB and only exists for the MSVC release build, never for this one (2026-11-22).
 $mapFile = Join-Path $bd 'xc2_boot.map'
-& clang-cl.exe /nologo /MT "/Fe:$exe" $obj $objOpus $objAudio $objNav $objNavMesh @iconRes `
+& clang-cl.exe /nologo /MT "/Fe:$exe" $obj $objOpus $objAudio $objNav $objNavMesh $objVoiceDb $objVoiceDir $objVoiceRen $objVoiceHooks $objVoiceOvl @iconRes `
     "$gfxDir\nxrt_gfx.lib" "$gfxDir\nxrt.lib" "$game\nxrt_game_xc2ns2_core.lib" "$game\nxrt_game_xc2ns2_data.lib" `
     $mainlib (Join-Path $libdir 'sdk.lib') `
     (Join-Path $libdir 'subsdk0.lib') (Join-Path $libdir 'rtld.lib') @extraLibs @vpxLibs @vorbisLibs @ffLibs `

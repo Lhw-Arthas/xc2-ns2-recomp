@@ -47,11 +47,15 @@ struct HudCanvas {
     void* ribbon_sink = nullptr;
 
     void rect_filled(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding = 0.f) const;
+    void rect_filled_hgrad(float x0, float y0, float x1, float y1, uint32_t rgba_left, uint32_t rgba_right) const;
     void rect(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding = 0.f, float thickness = 1.f) const;
     void line(float x0, float y0, float x1, float y1, uint32_t rgba, float thickness = 1.5f) const;
     void triangle_filled(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t rgba) const;
     void quad_filled(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba) const;
     void quad(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba, float thickness = 1.5f) const;
+    void convex_poly_filled(const float* xy, int count, uint32_t rgba) const;
+    void convex_poly_hgrad(const float* xy, int count, float x_left, float x_right, uint32_t rgba_left, uint32_t rgba_right) const;
+    void polyline(const float* xy, int count, uint32_t rgba, bool closed = false, float thickness = 1.5f) const;
     void circle_filled(float cx, float cy, float r, uint32_t rgba, int segments = 0) const;
     void circle(float cx, float cy, float r, uint32_t rgba, float thickness = 1.5f, int segments = 0) const;
     void text(float x, float y, float size, uint32_t rgba, const char* str) const;

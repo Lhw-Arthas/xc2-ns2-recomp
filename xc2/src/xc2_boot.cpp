@@ -58,6 +58,7 @@
 #include "xc2ns2/xc2ns2_game.h"
 #include "xc2_modules.h"
 #include "xc2_nav_overlay.h"
+#include "voice/xc2_voice_overlay.h"
 
 #include "play_types.h"
 
@@ -528,6 +529,26 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
         const bool f4 = down(VK_F4) || tapped(VK_F4);
         if (f4 && !f4_was_down) nxrt::play::toggle_picker();
         f4_was_down = f4;
+        static bool f5_was_down = false;
+        const bool f5 = down(VK_F5) || tapped(VK_F5);
+        if (f5 && !f5_was_down) {
+            if (down(VK_CONTROL))    xc2::voice::toggle_log();
+            else if (down(VK_SHIFT)) xc2::voice::cycle_density();
+            else                     xc2::voice::toggle();
+        }
+        f5_was_down = f5;
+        static bool f6_was_down = false;
+        const bool f6 = down(VK_F6) || tapped(VK_F6);
+        if (f6 && !f6_was_down) xc2::voice::trigger_mock(0);
+        f6_was_down = f6;
+        static bool f7_was_down = false;
+        const bool f7 = down(VK_F7) || tapped(VK_F7);
+        if (f7 && !f7_was_down) xc2::voice::trigger_mock(1);
+        f7_was_down = f7;
+        static bool f8_was_down = false;
+        const bool f8 = down(VK_F8) || tapped(VK_F8);
+        if (f8 && !f8_was_down) xc2::voice::toggle_mock_combat_mode();
+        f8_was_down = f8;
         if (shot_raw) {
             if (f12_left > 0 && shot_raw_have) {
                 write_raw_frame();     // the buffer filled at the end of the previous frame
@@ -2836,7 +2857,11 @@ int main(int argc, char **argv) {
         nxrt::play::start(po);
         if (!headless) {
             xc2::nav::init(kMainBase);
-            nxrt::play::set_hud_callback(&xc2::nav::draw);
+            xc2::voice::init(kMainBase);
+            nxrt::play::set_hud_callback([](const nxrt::gfx::HudCanvas& c) {
+                xc2::nav::draw(c);
+                xc2::voice::draw(c);
+            });
             nxrt::play::set_picker(xc2::nav::make_picker_callbacks());
         }
     }
