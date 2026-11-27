@@ -21,6 +21,11 @@ This directory is a **modified fork** of `Goldoire/fefw-recomp` (the original Gi
 
 | `file` | date | change |
 |---|---|---|
+| `runtime/src/gfx/nvn/nvn_prewarm.cpp` | 2026-11-27 | record and prewarm `uint_samplers` (`uint_tex_patch`) pipelines in player-local `pipeline_keys.bin` (`NXPKEYS2`), eliminating repeated draw-time fragment shader compiles for stencil/integer-sampler shaders |
+| `runtime/src/gfx/nvn/nvn_gpl.cpp` | 2026-11-27 | widen `frames_flowing()` window from 100 ms to 1500 ms so a heavy scene-load upload frame does not disable `gpl_async` and cascade into synchronous fragment-part compiles on the render thread |
+| `runtime/include/nxrt/gfx_tuning.h` | 2026-11-27 | declare `nxrt::gfx::prewarm_hwdec_async()` for post-device-init background Vulkan Video / D3D11VA prewarm |
+| `runtime/src/media/video_ffmpeg.cpp` | 2026-11-27 | implement `prewarm_hwdec_async()` (`std::call_once` detached background `ffdec_prewarm()`) |
+| `runtime/src/gfx/vk_device.cpp` | 2026-11-27 | trigger `prewarm_hwdec_async()` after windowed `Device::create()` completes, eliminating the ~100 ms first-cutscene Vulkan Video cold-start hitch without racing driver init (#42) |
 | `runtime/src/gfx/nvn/nvn_gpu_texture.cpp` | 2026-11-27 | remove legacy 2026-11-21 `4k target` / `film texture` hot-path mutex+clock+map logging probe from `tex_mark_gpu_written()` |
 | `runtime/src/services/hid.cpp` | 2026-11-27 | downgrade periodic normal `hid: pad 0 state` log from `NXLOG_W` to `NXLOG_D` (keep `OUT OF RANGE` at `NXLOG_W`) |
 | `runtime/src/gfx/nvn/nvn_gpu_pool.cpp` | 2026-11-27 | remove unused `#include "nvn_capture_spans.h"` and dead `nvn_capture_spans.h` / `test_nvn_capture_spans.cpp` superseded by PR #84 |

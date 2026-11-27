@@ -3,7 +3,9 @@
 
 #include <cstdio>
 #include <mutex>
+#include <thread>
 
+#include "nxrt/config.h"
 #include "nxrt/gfx_tuning.h"
 
 namespace nxrt::gfx {
@@ -22,6 +24,15 @@ void note_render_gpu_info(int index, uint32_t vendor_id, const char* name) {
 RenderGpuInfo render_gpu_info() {
     std::lock_guard<std::mutex> lk(g_render_gpu_mu);
     return g_render_gpu;
+}
+
+void prewarm_hwdec_async() {
+    static std::once_flag once;
+    if (!nxrt::config_get_bool("media", "hwdec", true)) return;
+    if (nxrt::config_get_str("media", "video_decoder", "library") == "off") return;
+    std::call_once(once, [] {
+        std::thread([] { nxrt::media::ffdec_prewarm(); }).detach();
+    });
 }
 }  // namespace nxrt::gfx
 

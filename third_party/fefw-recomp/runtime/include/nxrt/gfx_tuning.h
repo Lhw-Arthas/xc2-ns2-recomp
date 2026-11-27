@@ -16,6 +16,9 @@ struct RenderGpuInfo {
 };
 void note_render_gpu_info(int index, uint32_t vendor_id, const char* name);
 RenderGpuInfo render_gpu_info();
+// Asynchronously prewarm the FFmpeg hardware video device (Vulkan Video / D3D11VA) once gfx::Device::create() has finished,
+// avoiding both the #42 driver-init race at t=0.001s and the ~100 ms cold-start hitch on the first cutscene.
+void prewarm_hwdec_async();
 
 struct Tuning {
     std::atomic<int> anisotropy{0};        // 0 = what the game's samplers ask for; 2, 4, 8, 16 = at least this much on every filtering sampler

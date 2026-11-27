@@ -739,7 +739,9 @@ namespace {
 bool frames_flowing() {
     const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
     const int64_t seen = g_frame_seen_ns.load(std::memory_order_relaxed);
-    return seen != 0 && now - seen < 100000000;
+    // Allow a 1.5 s window so a heavy scene-load upload frame (>100 ms) does not disable gpl_async
+    // and cascade into dozens of synchronous fragment-part compiles on the render thread.
+    return seen != 0 && now - seen < 1500000000ll;
 }
 bool part_done_locked(const std::string& key) {
     auto it = g_libs.find(key);

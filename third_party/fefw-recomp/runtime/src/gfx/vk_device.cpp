@@ -941,6 +941,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
 
     NXLOG_I(kTag, "device ready: %s, queue family %u, validation %s, %s", props_.deviceName, queue_family_, validation_ ? "on" : "off",
             headless ? "headless" : "window surface");
+    if (!headless) prewarm_hwdec_async();
     return true;
 }
 
