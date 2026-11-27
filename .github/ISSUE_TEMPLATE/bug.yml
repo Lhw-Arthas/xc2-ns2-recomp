@@ -5,10 +5,11 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Please make sure you are on the latest release** (Launcher: **About → Check now**, or <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>).
-        Before filing, a quick glance at [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) (known issues) and [docs/INVARIANTS.md](docs/INVARIANTS.md) can save time.
+        **Quick checks before submitting:**
+        - Update to the [latest release](https://github.com/weile10000/xc2-ns2-recomp/releases/latest) first (**About → Check now** in the launcher).
+        - Common non-bugs: NVIDIA App global DLSS model M/L override causes horizontal black lines; Switch 1 mods/cheats are not directly compatible with Switch 2 3.0.1. ([Known issues](https://github.com/weile10000/xc2-ns2-recomp/blob/main/docs/COMPATIBILITY.md))
 
-        **请先确认已升级到最新版**（启动器 **关于 → 检查更新**，或点上方链接下载）；提交前可先扫一眼已知问题列表 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
+        **提交前请顺手确认：** 先在启动器 **关于 → 检查更新** 升级到最新版；N 卡横条黑线通常是 NVIDIA App 全局强开了 DLSS 模型 M/L 覆盖；NS1 模组/金手指与 NS2 3.0.1 不直接通用。
   - type: input
     id: build
     attributes:
@@ -67,7 +68,7 @@ body:
     id: upscaler
     attributes:
       label: Does it also happen on default TAAU (Frame Gen off)? (optional)
-      description: Only if you feel like testing against the v0.2.4 baseline - switch Upscaler to built-in TAAU and turn Frame Generation off, restart, and try the same spot.
+      description: Optional — switch Upscaler to built-in TAAU and turn Frame Generation off, restart, and try the same spot.
       options:
         - "Not tried"
         - "Yes, it happens on TAAU (FG off) too"

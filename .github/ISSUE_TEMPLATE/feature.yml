@@ -5,10 +5,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        **If you are on an older build, update first.** Check [`0.2.5`](https://github.com/weile10000/xc2-ns2-recomp/releases/latest)
-        or newer — recent updates already added M4 Mod Manager / DMNT Cheats, FSR 3 FG `HUDLessColor`, F10 dual FPS display, and runtime NVIDIA 3D stencil fixes.
-
-        **报 issue 前请先确认版本是 0.2.5 或更新**，近期版本已补齐 M4 模组与作弊码界面、FSR 3 FG 去 UI 重影、F10 双帧率显示以及运行期 3D 黑条修复等。
+        **Please check the [latest release](https://github.com/weile10000/xc2-ns2-recomp/releases/latest) first** — your idea may already be in recent builds.
+        **提交前请先确认最新版是否已包含该功能。**
   - type: textarea
     id: what
     attributes:

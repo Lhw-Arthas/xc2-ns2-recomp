@@ -5,12 +5,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        **If you are on an older build, update first.** Releases before **0.2.5** have known issues already fixed
-        (`#54` NVIDIA 3D black stripes, flicker, cutscene freezes, 4K dynres blur, `FORCE_UNORM` black bands, Intel pipeline cache crash).
-        Use **About → Check now** in `xc2-launcher.exe` or download the latest release:
-        <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>
-
-        **报 issue 前请先确认版本是 0.2.5 或更新**，此前版本的大量渲染与过场问题已经修复（可在启动器「关于 → 检查更新」一键升级）。
+        **Please make sure you are on the [latest release](https://github.com/weile10000/xc2-ns2-recomp/releases/latest)** (Launcher: **About → Check now**).
+        **报 issue 前请先确认已升级到最新版**（启动器 **关于 → 检查更新**）。
   - type: input
     id: area
     attributes:
@@ -22,7 +18,7 @@ body:
     id: build
     attributes:
       label: Build
-      placeholder: 0.2.5
+      placeholder: latest
     validations:
       required: true
   - type: dropdown

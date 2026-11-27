@@ -61,7 +61,7 @@ body:
     attributes:
       label: Build (optional)
       description: The report zip already says it; fill this in if you know it.
-      placeholder: 0.2.5
+      placeholder: latest (e.g. v0.2.6)
   - type: textarea
     id: notes
     attributes:
