@@ -2595,6 +2595,8 @@ VkImageView earlyz_scratch_view(VkFormat fmt, uint32_t w, uint32_t h) {
 Texture* g_su_tex = nullptr;                 // scene upscaler override (S14), see scene_upscale_for_draw
 VkImageView g_su_view = VK_NULL_HANDLE;
 Ref<Texture> g_tsr_depth;                   // temporal upscaling: the depth target of the G-buffer draw that gave this frame's camera
+Ref<Texture> g_scene_depth;                 // latest 3D G-buffer depth target for read-only overlay occlusion (nav ribbon)
+int g_scene_depth_mode = 0;                 // 0=fwd [0,1], 1=rev [0,1], 2=fwd [-1,1], 3=rev [-1,1]
 uint64_t g_tsr_frame = 0;                    // temporal upscaling: tone-map draws so far (the jitter phase of the frame being drawn)
 // Per-submission cache for vertex UBO 0 temporal jittering: avoids re-running 4x4 Gauss-Jordan parse_camera() + F->upload() + memcpy
 // thousands of times per frame on the same camera block (and keeps its upload offset stable so SetCache hits on draws 2..N).
@@ -4457,6 +4459,13 @@ bool begin_draw(int mode, bool indexed, int index_type, VkPrimitiveTopology* top
         if (!ubo_fast) g_dirty |= kDesc;
     }
     if (extras::temporal_wanted()) temporal_gbuffer_note();
+    if (S.ncolor >= 4 && S.depth_tex && S.depth_tex->b.width >= 320 && S.ds.depth_test && S.ds.depth_write) {
+        g_scene_depth = S.depth_tex;
+        const bool neg1 = (S.depth_mode == NVN_DEPTH_MODE_NEAR_IS_MINUS_W);
+        const int dfn = effective_depth_func();
+        const bool rev = (dfn == NVN_DEPTH_FUNC_GREATER || dfn == NVN_DEPTH_FUNC_GEQUAL);
+        g_scene_depth_mode = (neg1 ? 2 : 0) + (rev ? 1 : 0);
+    }
     rs_mark(kRsHead);
     if (g_dirty & (kDesc | kPipe)) {
         ++g_rs.draws_desc;
@@ -7736,6 +7745,7 @@ void replay_shutdown() {
     g_fb_clone.clear();
     g_vol3d_use.clear();
     g_vol3d.clear();
+    g_scene_depth = Ref<Texture>{};
     g_fb_clone_n.store(0, std::memory_order_relaxed);
 }
 
@@ -7749,5 +7759,10 @@ struct ReplayGauges {
 };
 ReplayGauges g_replay_gauges;
 }  // namespace
+
+Ref<Texture> take_scene_depth(int* out_depth_mode) {
+    if (out_depth_mode) *out_depth_mode = g_scene_depth_mode;
+    return g_scene_depth;
+}
 
 }  // namespace nxrt::nvn::be::gpu

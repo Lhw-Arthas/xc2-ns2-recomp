@@ -259,6 +259,25 @@ void present_on_render_thread(Window* w, int index, bool again) {
     gfx::Renderer::SubmitPrefix pre;
     const bool merged = take_batch_for_present(&cmds, &pre);
     extras::framegen_present_begin(fi.cmd, fi.extent, VkExtent2D{e.width, e.height}, crop, keep_aspect(), again);
+    {
+        int dmode = 0;
+        Ref<Texture> dtex = take_scene_depth(&dmode);
+        if (dtex && tex_gpu(dtex.get())) {
+            tex_ensure_current(dtex.get(), f);
+            const VkImageLayout dlay = tex_sampled_layout(dtex.get());
+            tex_transition(dtex.get(), f, dlay);
+            ViewRequest dq;
+            dq.type = VK_IMAGE_VIEW_TYPE_2D;
+            dq.base_level = 0;
+            dq.level_count = 1;
+            dq.base_layer = 0;
+            dq.layer_count = 1;
+            dq.depth_aspect = true;
+            VkImageView dv = tex_sampled_view(dtex.get(), dq);
+            const bool dflip = (window_origin_mode() == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT);
+            rend->set_scene_depth(dv, dlay, dflip, dmode);
+        }
+    }
     // pre carries the wait for the frame's own submission when it was not merged (see take_batch_for_present)
     { NXFT("present.end"); nxrt::HitchTimer ht(nxrt::kHpRenderPresentEnd); rend->end_frame(&pre); }
     extras::framegen_present_end();

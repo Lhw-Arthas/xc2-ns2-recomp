@@ -39,6 +39,7 @@
 #include "nxrt/platform.h"
 #include "nxrt/services_api.h"
 #include "extras/framegen.h"
+#include "extras/nav_ribbon.h"
 #include "extras/overlay_composite.h"
 #include "fps_stats.h"
 
@@ -243,6 +244,22 @@ void HudCanvas::measure_text(float size, const char* str, float* out_w, float* o
     if (out_h) *out_h = sz.y;
 }
 
+namespace {
+struct RibbonSink {
+    std::vector<Ribbon3DVertex> verts;
+    Ribbon3DParams params;
+    bool active = false;
+};
+}  // namespace
+
+void HudCanvas::set_ribbon_3d(const Ribbon3DVertex* verts, uint32_t count, const Ribbon3DParams& params) const {
+    if (!ribbon_sink || !verts || count < 4) return;
+    auto* sink = static_cast<RibbonSink*>(ribbon_sink);
+    sink->verts.assign(verts, verts + count);
+    sink->params = params;
+    sink->active = true;
+}
+
 struct Overlay::Impl {
     Context ctx;
     ImGuiContext* imgui = nullptr;
@@ -283,6 +300,9 @@ struct Overlay::Impl {
     VkFormat color_format = VK_FORMAT_UNDEFINED;
     bool hdr = false;                 // HDR swapchain: the overlay is drawn into an RGBA8 target and composited (draw)
     extras::OverlayComposite composite;
+    extras::NavRibbonPass nav_ribbon;
+    bool nav_ribbon_ok = false;
+    RibbonSink ribbon_sink;
 
     // Corner frame-rate counter. set_counter() stores the settings from any thread; the rest is used by the presenting thread only.
     std::atomic<bool> ptr_show{false}, ptr_in_shots{true};
@@ -539,6 +559,7 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
             NXLOG_W(kTag, "HDR overlay composite failed to initialise: the overlay is drawn straight into the HDR swapchain (colours will look wrong)");
         }
     }
+    s.nav_ribbon_ok = s.nav_ribbon.init(*ctx.device);
     const std::string key = config_get_str("gfx", "overlay_key", "F1");
     if (const SDL_Scancode sc = SDL_GetScancodeFromName(key.c_str()); sc != SDL_SCANCODE_UNKNOWN) s.toggle_sc = sc;
     else NXLOG_W(kTag, "unknown [gfx] overlay_key '%s': using F1", key.c_str());
@@ -693,6 +714,7 @@ Overlay::~Overlay() {
     if (!impl_) return;
     impl_->shutdown_perf_hud();
     if (impl_->ctx.device) impl_->ctx.device->wait_idle();
+    impl_->nav_ribbon.shutdown();
     impl_->composite.shutdown();
     if (impl_->backend_ready) ImGui_ImplVulkan_Shutdown();
     if (impl_->imgui) ImGui::DestroyContext(impl_->imgui);
@@ -1811,6 +1833,8 @@ void Overlay::draw(const FrameInfo& f) {
     ImGui::NewFrame();
     if (s.visible && !kb_on) s.build_ui();    // the keyboard is modal: the menu comes back once it is answered
     if (kb_on) s.draw_keyboard(now_s);
+    s.ribbon_sink.active = false;
+    s.ribbon_sink.verts.clear();
     if (hud_on && !kb_on) {
         std::function<void(const HudCanvas&)> cb;
         { std::lock_guard<std::mutex> hlk(s.hud_mu); cb = s.hud_cb; }
@@ -1820,6 +1844,7 @@ void Overlay::draw(const FrameInfo& f) {
             canvas.height = f.extent.height;
             canvas.draw_list = ImGui::GetForegroundDrawList();
             canvas.font = ImGui::GetFont();
+            canvas.ribbon_sink = &s.ribbon_sink;
             cb(canvas);
         }
     }
@@ -1837,8 +1862,8 @@ void Overlay::draw(const FrameInfo& f) {
     }
     ImGui::Render();
 
-    // one dynamic-rendering pass that draws the ImGui draw data into view
-    auto render_into = [&](VkImageView view, VkAttachmentLoadOp load) {
+    // one dynamic-rendering pass that draws the 3D nav ribbon (with scene depth occlusion) and ImGui draw data into view
+    auto render_into = [&](VkImageView view, VkFormat target_fmt, VkAttachmentLoadOp load) {
         VkRenderingAttachmentInfo att = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         att.imageView = view;
         att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1851,6 +1876,16 @@ void Overlay::draw(const FrameInfo& f) {
         ri.colorAttachmentCount = 1;
         ri.pColorAttachments = &att;
         vkCmdBeginRendering(f.cmd, &ri);
+        if (s.nav_ribbon_ok && s.ribbon_sink.active && s.ribbon_sink.verts.size() >= 4) {
+            extras::NavRibbonDepth rd;
+            rd.view = f.scene_depth_view;
+            rd.layout = f.scene_depth_layout;
+            rd.flip_y = f.scene_depth_flip_y;
+            rd.depth_mode = f.scene_depth_mode;
+            s.nav_ribbon.record(f.cmd, target_fmt, f.extent, f.slot,
+                                s.ribbon_sink.verts.data(), static_cast<uint32_t>(s.ribbon_sink.verts.size()),
+                                s.ribbon_sink.params, rd);
+        }
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), f.cmd);
         vkCmdEndRendering(f.cmd);
     };
@@ -1858,11 +1893,11 @@ void Overlay::draw(const FrameInfo& f) {
         // HDR: the overlay goes into the cleared RGBA8 target, then the composite maps it onto the swapchain image (UI white = paper white)
         const extras::HdrState hs = extras::hdr_state();
         s.composite.begin_overlay(f.cmd);
-        render_into(s.composite.target_view(), VK_ATTACHMENT_LOAD_OP_CLEAR);
+        render_into(s.composite.target_view(), VK_FORMAT_R8G8B8A8_UNORM, VK_ATTACHMENT_LOAD_OP_CLEAR);
         s.composite.composite(f.cmd, f.view, f.format, f.extent, f.hdr_output ? s.ctx.renderer->output_kind() : extras::OutputKind::Sdr8,
                               hs.paper_white_nits, hs.peak_nits);
     } else {
-        render_into(f.view, VK_ATTACHMENT_LOAD_OP_LOAD);
+        render_into(f.view, f.format, VK_ATTACHMENT_LOAD_OP_LOAD);
     }
     s.drawn++;
     ImGui::SetCurrentContext(prev);

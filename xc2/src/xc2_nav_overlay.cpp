@@ -76,9 +76,10 @@ bool safe_read_bytes(uint64_t addr, void* dst, size_t n) {
 }
 
 std::atomic<uint64_t> g_main_base{0};
-std::atomic<int> g_mode{2};   // 2 = Beacons + Ground Guide Line, 1 = Beacons Only, 0 = Off
+std::atomic<int> g_mode{2};   // 2 = Beacons + 3D Ground Ribbon, 1 = Beacons Only, 0 = Off
 std::atomic<bool> g_debug{false};
 std::atomic<int64_t> g_toast_until_ms{0};
+std::atomic<int64_t> g_reveal_start_ms{0};
 
 int64_t now_ms() {
     using namespace std::chrono;
@@ -170,7 +171,8 @@ void push_unique_marker(std::vector<NavMarker>& out, const Vec3& pos, MarkerKind
     out.push_back(nm);
 }
 
-void collect_locators(uint64_t mb, uint32_t current_map_id, std::vector<NavMarker>& out) {
+void collect_locators(uint64_t mb, uint32_t current_map_id, std::vector<NavMarker>& out, uint32_t& out_offmap_main) {
+    out_offmap_main = 0;
     uint64_t loc_mgr = 0;
     if (!safe_read(mb + off301::kMenuLocationSingleton, loc_mgr) || !loc_mgr) return;
 
@@ -186,8 +188,11 @@ void collect_locators(uint64_t mb, uint32_t current_map_id, std::vector<NavMarke
         }
     }
 
-    // Categories 0..3: GfFieldLocator vectors (stride 0x430 per category, starting at +0x48).
-    for (uint32_t cat = 0; cat < 4; ++cat) {
+    // Categories 0..1 ONLY:
+    //   cat 0 = Active Main Story Quest (GfQuestManager::getProgressCurrentQuest(QTYPE=1))
+    //   cat 1 = Active Tracked Sub/Blade Quest (GfQuestManager::getProgressCurrentQuest(QTYPE=3/2))
+    // Deliberately skip cat 2 and cat 3 (cat 3 = collectOrderableLocators = unaccepted '!' quest givers).
+    for (uint32_t cat = 0; cat < 2; ++cat) {
         const uint64_t cat_base = loc_mgr + 0x48ull + static_cast<uint64_t>(cat) * 0x430ull;
         uint64_t begin_ptr = 0, end_ptr = 0;
         if (!safe_read(cat_base, begin_ptr) || !safe_read(cat_base + 8, end_ptr)) continue;
@@ -203,7 +208,10 @@ void collect_locators(uint64_t mb, uint32_t current_map_id, std::vector<NavMarke
             uint64_t vt = 0;
             uint32_t icon_id = 0, map_id = 0;
             if (!safe_read(impl, vt) || !safe_read(impl + 0x0C, icon_id) || !safe_read(impl + 0x10, map_id)) continue;
-            if (current_map_id != 0 && map_id != 0 && map_id != current_map_id) continue;
+            if (current_map_id != 0 && map_id != 0 && map_id != current_map_id) {
+                if (cat == 0 && out_offmap_main == 0) out_offmap_main = map_id;
+                continue;
+            }
             if (vt < mb) continue;
             const uint64_t vt_rva = vt - mb;
 
@@ -507,57 +515,92 @@ void format_elev(float dy, char* buf, size_t n, uint32_t& out_col) {
     }
 }
 
+void draw_chevron_up(const nxrt::gfx::HudCanvas& c, float cx, float cy, float w, float h, uint32_t col, float th) {
+    c.line(cx - w, cy + h, cx, cy, col, th);
+    c.line(cx, cy, cx + w, cy + h, col, th);
+}
+
+void draw_chevron_down(const nxrt::gfx::HudCanvas& c, float cx, float cy, float w, float h, uint32_t col, float th) {
+    c.line(cx - w, cy - h, cx, cy, col, th);
+    c.line(cx, cy, cx + w, cy - h, col, th);
+}
+
 void draw_beacon(const nxrt::gfx::HudCanvas& c, float x, float y, float scale,
                  uint32_t col, float dist, float dy, bool primary, const char* extra_line) {
-    const float r = (primary ? 11.f : 8.f) * scale;
-    const uint32_t dark = 0x000000CCu;
+    const float r = (primary ? 11.5f : 8.5f) * scale;
+    const uint32_t dark = 0x000000D0u;
+    const double t_sec = static_cast<double>(now_ms()) * 0.001;
 
-    // Subtle vertical drop-pin line under the diamond
-    c.line(x, y + r, x, y + r + 10.f * scale, (col & 0xFFFFFF00u) | 0xA0u, 2.f * scale);
+    // 1. Subtle expanding radial Core-Crystal pulse ring for primary objective
+    if (primary) {
+        const float ph = static_cast<float>(std::fmod(t_sec * 0.55, 1.0));
+        const float pr = r * (1.25f + ph * 1.45f);
+        const uint32_t pa = static_cast<uint32_t>((1.0f - ph) * (1.0f - ph) * 140.f) & 0xFFu;
+        if (pa > 4u) {
+            c.quad(x, y - pr, x + pr, y, x, y + pr, x - pr, y, (col & 0xFFFFFF00u) | pa, 1.5f * scale);
+        }
+    }
 
-    // Outer dark diamond + colored fill + white core
-    c.quad_filled(x, y - r - 2.f * scale, x + r + 2.f * scale, y, x, y + r + 2.f * scale, x - r - 2.f * scale, y, dark);
-    c.quad_filled(x, y - r, x + r, y, x, y + r, x - r, y, col);
-    const float ir = r * 0.42f;
-    c.quad_filled(x, y - ir, x + ir, y, x, y + ir, x - ir, y, 0xFFFFFFEEu);
+    // 2. Double-layer 45° Core-Crystal diamond (outer glowing wireframe + translucent body + bright core)
+    const float ro = r * 1.24f;
+    c.quad(x, y - ro, x + ro, y, x, y + ro, x - ro, y, 0x00000088u, 3.0f * scale);
+    c.quad(x, y - ro, x + ro, y, x, y + ro, x - ro, y, (col & 0xFFFFFF00u) | 0xE8u, 1.5f * scale);
+    c.quad_filled(x, y - r, x + r, y, x, y + r, x - r, y, (col & 0xFFFFFF00u) | 0xC8u);
+    const float ir = r * 0.44f;
+    c.quad_filled(x, y - ir, x + ir, y, x, y + ir, x - ir, y, 0xFFFFFFF0u);
 
-    // Distance + Elevation label above the diamond
+    // 3. Minimalist breathing elevation chevrons (^ / v) above or below diamond when |ΔY| >= 3m
+    const int idy = static_cast<int>(std::lround(dy));
+    const float bob = static_cast<float>(std::sin(t_sec * 3.6)) * 2.2f * scale;
+    const float cw = 5.5f * scale, ch = 3.6f * scale;
+    if (idy >= 3) {
+        const uint32_t ecol = 0x80D8FFEEu;
+        const float base_y = y - ro - 7.f * scale - bob;
+        draw_chevron_up(c, x, base_y, cw, ch, 0x000000AAu, 3.2f * scale);
+        draw_chevron_up(c, x, base_y, cw, ch, ecol, 1.8f * scale);
+        if (idy >= 15) {
+            draw_chevron_up(c, x, base_y - 5.5f * scale, cw * 0.85f, ch * 0.85f, 0x00000088u, 2.8f * scale);
+            draw_chevron_up(c, x, base_y - 5.5f * scale, cw * 0.85f, ch * 0.85f, ecol, 1.5f * scale);
+        }
+    } else if (idy <= -3) {
+        const uint32_t ecol = 0xFFAB40EEu;
+        const float base_y = y + ro + 7.f * scale + bob;
+        draw_chevron_down(c, x, base_y, cw, ch, 0x000000AAu, 3.2f * scale);
+        draw_chevron_down(c, x, base_y, cw, ch, ecol, 1.8f * scale);
+        if (idy <= -15) {
+            draw_chevron_down(c, x, base_y + 5.5f * scale, cw * 0.85f, ch * 0.85f, 0x00000088u, 2.8f * scale);
+            draw_chevron_down(c, x, base_y + 5.5f * scale, cw * 0.85f, ch * 0.85f, ecol, 1.5f * scale);
+        }
+    }
+
+    // 4. Frameless distance readout directly below diamond (1px dark drop shadow, no boxy pill)
     char dist_buf[32];
-    char elev_buf[32];
-    uint32_t elev_col = 0xFFFFFFFFu;
-    std::snprintf(dist_buf, sizeof dist_buf, "%dm", static_cast<int>(std::lround(dist)));
-    format_elev(dy, elev_buf, sizeof elev_buf, elev_col);
-
-    const float font_sz = (primary ? 16.f : 13.5f) * scale;
-    float dw = 0.f, dh = 0.f, ew = 0.f, eh = 0.f;
+    if (std::abs(idy) >= 3) {
+        std::snprintf(dist_buf, sizeof dist_buf, "%dm (%+dm)", static_cast<int>(std::lround(dist)), idy);
+    } else {
+        std::snprintf(dist_buf, sizeof dist_buf, "%dm", static_cast<int>(std::lround(dist)));
+    }
+    const float font_sz = (primary ? 15.5f : 13.f) * scale;
+    float dw = 0.f, dh = 0.f;
     c.measure_text(font_sz, dist_buf, &dw, &dh);
-    c.measure_text(font_sz, elev_buf, &ew, &eh);
-    const float gap = 6.f * scale;
-    const float pad_x = 7.f * scale;
-    const float pad_y = 3.f * scale;
-    const float pill_w = dw + gap + ew + 2.f * pad_x;
-    const float pill_h = std::max(dh, eh) + 2.f * pad_y;
     const float W = static_cast<float>(c.width);
     const float H = static_cast<float>(c.height);
-    const float px0 = std::clamp(x - pill_w * 0.5f, 8.f, std::max(8.f, W - pill_w - 8.f));
-    const float py0 = std::clamp(y - r - 6.f * scale - pill_h, 8.f, std::max(8.f, H - pill_h - 8.f));
+    const float below_pad = (idy <= -3) ? (ro + 18.f * scale) : (ro + 7.f * scale);
+    const float tx = std::clamp(x - dw * 0.5f, 12.f, std::max(12.f, W - dw - 12.f));
+    const float ty = std::clamp(y + below_pad, 12.f, std::max(12.f, H - dh - 12.f));
+    c.text_outlined(tx, ty, font_sz, 0xFFFFFFFFu, dark, dist_buf);
 
-    c.rect_filled(px0, py0, px0 + pill_w, py0 + pill_h, 0x0B1018C8u, 4.f * scale);
-    c.rect(px0, py0, px0 + pill_w, py0 + pill_h, (col & 0xFFFFFF00u) | 0x99u, 4.f * scale, 1.f);
-    c.text_outlined(px0 + pad_x, py0 + pad_y, font_sz, 0xFFFFFFFFu, dark, dist_buf);
-    c.text_outlined(px0 + pad_x + dw + gap, py0 + pad_y, font_sz, elev_col, dark, elev_buf);
-
+    // 5. Subtle frameless skip-travel landmark micro-hint below distance
     if (extra_line && *extra_line) {
-        const float sub_sz = 13.5f * scale;
+        const float sub_sz = 13.f * scale;
         float sw = 0.f, sh = 0.f;
         c.measure_text(sub_sz, extra_line, &sw, &sh);
-        const float sw_box = sw + 2.f * pad_x;
-        const float sh_box = sh + 2.f * pad_y;
-        const float spx0 = std::clamp(x - sw_box * 0.5f, 8.f, std::max(8.f, W - sw_box - 8.f));
-        const float spy0 = std::clamp(y + r + 12.f * scale, 8.f, std::max(8.f, H - sh_box - 8.f));
-        c.rect_filled(spx0, spy0, spx0 + sw_box, spy0 + sh_box, 0x071A24D8u, 4.f * scale);
-        c.rect(spx0, spy0, spx0 + sw_box, spy0 + sh_box, 0x4DD0E1BBu, 4.f * scale, 1.f);
-        c.text_outlined(spx0 + pad_x, spy0 + pad_y, sub_sz, 0x80DEEAFFu, dark, extra_line);
+        const float pad_x = 8.f * scale, pad_y = 2.5f * scale;
+        const float slx = std::clamp(x - sw * 0.5f, 16.f, std::max(16.f, W - sw - 16.f));
+        const float sly = std::clamp(ty + dh + 4.f * scale, 12.f, std::max(12.f, H - sh - 12.f));
+        c.rect_filled(slx - pad_x, sly - pad_y, slx + sw + pad_x, sly + sh + pad_y, 0x06131CA0u, 3.f * scale);
+        c.line(slx - pad_x, sly - pad_y, slx + sw + pad_x, sly - pad_y, 0x4DD0E199u, 1.f);
+        c.text_outlined(slx, sly, sub_sz, 0xB2EBF2F0u, dark, extra_line);
     }
 }
 
@@ -571,51 +614,46 @@ void draw_edge_arrow(const nxrt::gfx::HudCanvas& c, float sx, float sy, float sc
     if (len < 1e-3f) { dx = 0.f; dy_s = -1.f; }
     else { dx /= len; dy_s /= len; }
 
-    const float margin_x = 90.f * scale;
-    const float margin_y = 110.f * scale;
-    const float max_x = cx - margin_x;
-    const float max_y = cy - margin_y;
-    const float tx = (std::fabs(dx) > 1e-4f) ? (max_x / std::fabs(dx)) : 1e9f;
-    const float ty = (std::fabs(dy_s) > 1e-4f) ? (max_y / std::fabs(dy_s)) : 1e9f;
-    const float t = std::min(tx, ty);
-    const float ex = cx + dx * t;
-    const float ey = cy + dy_s * t;
+    // Elliptical 16:9 safe-zone orbit (smoothly glides around screen instead of sticking to corners)
+    const float rx = W * 0.41f;
+    const float ry = H * 0.37f;
+    const float ex = cx + dx * rx;
+    const float ey = cy + dy_s * ry;
 
-    const float sz = 14.f * scale;
-    const float px = -dy_s, py = dx;  // perpendicular
-    const float tip_x = ex + dx * sz;
-    const float tip_y = ey + dy_s * sz;
-    const float b1_x = ex - dx * (sz * 0.6f) + px * (sz * 0.8f);
-    const float b1_y = ey - dy_s * (sz * 0.6f) + py * (sz * 0.8f);
-    const float b2_x = ex - dx * (sz * 0.6f) - px * (sz * 0.8f);
-    const float b2_y = ey - dy_s * (sz * 0.6f) - py * (sz * 0.8f);
+    const float sz = 11.f * scale;
+    const float px = -dy_s, py = dx;
+    const uint32_t col70 = (col & 0xFFFFFF00u) | 0xB4u;  // 70% alpha so off-screen hint never steals focus
+    const float tip_x = ex + dx * (sz * 1.15f);
+    const float tip_y = ey + dy_s * (sz * 1.15f);
+    const float b1_x = ex - dx * (sz * 0.45f) + px * (sz * 0.72f);
+    const float b1_y = ey - dy_s * (sz * 0.45f) + py * (sz * 0.72f);
+    const float b2_x = ex - dx * (sz * 0.45f) - px * (sz * 0.72f);
+    const float b2_y = ey - dy_s * (sz * 0.45f) - py * (sz * 0.72f);
 
-    c.triangle_filled(tip_x, tip_y, b1_x, b1_y, b2_x, b2_y, col);
+    c.triangle_filled(tip_x, tip_y, b1_x, b1_y, b2_x, b2_y, 0x00000090u);
+    c.triangle_filled(tip_x - dx * 1.2f, tip_y - dy_s * 1.2f, b1_x, b1_y, b2_x, b2_y, col70);
 
     char label[48];
-    char elev[24];
-    uint32_t elev_col = 0xFFFFFFFFu;
-    format_elev(dy, elev, sizeof elev, elev_col);
-    std::snprintf(label, sizeof label, "%dm %s", static_cast<int>(std::lround(dist)), elev);
-    const float font_sz = 16.f * scale;
+    const int idy = static_cast<int>(std::lround(dy));
+    if (std::abs(idy) >= 3) {
+        std::snprintf(label, sizeof label, "%dm %s%dm", static_cast<int>(std::lround(dist)), idy > 0 ? "▲+" : "▼", idy);
+    } else {
+        std::snprintf(label, sizeof label, "%dm", static_cast<int>(std::lround(dist)));
+    }
+    const float font_sz = 14.5f * scale;
     float tw = 0.f, th = 0.f;
     c.measure_text(font_sz, label, &tw, &th);
-    const float lx = std::clamp(ex - dx * (sz * 1.8f) - tw * 0.5f, 16.f, W - tw - 16.f);
-    const float ly = std::clamp(ey - dy_s * (sz * 1.8f) - th * 0.5f, 16.f, H - th - 16.f);
-    c.rect_filled(lx - 7.f * scale, ly - 3.f * scale, lx + tw + 7.f * scale, ly + th + 3.f * scale, 0x0B1018D8u, 4.f * scale);
-    c.rect(lx - 7.f * scale, ly - 3.f * scale, lx + tw + 7.f * scale, ly + th + 3.f * scale, (col & 0xFFFFFF00u) | 0xAAu, 4.f * scale, 1.f);
-    c.text_outlined(lx, ly, font_sz, 0xFFFFFFFFu, 0x000000DDu, label);
+    const float lx = std::clamp(ex - dx * (sz * 2.4f) - tw * 0.5f, 18.f, W - tw - 18.f);
+    const float ly = std::clamp(ey - dy_s * (sz * 2.4f) - th * 0.5f, 18.f, H - th - 18.f);
+    c.text_outlined(lx, ly, font_sz, 0xFFFFFFC8u, 0x000000B8u, label);
 
     if (extra_line && *extra_line) {
-        const float sub_sz = 13.f * scale;
+        const float sub_sz = 12.f * scale;
         float sw = 0.f, sh = 0.f;
         c.measure_text(sub_sz, extra_line, &sw, &sh);
-        const float pad_x = 7.f * scale, pad_y = 3.f * scale;
-        const float slx = std::clamp(lx + (tw - sw) * 0.5f, 16.f, W - sw - 16.f);
-        const float sly = std::clamp(ly + th + 8.f * scale, 16.f, H - sh - 16.f);
-        c.rect_filled(slx - pad_x, sly - pad_y, slx + sw + pad_x, sly + sh + pad_y, 0x071A24CCu, 4.f * scale);
-        c.rect(slx - pad_x, sly - pad_y, slx + sw + pad_x, sly + sh + pad_y, 0x4DD0E1AAu, 4.f * scale, 1.f);
-        c.text_outlined(slx, sly, sub_sz, 0x80DEEAFFu, 0x000000CCu, extra_line);
+        const float slx = std::clamp(lx + (tw - sw) * 0.5f, 18.f, W - sw - 18.f);
+        const float sly = std::clamp(ly + th + 3.f * scale, 18.f, H - sh - 18.f);
+        c.text_outlined(slx, sly, sub_sz, 0x80DEEAB8u, 0x000000A8u, extra_line);
     }
 }
 
@@ -637,100 +675,72 @@ void draw_toast(const nxrt::gfx::HudCanvas& c, float scale) {
     c.text_outlined(x0 + pad_x, y0 + pad_y, sz, mode > 0 ? 0xE1F5FEFFu : 0xCFD8DCFFu, 0x000000CCu, msg);
 }
 
-// Clip a 3D world segment against the camera near plane (clip.w >= kNearW) and project to screen.
-bool clip_and_project_seg(const float m[16], const NavVec3& a, const NavVec3& b,
-                          float W, float H, float& sx0, float& sy0, float& sx1, float& sy1) {
-    constexpr float kNearW = 0.35f;
-    auto to_clip = [&](const NavVec3& v, float out[4]) {
-        out[0] = v.x * m[0] + v.y * m[4] + v.z * m[8]  + m[12];
-        out[1] = v.x * m[1] + v.y * m[5] + v.z * m[9]  + m[13];
-        out[2] = v.x * m[2] + v.y * m[6] + v.z * m[10] + m[14];
-        out[3] = v.x * m[3] + v.y * m[7] + v.z * m[11] + m[15];
-    };
-    float c0[4], c1[4];
-    to_clip(a, c0);
-    to_clip(b, c1);
-    const bool in0 = (c0[3] >= kNearW);
-    const bool in1 = (c1[3] >= kNearW);
-    if (!in0 && !in1) return false;
-    if (!in0 || !in1) {
-        const float denom = c0[3] - c1[3];
-        if (std::fabs(denom) < 1e-6f) return false;
-        const float t = std::clamp((c0[3] - kNearW) / denom, 0.f, 1.f);
-        float cm[4];
-        for (int i = 0; i < 4; ++i) cm[i] = c0[i] + (c1[i] - c0[i]) * t;
-        if (!in0) std::memcpy(c0, cm, sizeof cm);
-        else      std::memcpy(c1, cm, sizeof cm);
-    }
-    if (c0[3] < 1e-4f || c1[3] < 1e-4f) return false;
-    sx0 = (c0[0] / c0[3] * 0.5f + 0.5f) * W;
-    sy0 = (0.5f - c0[1] / c0[3] * 0.5f) * H;
-    sx1 = (c1[0] / c1[3] * 0.5f + 0.5f) * W;
-    sy1 = (0.5f - c1[1] / c1[3] * 0.5f) * H;
-    // Reject wildly off-screen segments
-    if ((sx0 < -W && sx1 < -W) || (sx0 > 2.f * W && sx1 > 2.f * W) ||
-        (sy0 < -H && sy1 < -H) || (sy0 > 2.f * H && sy1 > 2.f * H)) return false;
-    return true;
-}
-
-void draw_ground_guide_line(const nxrt::gfx::HudCanvas& c, const float vp[16],
-                            const Vec3& player, const std::vector<NavVec3>& pts,
-                            uint32_t base_col, float scale) {
+// Build a true 3D horizontal ground conveyor-belt ribbon (triangle strip) and submit it to the native Vulkan pass.
+void submit_ground_ribbon(const nxrt::gfx::HudCanvas& c, const float vp[16],
+                          const std::vector<NavVec3>& pts, uint32_t base_col) {
     if (pts.size() < 2) return;
-    const float W = static_cast<float>(c.width);
-    const float H = static_cast<float>(c.height);
-    const float lift = 0.50f;  // lift 50 cm above walkable NavMesh so ribbon floats cleanly over grass
+    constexpr float kLift = 0.22f;       // 22 cm above NavMesh floor (hugs terrain cleanly)
+    constexpr float kHalfW = 0.78f;      // 1.56 m world width (XC3-style translucent conveyor belt)
+    constexpr float kNearZero = 2.0f;    // fully transparent under player's feet
+    constexpr float kNearFull = 5.2f;    // full opacity ahead of player
+    constexpr float kFarStart = 42.0f;   // begin soft distance dissipation
+    constexpr float kFarEnd = 68.0f;     // dissolve gently before horizon
 
-    // Animated pulse phase moving forward along the path (18 m/s)
-    const double t_sec = static_cast<double>(now_ms()) * 0.001;
-    const float pulse_phase = static_cast<float>(std::fmod(t_sec * 18.0, 12.0));
+    static thread_local std::vector<nxrt::gfx::Ribbon3DVertex> verts;
+    verts.clear();
+    verts.reserve(256);
 
     float accum_d = 0.f;
-    for (size_t i = 0; i + 1 < pts.size(); ++i) {
-        NavVec3 p0{pts[i].x, pts[i].y + lift, pts[i].z};
-        NavVec3 p1{pts[i + 1].x, pts[i + 1].y + lift, pts[i + 1].z};
-        const float seg_len = std::sqrt((p1.x - p0.x) * (p1.x - p0.x) +
-                                        (p1.y - p0.y) * (p1.y - p0.y) +
-                                        (p1.z - p0.z) * (p1.z - p0.z));
-        const float mx = (p0.x + p1.x) * 0.5f - player.x;
-        const float my = (p0.y + p1.y) * 0.5f - player.y;
-        const float mz = (p0.z + p1.z) * 0.5f - player.z;
-        const float dist = std::sqrt(mx * mx + my * my + mz * mz);
-
-        // Fade out gently beyond 220m so distant mountain silhouettes stay clean,
-        // and skip the first 1.8m right under the player's body.
-        const float path_mid = accum_d + seg_len * 0.5f;
-        if (dist > 260.f || path_mid < 1.8f) {
-            accum_d += seg_len;
-            continue;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        if (i > 0) {
+            const float dx = pts[i].x - pts[i - 1].x;
+            const float dy = pts[i].y - pts[i - 1].y;
+            const float dz = pts[i].z - pts[i - 1].z;
+            accum_d += std::sqrt(dx * dx + dy * dy + dz * dz);
         }
-        float alpha = 1.0f;
-        if (dist > 140.f) alpha = std::clamp(1.0f - (dist - 140.f) / 120.f, 0.15f, 1.0f);
-        if (path_mid < 4.5f) alpha *= std::clamp((path_mid - 1.8f) / 2.7f, 0.15f, 1.0f);
+        if (accum_d > kFarEnd + 3.f) break;
 
-        float sx0, sy0, sx1, sy1;
-        if (clip_and_project_seg(vp, p0, p1, W, H, sx0, sy0, sx1, sy1)) {
-            const float near_boost = std::clamp(1.35f - dist * 0.008f, 0.65f, 1.35f);
-            const uint32_t a_out = static_cast<uint32_t>(alpha * 155.f) & 0xFFu;
-            const uint32_t a_core = static_cast<uint32_t>(alpha * 225.f) & 0xFFu;
-            c.line(sx0, sy0, sx1, sy1, 0x04121E00u | a_out, 5.5f * scale * near_boost);
-            c.line(sx0, sy0, sx1, sy1, (base_col & 0xFFFFFF00u) | a_core, 2.8f * scale * near_boost);
+        // Horizontal XZ tangent for a flat terrain-hugging belt
+        const NavVec3& p_prev = pts[i > 0 ? i - 1 : 0];
+        const NavVec3& p_next = pts[i + 1 < pts.size() ? i + 1 : pts.size() - 1];
+        float tx = p_next.x - p_prev.x;
+        float tz = p_next.z - p_prev.z;
+        const float tlen = std::hypot(tx, tz);
+        if (tlen < 1e-4f) { tx = 1.f; tz = 0.f; }
+        else { tx /= tlen; tz /= tlen; }
+        // Right vector = cross(Up(0,1,0), Tangent(tx,0,tz)) = (tz, 0, -tx)
+        const float rx = tz;
+        const float rz = -tx;
 
-            // Flowing bright bead every 12 m along the path gliding toward the objective
-            const float d0 = std::fmod(accum_d - pulse_phase + 12000.f, 12.0f);
-            if (seg_len > 0.1f && d0 < seg_len) {
-                const float frac = d0 / seg_len;
-                const float bx = sx0 + (sx1 - sx0) * frac;
-                const float by = sy0 + (sy1 - sy0) * frac;
-                if (bx >= 16.f && bx <= W - 16.f && by >= 16.f && by <= H - 16.f) {
-                    const float br = 4.2f * scale * near_boost;
-                    c.circle_filled(bx, by, br + 1.5f * scale, 0x04121E00u | a_out);
-                    c.circle_filled(bx, by, br, 0xFFFFFF00u | a_core);
-                }
-            }
+        float fade = 1.0f;
+        if (accum_d < kNearFull) {
+            fade = std::clamp((accum_d - kNearZero) / (kNearFull - kNearZero), 0.f, 1.f);
+            fade = fade * fade * (3.f - 2.f * fade);
+        } else if (accum_d > kFarStart) {
+            fade = std::clamp(1.0f - (accum_d - kFarStart) / (kFarEnd - kFarStart), 0.f, 1.f);
+            fade = fade * fade * (3.f - 2.f * fade);
         }
-        accum_d += seg_len;
+
+        const float y = pts[i].y + kLift;
+        verts.push_back({pts[i].x - rx * kHalfW, y, pts[i].z - rz * kHalfW, -1.0f, accum_d, fade});
+        verts.push_back({pts[i].x + rx * kHalfW, y, pts[i].z + rz * kHalfW,  1.0f, accum_d, fade});
     }
+
+    if (verts.size() < 4) return;
+
+    nxrt::gfx::Ribbon3DParams prm;
+    std::memcpy(prm.view_proj, vp, sizeof prm.view_proj);
+    prm.color[0] = static_cast<float>((base_col >> 24) & 0xFFu) / 255.f;
+    prm.color[1] = static_cast<float>((base_col >> 16) & 0xFFu) / 255.f;
+    prm.color[2] = static_cast<float>((base_col >> 8)  & 0xFFu) / 255.f;
+    prm.color[3] = 0.92f;
+    const int64_t t_ms = now_ms();
+    prm.time_sec = static_cast<float>(static_cast<double>(t_ms % 10000000LL) * 0.001);
+    const int64_t rev_t0 = g_reveal_start_ms.load(std::memory_order_relaxed);
+    const float rev_frac = (rev_t0 > 0) ? std::clamp(static_cast<float>(t_ms - rev_t0) / 450.f, 0.f, 1.f) : 1.f;
+    prm.reveal_dist = 4.f + rev_frac * (kFarEnd + 10.f);
+    prm.occluded_alpha = 0.14f;
+    c.set_ribbon_3d(verts.data(), static_cast<uint32_t>(verts.size()), prm);
 }
 
 }  // namespace
@@ -755,6 +765,7 @@ void toggle() {
     const int cur = g_mode.load(std::memory_order_relaxed);
     const int next = (cur == 2) ? 1 : (cur == 1) ? 0 : 2;
     g_mode.store(next, std::memory_order_relaxed);
+    if (next == 2) g_reveal_start_ms.store(now_ms(), std::memory_order_relaxed);
     g_toast_until_ms.store(now_ms() + 2400, std::memory_order_relaxed);
     NXLOG_I(kTag, "3D nav overlay mode=%d (F3)", next);
 }
@@ -794,10 +805,11 @@ void draw(const nxrt::gfx::HudCanvas& c) {
     Vec3 player{};
     if (!read_player_pos(mb, cam_tgt, player)) return;
 
-    // 3. Collect active quest/objective locators on the current map.
+    // 3. Collect active tracked quest locators on the current map (cat 0 = Main Story, cat 1 = Active Sub/Blade Quest).
     std::vector<NavMarker> markers;
     markers.reserve(16);
-    collect_locators(mb, map_id, markers);
+    uint32_t offmap_main = 0;
+    collect_locators(mb, map_id, markers, offmap_main);
 
     for (auto& m : markers) {
         const float dx = m.pos.x - player.x;
@@ -860,7 +872,7 @@ void draw(const nxrt::gfx::HudCanvas& c) {
                             {markers[0].pos.x, markers[0].pos.y, markers[0].pos.z},
                             nav_path);
         if (nav_path.reachable && nav_path.map_res == map_res && nav_path.points.size() >= 2) {
-            draw_ground_guide_line(c, vp, player, nav_path.points, kind_color(markers[0].kind), scale);
+            submit_ground_ribbon(c, vp, nav_path.points, kind_color(markers[0].kind));
         }
     }
 
@@ -905,15 +917,15 @@ void draw(const nxrt::gfx::HudCanvas& c) {
                 std::snprintf(pinfo, sizeof pinfo, " | mesh=%s(%s)", map_res, nav_path.loaded ? "unreach" : "loading");
             }
             std::snprintf(dbg, sizeof dbg,
-                          "NAV map=%u(%s) | P(%.1f, %.1f, %.1f) | T0(%.1f, %.1f, %.1f) d=%.0fm dy=%+.0fm | loc=%zu lm=%zu%s",
+                          "NAV map=%u(%s) | P(%.1f, %.1f, %.1f) | T0[c%u](%.1f, %.1f, %.1f) d=%.0fm dy=%+.0fm | loc=%zu offMain=%u lm=%zu%s",
                           map_id, map_res[0] ? map_res : "?",
                           player.x, player.y, player.z,
-                          markers[0].pos.x, markers[0].pos.y, markers[0].pos.z,
-                          markers[0].dist, markers[0].dy, markers.size(), landmarks.size(), pinfo);
+                          markers[0].cat, markers[0].pos.x, markers[0].pos.y, markers[0].pos.z,
+                          markers[0].dist, markers[0].dy, markers.size(), offmap_main, landmarks.size(), pinfo);
         } else {
             std::snprintf(dbg, sizeof dbg,
-                          "NAV map=%u | P(%.1f, %.1f, %.1f) | loc=0 lm=%zu",
-                          map_id, player.x, player.y, player.z, landmarks.size());
+                          "NAV map=%u | P(%.1f, %.1f, %.1f) | loc=0 offMain=%u lm=%zu",
+                          map_id, player.x, player.y, player.z, offmap_main, landmarks.size());
         }
         const float sz = 14.f * scale;
         float tw = 0.f, th = 0.f;

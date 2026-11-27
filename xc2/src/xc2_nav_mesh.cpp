@@ -482,31 +482,69 @@ bool build_map_navmesh(const ArhIndex& arh, const std::string& map_res, MapNavMe
     return !out.polys.empty();
 }
 
-// Smooth portal polyline gently (Laplacian + min spacing) while preserving start/end and ground elevation.
+// Smooth portal polyline (Laplacian straightening + Catmull-Rom uniform resampling) while hugging terrain elevation.
 void smooth_path(std::vector<NavVec3>& pts) {
     if (pts.size() <= 2) return;
-    // 2 passes of gentle 3-point smoothing on XZ (lighter on Y to hug terrain elevation closely)
+
+    // 1. 4 passes of gentle Laplacian smoothing on XZ (lighter on Y to preserve slope contour)
     std::vector<NavVec3> tmp = pts;
-    for (int pass = 0; pass < 2; ++pass) {
+    for (int pass = 0; pass < 4; ++pass) {
         for (size_t i = 1; i + 1 < pts.size(); ++i) {
-            tmp[i].x = pts[i - 1].x * 0.25f + pts[i].x * 0.5f + pts[i + 1].x * 0.25f;
-            tmp[i].y = pts[i - 1].y * 0.15f + pts[i].y * 0.7f + pts[i + 1].y * 0.15f;
-            tmp[i].z = pts[i - 1].z * 0.25f + pts[i].z * 0.5f + pts[i + 1].z * 0.25f;
+            tmp[i].x = pts[i - 1].x * 0.28f + pts[i].x * 0.44f + pts[i + 1].x * 0.28f;
+            tmp[i].y = pts[i - 1].y * 0.15f + pts[i].y * 0.70f + pts[i + 1].y * 0.15f;
+            tmp[i].z = pts[i - 1].z * 0.28f + pts[i].z * 0.44f + pts[i + 1].z * 0.28f;
         }
         pts.swap(tmp);
     }
-    // Thin out dense points closer than 1.8m so ribbon segments stay clean and uniform
-    std::vector<NavVec3> out;
-    out.reserve(pts.size());
-    out.push_back(pts.front());
+
+    // 2. Thin out tight micro-zigzags (< 2.5m) into clean control points
+    std::vector<NavVec3> ctrl;
+    ctrl.reserve(pts.size());
+    ctrl.push_back(pts.front());
     for (size_t i = 1; i + 1 < pts.size(); ++i) {
-        const NavVec3& prev = out.back();
+        const NavVec3& prev = ctrl.back();
         const float dx = pts[i].x - prev.x, dy = pts[i].y - prev.y, dz = pts[i].z - prev.z;
-        if (dx * dx + dy * dy + dz * dz >= 3.24f) {
-            out.push_back(pts[i]);
+        if (dx * dx + dy * dy + dz * dz >= 6.25f) {
+            ctrl.push_back(pts[i]);
         }
     }
-    out.push_back(pts.back());
+    ctrl.push_back(pts.back());
+    if (ctrl.size() <= 2) {
+        pts.swap(ctrl);
+        return;
+    }
+
+    // 3. Catmull-Rom spline resampling at ~1.25m world spacing for silky curved 3D ribbon
+    auto catmull = [](const NavVec3& p0, const NavVec3& p1, const NavVec3& p2, const NavVec3& p3, float t) -> NavVec3 {
+        const float t2 = t * t;
+        const float t3 = t2 * t;
+        auto eval = [&](float v0, float v1, float v2, float v3) {
+            return 0.5f * ((2.0f * v1) +
+                           (-v0 + v2) * t +
+                           (2.0f * v0 - 5.0f * v1 + 4.0f * v2 - v3) * t2 +
+                           (-v0 + 3.0f * v1 - 3.0f * v2 + v3) * t3);
+        };
+        return {eval(p0.x, p1.x, p2.x, p3.x), eval(p0.y, p1.y, p2.y, p3.y), eval(p0.z, p1.z, p2.z, p3.z)};
+    };
+
+    std::vector<NavVec3> out;
+    out.reserve(ctrl.size() * 3);
+    out.push_back(ctrl.front());
+    for (size_t i = 0; i + 1 < ctrl.size(); ++i) {
+        const NavVec3& p0 = ctrl[i > 0 ? i - 1 : 0];
+        const NavVec3& p1 = ctrl[i];
+        const NavVec3& p2 = ctrl[i + 1];
+        const NavVec3& p3 = ctrl[i + 2 < ctrl.size() ? i + 2 : ctrl.size() - 1];
+        const float seg_d = std::sqrt((p2.x - p1.x) * (p2.x - p1.x) +
+                                      (p2.y - p1.y) * (p2.y - p1.y) +
+                                      (p2.z - p1.z) * (p2.z - p1.z));
+        const int steps = std::clamp(static_cast<int>(std::ceil(seg_d / 1.25f)), 1, 16);
+        for (int s = 1; s <= steps; ++s) {
+            out.push_back(catmull(p0, p1, p2, p3, static_cast<float>(s) / static_cast<float>(steps)));
+            if (out.size() >= 640) break;
+        }
+        if (out.size() >= 640) break;
+    }
     pts.swap(out);
 }
 

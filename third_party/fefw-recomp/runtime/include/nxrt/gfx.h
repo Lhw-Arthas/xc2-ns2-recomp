@@ -271,6 +271,10 @@ struct FrameInfo {
     uint32_t image_index = 0;
     uint64_t frame_number = 0;            // counts successful begin_frame calls from 0
     bool hdr_output = false;              // the target is an HDR swapchain image (HDR10 / scRGB): colours are encoded, not sRGB
+    VkImageView scene_depth_view = VK_NULL_HANDLE;        // optional read-only 3D scene depth view for overlay depth occlusion
+    VkImageLayout scene_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool scene_depth_flip_y = false;
+    int scene_depth_mode = 0;             // 0=fwd [0,1], 1=rev [0,1], 2=fwd [-1,1], 3=rev [-1,1]
 };
 
 struct RendererStats {
@@ -316,6 +320,8 @@ public:
     // Called from end_frame, after the caller's drawing, with the image still in COLOR_ATTACHMENT_OPTIMAL: record draws that
     // go on top (the ImGui overlay) with a dynamic-rendering pass that loads the image.
     void set_overlay_hook(std::function<void(const FrameInfo&)> hook);
+    // Optional per-frame read-only 3D scene depth view handed to the overlay hook (cleared after end_frame).
+    void set_scene_depth(VkImageView view, VkImageLayout layout, bool flip_y, int depth_mode);
 
     // Present mode. The request is remembered; the mode in use is the closest the surface supports (Mailbox -> Immediate ->
     // Fifo, Immediate -> Mailbox -> Fifo, FifoRelaxed -> Fifo). Recreates the swapchain; false if recreation failed.

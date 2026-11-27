@@ -21,8 +21,12 @@ This directory is a **modified fork** of `Goldoire/fefw-recomp` (the original Gi
 
 | `file` | date | change |
 |---|---|---|
-| `runtime/include/nxrt/overlay.h` | 2026-11-27 | add game-agnostic `HudCanvas` 2D foreground drawing facade and `Overlay::set_hud_callback()` |
-| `runtime/src/gfx/overlay.cpp` | 2026-11-27 | implement `HudCanvas` primitives over `ImGui::GetForegroundDrawList()` and invoke `hud_cb` inside `Overlay::draw()` (SDR + HDR safe, zero input capture) |
+| `runtime/src/gfx/shaders/nav_ribbon.{vert,frag}` | 2026-11-27 | new: GLSL shaders for native Vulkan 3D translucent conveyor-belt navigation ribbon with read-only scene depth occlusion |
+| `runtime/src/gfx/extras/nav_ribbon.{h,cpp}` + `nav_ribbon_shaders.inc` | 2026-11-27 | new: `NavRibbonPass` dynamic-rendering Vulkan 3D ribbon pass (per-slot upload VB, depth sampler, SDR + HDR safe) |
+| `runtime/include/nxrt/gfx.h` + `runtime/src/gfx/vk_renderer.cpp` | 2026-11-27 | pass optional per-frame read-only 3D scene depth view/layout/flip_y/depth_mode into `FrameInfo` for overlay depth occlusion |
+| `runtime/src/gfx/nvn/nvn_replay.cpp` + `nvn_present.cpp` + `nvn_gpu_internal.h` | 2026-11-27 | capture latest 3D G-buffer depth texture (`take_scene_depth`) and hand its sampled depth-aspect view to `Renderer::set_scene_depth()` before overlay draw |
+| `runtime/include/nxrt/overlay.h` | 2026-11-27 | add game-agnostic `HudCanvas` 2D foreground drawing facade, `Ribbon3DVertex` / `Ribbon3DParams` / `set_ribbon_3d()`, and `Overlay::set_hud_callback()` |
+| `runtime/src/gfx/overlay.cpp` | 2026-11-27 | implement `HudCanvas` primitives + `NavRibbonPass` 3D ribbon draw before ImGui inside `Overlay::draw()` (SDR + HDR safe, zero input capture) |
 | `runtime/include/nxrt/play.h` | 2026-11-27 | expose `play::set_hud_callback()` to register a foreground HUD drawer |
 | `runtime/src/gfx/play/play.cpp` | 2026-11-27 | wire `play::set_hud_callback()` to `st.overlay` and clear it on `play::stop()` |
 | `runtime/src/gfx/nvn/nvn_prewarm.cpp` | 2026-11-27 | record and prewarm `uint_samplers` (`uint_tex_patch`) pipelines in player-local `pipeline_keys.bin` (`NXPKEYS2`), eliminating repeated draw-time fragment shader compiles for stencil/integer-sampler shaders |

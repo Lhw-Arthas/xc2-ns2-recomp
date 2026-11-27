@@ -799,6 +799,8 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
         barrier(slot.cmd, t.image, kColorAtt, kColorAtt);
         s.overlay(s.info);
     }
+    s.info.scene_depth_view = VK_NULL_HANDLE;
+    s.info.scene_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     const bool capturing = s.cap_pending.load(std::memory_order_acquire) && (s.headless || s.capture_supported);
     Buffer cap;
@@ -1039,6 +1041,12 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
 }
 
 void Renderer::set_overlay_hook(std::function<void(const FrameInfo&)> hook) { impl_->overlay = std::move(hook); }
+void Renderer::set_scene_depth(VkImageView view, VkImageLayout layout, bool flip_y, int depth_mode) {
+    impl_->info.scene_depth_view = view;
+    impl_->info.scene_depth_layout = layout;
+    impl_->info.scene_depth_flip_y = flip_y;
+    impl_->info.scene_depth_mode = depth_mode;
+}
 
 bool Renderer::set_present_mode(PresentMode m) {
     Impl& s = *impl_;

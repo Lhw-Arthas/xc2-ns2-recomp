@@ -22,6 +22,21 @@ namespace nxrt::gfx {
 void set_shader_backlog(int pending);
 int shader_backlog();
 
+// 3D ground navigation ribbon vertex & parameters (rendered by native Vulkan pass before ImGui, with depth occlusion).
+struct Ribbon3DVertex {
+    float x = 0.f, y = 0.f, z = 0.f;
+    float u = 0.f, v = 0.f;
+    float fade = 1.f;
+};
+
+struct Ribbon3DParams {
+    float view_proj[16] = {};
+    float color[4] = {0.22f, 0.85f, 1.0f, 0.88f};
+    float time_sec = 0.f;
+    float reveal_dist = 100.f;
+    float occluded_alpha = 0.14f;
+};
+
 // Lightweight game-agnostic 2D foreground canvas backed by ImGui's foreground draw list (no ImGui header needed by callers,
 // works transparently on both SDR and HDR swapchains, never captures input).
 struct HudCanvas {
@@ -29,6 +44,7 @@ struct HudCanvas {
     uint32_t height = 0;
     void* draw_list = nullptr;
     void* font = nullptr;
+    void* ribbon_sink = nullptr;
 
     void rect_filled(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding = 0.f) const;
     void rect(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding = 0.f, float thickness = 1.f) const;
@@ -41,6 +57,7 @@ struct HudCanvas {
     void text(float x, float y, float size, uint32_t rgba, const char* str) const;
     void text_outlined(float x, float y, float size, uint32_t rgba, uint32_t outline_rgba, const char* str) const;
     void measure_text(float size, const char* str, float* out_w, float* out_h) const;
+    void set_ribbon_3d(const Ribbon3DVertex* verts, uint32_t count, const Ribbon3DParams& params) const;
 };
 
 class Overlay {

@@ -371,6 +371,7 @@ int depth_mode();
 gfx::Renderer* renderer();
 FrameLimiter* limiter();
 PresentPass* present_pass();
+Ref<Texture> take_scene_depth(int* out_depth_mode);
 extras::OutputPass* output_pass();
 bool keep_aspect();
 
