@@ -26,7 +26,6 @@
 #include "nxrt/nvn_backend.h"
 #include "nxrt/write_watch.h"
 #include "vk_gauges.h"
-#include "nvn_capture_spans.h"
 #include "nvn_gpu_internal.h"
 #include "nvn_mirror_cap.h"
 

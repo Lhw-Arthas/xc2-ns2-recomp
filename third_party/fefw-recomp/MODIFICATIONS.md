@@ -21,6 +21,9 @@ This directory is a **modified fork** of `Goldoire/fefw-recomp` (the original Gi
 
 | `file` | date | change |
 |---|---|---|
+| `runtime/src/gfx/nvn/nvn_gpu_texture.cpp` | 2026-11-27 | remove legacy 2026-11-21 `4k target` / `film texture` hot-path mutex+clock+map logging probe from `tex_mark_gpu_written()` |
+| `runtime/src/services/hid.cpp` | 2026-11-27 | downgrade periodic normal `hid: pad 0 state` log from `NXLOG_W` to `NXLOG_D` (keep `OUT OF RANGE` at `NXLOG_W`) |
+| `runtime/src/gfx/nvn/nvn_gpu_pool.cpp` | 2026-11-27 | remove unused `#include "nvn_capture_spans.h"` and dead `nvn_capture_spans.h` / `test_nvn_capture_spans.cpp` superseded by PR #84 |
 | `runtime/src/gfx/nvn/nvn_gpu.cpp` | 2026-11-27 | stop post-`VK_ERROR_DEVICE_LOST` memory explosion (#81, #41): drain `deferred` destroys and free cached upload chunks in `retire()` on `device_lost()`, short-circuit `submit()` / `submit_on_render_thread()` / `serial_done()` on `device_lost()`, drain deferred destroys on `present()` when lost, and only grow a new `VkDescriptorPool` in `Frame::alloc_set()` on `VK_ERROR_OUT_OF_POOL_MEMORY` / `VK_ERROR_FRAGMENTED_POOL` |
 | `runtime/src/gfx/nvn/nvn_gpu_pool.cpp` | 2026-11-27 | skip `mirror_capture_take()` on `device_lost()`, destroy returned `CapArena` buffers immediately when lost instead of caching, and add `~MirrorCapture()` so dropped captures never leak arenas (#81) |
 | `runtime/src/gfx/nvn/nvn_texprep.cpp` | 2026-11-27 | skip VMA staging buffer creation in background `nvn-texprep` workers once `device_lost()` is latched (#81) |
