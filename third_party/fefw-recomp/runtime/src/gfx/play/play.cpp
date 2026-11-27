@@ -1613,6 +1613,7 @@ bool start(const StartOptions& opt) {
 void stop() {
     G& st = g();
     if (!st.started) return;
+    if (st.overlay) st.overlay->set_hud_callback({});
     nxrt::cheats::clear();
     vpad_shutdown();      // a virtual pad from a test script does not outlive play mode
     if (const GamePlay* gp = game_play(); gp && gp->remove) gp->remove();
@@ -1634,6 +1635,11 @@ void stop() {
 bool overlay_blocks_game() {
     const G& st = g();
     return st.started && st.overlay && st.overlay->blocks_game();
+}
+
+void set_hud_callback(std::function<void(const gfx::HudCanvas&)> fn) {
+    G& st = g();
+    if (st.overlay) st.overlay->set_hud_callback(std::move(fn));
 }
 
 void set_external_mouse_capture(bool on) {

@@ -1,0 +1,776 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "xc2_nav_overlay.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+#include "nxrt/config.h"
+#include "nxrt/log.h"
+#include "nxrt/memory.h"
+
+namespace xc2::nav {
+namespace {
+
+constexpr const char* kTag = "nav";
+
+// Verified retail 3.0.1 (build id 8BEF68ED1EEBC24B) main-relative read-only offsets.
+namespace off301 {
+constexpr uint64_t kGfInfoViewMat        = 0x11a9a60;  // float[16]
+constexpr uint64_t kGfInfoViewProj       = 0x11a9ae0;  // float[16], row-vector (v * M)
+constexpr uint64_t kGfInfoCamPos         = 0x11a9b20;  // float[3]
+constexpr uint64_t kGfInfoCamTgt         = 0x11a9b40;  // float[3]
+constexpr uint64_t kMapIdSingleton       = 0x1070f88;  // ptr -> +0x0C uint32_t currentMapBdatId
+constexpr uint64_t kFormationSingleton   = 0x1070c48;  // ptr -> +0x1A8 uint64_t controlMoverHandle
+constexpr uint64_t kObjManagerSingleton  = 0x11b3f70;  // ptr -> +0x420228 bitmap, +0x420230 node[4096] (stride 0x420)
+constexpr uint64_t kMenuLocationSingleton = 0x11ac248; // ptr -> cat 4 (+0x18..+0x2C), cat 0..3 (+0x48 + cat*0x430)
+constexpr uint64_t kGmkManagerSingleton   = 0x1070978; // ptr -> +0xF358/+0xF360 GmkSet* vector -> +0x1B8 GmkList*[] ('LDMK')
+constexpr uint64_t kDataBdatSingleton     = 0x0f2d290; // ptr -> +0x10 + idx*8 decrypted BDAT table pointers (526 entries)
+constexpr uint32_t kBdatIdxFldLandmarkMsg = 443u;      // [443] (0x1bb) fld_landmark (active language landmark names)
+constexpr uint32_t kFourCcLdmk            = 0x4b4d444cu; // 'LDMK' (TGmkList<GmkLandmark>)
+
+// 3.0.1 AFieldLocator subclass vtables (relative to main_base).
+constexpr uint64_t kVtBatEnemyId         = 0xe28dd8;   // FixedVector<Vec3> arr=+0x830, cnt=+0x930
+constexpr uint64_t kVtBatEnemyGroup      = 0xe28e20;   // FixedVector<Vec3> arr=+0x060, cnt=+0x160
+constexpr uint64_t kVtBatEnemySpecies    = 0xe28e68;   // FixedVector<Vec3> arr=+0x020, cnt=+0x120
+constexpr uint64_t kVtTalkNpcId          = 0xe28eb0;   // active u8=+0x1A, Vec3=+0x20
+constexpr uint64_t kVtTalkDummyGroup     = 0xe28ef8;   // FixedVector<Vec3> arr=+0x040, cnt=+0x0D0
+constexpr uint64_t kVtReach              = 0xe28f40;   // active u8=+0x18, Vec3=+0x20
+constexpr uint64_t kVtTbox               = 0xe28f88;   // active u8=+0x58, Vec3=+0x60
+constexpr uint64_t kVtPrecious           = 0xe28fd0;   // FixedVector<Vec3> arr=+0x430, cnt=+0x530
+constexpr uint64_t kVtEventPreorder      = 0xe29038;   // active u8=+0x58, Vec3=+0x60
+constexpr uint64_t kVtPreciousPreorder   = 0xe29080;   // active u8=+0x58, Vec3=+0x60
+constexpr uint64_t kVtGimmick            = 0xe290c8;   // active u8=+0x1A, Vec3=+0x20
+constexpr uint64_t kVtDlcArr1            = 0xe29110;   // FixedVector<Vec3> arr=+0x020, cnt=+0x120
+constexpr uint64_t kVtDlcArr2            = 0xe29158;   // FixedVector<Vec3> arr=+0x020, cnt=+0x120
+}  // namespace off301
+
+struct Vec3 {
+    float x = 0.f, y = 0.f, z = 0.f;
+};
+
+inline bool is_finite3(const Vec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) &&
+           std::fabs(v.x) < 1e6f && std::fabs(v.y) < 1e6f && std::fabs(v.z) < 1e6f;
+}
+
+template <typename T>
+bool safe_read(uint64_t addr, T& out) {
+    if (addr < 0x10000ull || addr > UINT64_MAX - sizeof(T)) return false;
+    if (!nxrt::mem::is_mapped(addr, sizeof(T))) return false;
+    std::memcpy(&out, reinterpret_cast<const void*>(addr), sizeof(T));
+    return true;
+}
+
+bool safe_read_bytes(uint64_t addr, void* dst, size_t n) {
+    if (addr < 0x10000ull || addr > UINT64_MAX - n) return false;
+    if (!nxrt::mem::is_mapped(addr, n)) return false;
+    std::memcpy(dst, reinterpret_cast<const void*>(addr), n);
+    return true;
+}
+
+std::atomic<uint64_t> g_main_base{0};
+std::atomic<bool> g_enabled{true};
+std::atomic<bool> g_debug{false};
+std::atomic<int64_t> g_toast_until_ms{0};
+
+int64_t now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+enum class MarkerKind : uint8_t {
+    MainStory = 0,
+    Quest     = 1,
+    Battle    = 2,
+    Collect   = 3,
+    Pin       = 4,
+};
+
+struct NavMarker {
+    Vec3 pos;
+    MarkerKind kind = MarkerKind::Quest;
+    uint32_t cat = 0;
+    uint32_t icon_id = 0;
+    float dist = 0.f;
+    float dy = 0.f;
+};
+
+bool read_player_pos(uint64_t mb, const Vec3& cam_tgt, Vec3& out) {
+    // 1. Try GfGamePlayerFormation::s_instance -> +0x1A8 handle -> GfObjManager -> GfObj -> GfComTransform -> pos
+    uint64_t form = 0;
+    uint64_t handle = ~0ull;
+    if (safe_read(mb + off301::kFormationSingleton, form) && form &&
+        safe_read(form + 0x1a8, handle) && handle != ~0ull) {
+        uint64_t mgr = 0;
+        if (safe_read(mb + off301::kObjManagerSingleton, mgr) && mgr) {
+            const uint64_t tbl = mgr + 0x420000ull;
+            uint64_t bitmap_ptr = 0, nodes_ptr = 0;
+            if (safe_read(tbl + 0x228, bitmap_ptr) && safe_read(tbl + 0x230, nodes_ptr) &&
+                bitmap_ptr && nodes_ptr) {
+                const uint32_t slot = static_cast<uint32_t>(handle & 0xFFFull);
+                const uint32_t word_idx = static_cast<uint32_t>((handle >> 5) & 0x7Full);
+                uint32_t bits = 0;
+                if (safe_read(bitmap_ptr + static_cast<uint64_t>(word_idx) * 4ull, bits) &&
+                    ((bits >> (handle & 31u)) & 1u) != 0u) {
+                    const uint64_t node = nodes_ptr + static_cast<uint64_t>(slot) * 0x420ull;
+                    uint64_t node_handle = 0;
+                    uint64_t obj = 0;
+                    if (safe_read(node + 0x08, node_handle) && node_handle == handle &&
+                        safe_read(node + 0x18, obj) && obj) {
+                        uint64_t com_tf = 0, tf_data = 0;
+                        Vec3 p{};
+                        if (safe_read(obj + 0x38, com_tf) && com_tf &&
+                            safe_read(com_tf + 0x10, tf_data) && tf_data &&
+                            safe_read(tf_data + 0x40, p) && is_finite3(p)) {
+                            out = p;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2. Fallback: camera target is always anchored near the player's chest during field exploration.
+    if (is_finite3(cam_tgt) && (std::fabs(cam_tgt.x) + std::fabs(cam_tgt.y) + std::fabs(cam_tgt.z) > 1e-3f)) {
+        out = cam_tgt;
+        return true;
+    }
+    return false;
+}
+
+bool read_current_map_id(uint64_t mb, uint32_t& out_map_id) {
+    uint64_t mgr = 0;
+    if (!safe_read(mb + off301::kMapIdSingleton, mgr) || !mgr) return false;
+    uint32_t id = 0;
+    if (!safe_read(mgr + 0x0C, id)) return false;
+    out_map_id = id;
+    return id != 0;
+}
+
+void push_unique_marker(std::vector<NavMarker>& out, const Vec3& pos, MarkerKind kind, uint32_t cat, uint32_t icon_id) {
+    if (!is_finite3(pos)) return;
+    if (std::fabs(pos.x) < 1e-4f && std::fabs(pos.y) < 1e-4f && std::fabs(pos.z) < 1e-4f) return;
+    for (const auto& m : out) {
+        const float dx = m.pos.x - pos.x, dy = m.pos.y - pos.y, dz = m.pos.z - pos.z;
+        if (dx * dx + dy * dy + dz * dz < 2.25f) return;  // deduplicate within 1.5m
+    }
+    if (out.size() >= 32) return;
+    NavMarker nm;
+    nm.pos = pos;
+    nm.kind = kind;
+    nm.cat = cat;
+    nm.icon_id = icon_id;
+    out.push_back(nm);
+}
+
+void collect_locators(uint64_t mb, uint32_t current_map_id, std::vector<NavMarker>& out) {
+    uint64_t loc_mgr = 0;
+    if (!safe_read(mb + off301::kMenuLocationSingleton, loc_mgr) || !loc_mgr) return;
+
+    // Category 4: single special/DLC locator at loc_mgr + 0x18 / +0x1A / +0x20.
+    {
+        uint16_t flag18 = 0;
+        uint8_t cnt1a = 0;
+        Vec3 p{};
+        if (safe_read(loc_mgr + 0x18, flag18) && flag18 != 0 &&
+            safe_read(loc_mgr + 0x1A, cnt1a) && cnt1a > 0 &&
+            safe_read(loc_mgr + 0x20, p)) {
+            push_unique_marker(out, p, MarkerKind::Pin, 4, 0);
+        }
+    }
+
+    // Categories 0..3: GfFieldLocator vectors (stride 0x430 per category, starting at +0x48).
+    for (uint32_t cat = 0; cat < 4; ++cat) {
+        const uint64_t cat_base = loc_mgr + 0x48ull + static_cast<uint64_t>(cat) * 0x430ull;
+        uint64_t begin_ptr = 0, end_ptr = 0;
+        if (!safe_read(cat_base, begin_ptr) || !safe_read(cat_base + 8, end_ptr)) continue;
+        if (!begin_ptr || end_ptr <= begin_ptr) continue;
+        const uint64_t span = end_ptr - begin_ptr;
+        if (span > 0x20ull * 128ull) continue;  // sanity guard
+        const size_t n = static_cast<size_t>(span / 0x20ull);
+
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t impl = 0;
+            if (!safe_read(begin_ptr + i * 0x20ull + 0x18ull, impl) || !impl) continue;
+
+            uint64_t vt = 0;
+            uint32_t icon_id = 0, map_id = 0;
+            if (!safe_read(impl, vt) || !safe_read(impl + 0x0C, icon_id) || !safe_read(impl + 0x10, map_id)) continue;
+            if (current_map_id != 0 && map_id != 0 && map_id != current_map_id) continue;
+            if (vt < mb) continue;
+            const uint64_t vt_rva = vt - mb;
+
+            auto default_kind = [&](MarkerKind fallback) -> MarkerKind {
+                if (cat == 0) return MarkerKind::MainStory;
+                return fallback;
+            };
+
+            auto read_single = [&](uint64_t active_off, uint64_t pos_off, MarkerKind kind) {
+                uint8_t active = 0;
+                Vec3 p{};
+                if (safe_read(impl + active_off, active) && active != 0 && safe_read(impl + pos_off, p)) {
+                    push_unique_marker(out, p, default_kind(kind), cat, icon_id);
+                }
+            };
+
+            auto read_array = [&](uint64_t arr_off, uint64_t cnt_off, MarkerKind kind) {
+                uint32_t cnt = 0;
+                if (!safe_read(impl + cnt_off, cnt) || cnt == 0) return;
+                cnt = std::min<uint32_t>(cnt, 16u);
+                for (uint32_t k = 0; k < cnt; ++k) {
+                    Vec3 p{};
+                    if (safe_read(impl + arr_off + static_cast<uint64_t>(k) * 16ull, p)) {
+                        push_unique_marker(out, p, default_kind(kind), cat, icon_id);
+                    }
+                }
+            };
+
+            switch (vt_rva) {
+                case off301::kVtReach:
+                    read_single(0x18, 0x20, MarkerKind::Quest);
+                    break;
+                case off301::kVtTalkNpcId:
+                    read_single(0x1A, 0x20, MarkerKind::Quest);
+                    break;
+                case off301::kVtGimmick:
+                    read_single(0x1A, 0x20, MarkerKind::Collect);
+                    break;
+                case off301::kVtTbox:
+                case off301::kVtEventPreorder:
+                case off301::kVtPreciousPreorder:
+                    read_single(0x58, 0x60, MarkerKind::Collect);
+                    break;
+                case off301::kVtBatEnemyId:
+                    read_array(0x830, 0x930, MarkerKind::Battle);
+                    break;
+                case off301::kVtBatEnemyGroup:
+                    read_array(0x060, 0x160, MarkerKind::Battle);
+                    break;
+                case off301::kVtBatEnemySpecies:
+                    read_array(0x020, 0x120, MarkerKind::Battle);
+                    break;
+                case off301::kVtTalkDummyGroup:
+                    read_array(0x040, 0x0D0, MarkerKind::Quest);
+                    break;
+                case off301::kVtPrecious:
+                    read_array(0x430, 0x530, MarkerKind::Collect);
+                    break;
+                case off301::kVtDlcArr1:
+                case off301::kVtDlcArr2:
+                    read_array(0x020, 0x120, MarkerKind::Quest);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+}
+
+struct LandmarkInfo {
+    Vec3 pos;
+    uint32_t bdat_id = 0;
+    uint64_t pop_bdat_fp = 0;  // maXXa_FLD_LandmarkPop BDAT table in guest memory
+    uint8_t category = 0;
+};
+
+// Minimal read-only BDAT v2 column lookup on already-decrypted in-memory guest tables.
+bool bdat_find_column(uint64_t tbl, const char* col_name, uint16_t& out_val_off, uint8_t& out_type) {
+    uint32_t magic = 0;
+    if (!safe_read(tbl, magic) || magic != 0x54414442u) return false;  // 'BDAT'
+    uint16_t bucket_off = 0, bucket_n = 0;
+    if (!safe_read(tbl + 0x0A, bucket_off) || !safe_read(tbl + 0x0C, bucket_n) || bucket_n == 0 || bucket_n > 256) {
+        return false;
+    }
+
+    // Walk all buckets (small table, immune to hash edge cases).
+    for (uint16_t b = 0; b < bucket_n; ++b) {
+        uint16_t e = 0;
+        if (!safe_read(tbl + bucket_off + static_cast<uint64_t>(b) * 2ull, e)) continue;
+        for (int guard = 0; guard < 64 && e != 0; ++guard) {
+            uint16_t desc = 0, nxt = 0, name_off = 0;
+            if (!safe_read(tbl + e, desc) || !safe_read(tbl + e + 2, nxt) || !safe_read(tbl + e + 4, name_off)) break;
+            char buf[64] = {};
+            if (safe_read_bytes(tbl + name_off, buf, sizeof(buf) - 1)) {
+                buf[sizeof(buf) - 1] = '\0';
+                if (std::strcmp(buf, col_name) == 0) {
+                    uint8_t typ = 0;
+                    uint16_t voff = 0;
+                    if (!safe_read(tbl + desc + 1, typ) || !safe_read(tbl + desc + 2, voff)) return false;
+                    out_type = typ;
+                    out_val_off = voff;
+                    return true;
+                }
+            }
+            e = nxt;
+        }
+    }
+    return false;
+}
+
+bool bdat_row_addr(uint64_t tbl, uint32_t row_id, uint64_t& out_row) {
+    uint16_t row_sz = 0, row_off = 0, row_cnt = 0, id_top = 0;
+    if (!safe_read(tbl + 0x08, row_sz) || !safe_read(tbl + 0x0E, row_off) ||
+        !safe_read(tbl + 0x10, row_cnt) || !safe_read(tbl + 0x12, id_top)) return false;
+    if (row_id < id_top || row_id >= static_cast<uint32_t>(id_top) + row_cnt) return false;
+    out_row = tbl + row_off + static_cast<uint64_t>(row_id - id_top) * row_sz;
+    return true;
+}
+
+bool bdat_read_uint(uint64_t tbl, uint32_t row_id, const char* col_name, uint32_t& out_val) {
+    uint16_t voff = 0;
+    uint8_t typ = 0;
+    uint64_t row = 0;
+    if (!bdat_find_column(tbl, col_name, voff, typ) || !bdat_row_addr(tbl, row_id, row)) return false;
+    // BDAT v2 types: 1=u8, 2=u16, 3=u32, 4=i8, 5=i16, 6=i32, 7=str_off(u32), 8=f32.
+    if (typ == 1 || typ == 4) {
+        uint8_t v = 0;
+        if (!safe_read(row + voff, v)) return false;
+        out_val = v;
+        return true;
+    }
+    if (typ == 2 || typ == 5) {
+        uint16_t v = 0;
+        if (!safe_read(row + voff, v)) return false;
+        out_val = v;
+        return true;
+    }
+    uint32_t v = 0;
+    if (!safe_read(row + voff, v)) return false;
+    out_val = v;
+    return true;
+}
+
+bool read_landmark_localized_name(uint64_t mb, const LandmarkInfo& lm, char* out, size_t out_n) {
+    if (!out || out_n < 2 || !lm.pop_bdat_fp || lm.bdat_id == 0) return false;
+    out[0] = '\0';
+
+    // 1. Read MSGID from map's FLD_LandmarkPop table.
+    uint32_t msg_id = 0;
+    if (!bdat_read_uint(lm.pop_bdat_fp, lm.bdat_id, "MSGID", msg_id) || msg_id == 0) return false;
+
+    // 2. Read active language's fld_landmark message BDAT table pointer from GfDataBdat::s_instance[443].
+    uint64_t bdat_mgr = 0, msg_tbl = 0;
+    if (!safe_read(mb + off301::kDataBdatSingleton, bdat_mgr) || !bdat_mgr) return false;
+    if (!safe_read(bdat_mgr + 0x10ull + static_cast<uint64_t>(off301::kBdatIdxFldLandmarkMsg) * 8ull, msg_tbl) || !msg_tbl) {
+        return false;
+    }
+
+    // 3. Look up "name" string offset in fld_landmark (already decrypted in guest memory, in the game's active language).
+    uint16_t voff = 0;
+    uint8_t typ = 0;
+    uint64_t row = 0;
+    uint32_t str_tbl_off = 0, str_tbl_sz = 0, str_off = 0;
+    if (!safe_read(msg_tbl + 0x18, str_tbl_off) || !safe_read(msg_tbl + 0x1C, str_tbl_sz)) return false;
+    const uint64_t tbl_end = static_cast<uint64_t>(str_tbl_off) + static_cast<uint64_t>(str_tbl_sz);
+    if (tbl_end < 0x20ull || tbl_end > 64ull * 1024ull * 1024ull) return false;
+    if (!bdat_find_column(msg_tbl, "name", voff, typ) || !bdat_row_addr(msg_tbl, msg_id, row)) return false;
+    if (!safe_read(row + voff, str_off) || str_off == 0 || str_off >= tbl_end) return false;
+
+    const size_t max_read = static_cast<size_t>(std::min<uint64_t>(out_n - 1, tbl_end - str_off));
+    if (max_read == 0 || !safe_read_bytes(msg_tbl + str_off, out, max_read)) return false;
+    out[max_read] = '\0';
+    for (size_t i = 0; out[i]; ++i) {
+        if (out[i] == '\n' || out[i] == '\r') out[i] = ' ';
+    }
+    return out[0] != '\0';
+}
+
+void collect_landmarks(uint64_t mb, std::vector<LandmarkInfo>& out) {
+    uint64_t gmk_mgr = 0;
+    if (!safe_read(mb + off301::kGmkManagerSingleton, gmk_mgr) || !gmk_mgr) return;
+    uint64_t set_begin = 0, set_end = 0;
+    if (!safe_read(gmk_mgr + 0xF358ull, set_begin) || !safe_read(gmk_mgr + 0xF360ull, set_end)) return;
+    if (!set_begin || set_end <= set_begin) return;
+    const size_t set_n = std::min<size_t>(static_cast<size_t>((set_end - set_begin) / 8ull), 64u);
+
+    for (size_t s = 0; s < set_n; ++s) {
+        uint64_t gmk_set = 0;
+        if (!safe_read(set_begin + s * 8ull, gmk_set) || !gmk_set) continue;
+        // Scan GmkSet::m_lists[] at +0x1B8 for the 'LDMK' (GmkLandmark) list.
+        for (size_t t = 0; t < 48u; ++t) {
+            uint64_t list = 0;
+            if (!safe_read(gmk_set + 0x1B8ull + t * 8ull, list) || !list) continue;
+            uint64_t hdr_ptr = 0;
+            uint32_t fourcc = 0;
+            if (!safe_read(list + 0x1A0ull, hdr_ptr) || !hdr_ptr || !safe_read(hdr_ptr, fourcc) ||
+                fourcc != off301::kFourCcLdmk) {
+                continue;
+            }
+            uint64_t pop_bdat_fp = 0;
+            safe_read(list + 0x1B8ull, pop_bdat_fp);  // TGmkList<GmkLandmark>::getBindedBdatFp()
+            uint64_t lm_begin = 0, lm_end = 0;
+            if (!safe_read(list + 0x1F0ull, lm_begin) || !safe_read(list + 0x1F8ull, lm_end)) continue;
+            if (!lm_begin || lm_end <= lm_begin) continue;
+            const size_t lm_n = std::min<size_t>(static_cast<size_t>((lm_end - lm_begin) / 0x100ull), 256u);
+            for (size_t i = 0; i < lm_n; ++i) {
+                const uint64_t lm = lm_begin + i * 0x100ull;
+                uint64_t bdat_info = 0;
+                uint64_t tf_ptr = 0;
+                uint32_t bdat_id = 0;
+                uint8_t cat = 0xFF;
+                Vec3 pos{};
+                if (safe_read(lm + 0x30ull, bdat_info) && bdat_info &&
+                    safe_read(bdat_info + 0x02ull, cat) && cat <= 1u &&
+                    safe_read(lm + 0x10ull, tf_ptr) && tf_ptr &&
+                    safe_read(tf_ptr + 0x00ull, pos) && is_finite3(pos)) {
+                    safe_read(lm + 0x38ull, bdat_id);
+                    out.push_back({pos, bdat_id, pop_bdat_fp, cat});
+                }
+            }
+            break;  // at most one LDMK list per GmkSet
+        }
+    }
+}
+
+struct Projected {
+    float sx = 0.f;
+    float sy = 0.f;
+    bool in_front = false;
+    bool on_screen = false;
+};
+
+Projected project_world(const float m[16], const Vec3& w, float screen_w, float screen_h) {
+    // Row-vector multiply matching gf::util::getScreenPos: clip = vec4(w, 1) * m_viewProj.
+    const float cx = w.x * m[0] + w.y * m[4] + w.z * m[8]  + m[12];
+    const float cy = w.x * m[1] + w.y * m[5] + w.z * m[9]  + m[13];
+    const float cz = w.x * m[2] + w.y * m[6] + w.z * m[10] + m[14];
+    const float cw = w.x * m[3] + w.y * m[7] + w.z * m[11] + m[15];
+
+    Projected r;
+    r.in_front = (cw > 1e-4f) && (cz >= 0.f);
+    const float inv_w = (std::fabs(cw) > 1e-4f) ? (1.0f / std::fabs(cw)) : 1.0f;
+    float ndc_x = cx * inv_w;
+    float ndc_y = cy * inv_w;
+    if (!r.in_front) {
+        ndc_x = -ndc_x;
+        ndc_y = -ndc_y;
+    }
+    r.sx = (ndc_x * 0.5f + 0.5f) * screen_w;
+    r.sy = (0.5f - ndc_y * 0.5f) * screen_h;
+    r.on_screen = r.in_front && r.sx >= 24.f && r.sx <= screen_w - 24.f &&
+                  r.sy >= 24.f && r.sy <= screen_h - 24.f;
+    return r;
+}
+
+uint32_t kind_color(MarkerKind k) {
+    switch (k) {
+        case MarkerKind::MainStory: return 0xFFD54FFFu;  // warm gold
+        case MarkerKind::Quest:     return 0x4FC3F7FFu;  // bright cyan
+        case MarkerKind::Battle:    return 0xFF6E6EFFu;  // coral red
+        case MarkerKind::Collect:   return 0x69F0AEFFu;  // emerald green
+        case MarkerKind::Pin:       return 0xCE93D8FFu;  // soft violet
+    }
+    return 0x4FC3F7FFu;
+}
+
+void format_elev(float dy, char* buf, size_t n, uint32_t& out_col) {
+    const int idy = static_cast<int>(std::lround(dy));
+    if (idy >= 3) {
+        std::snprintf(buf, n, "▲+%dm", idy);
+        out_col = 0x80D8FFFFu;  // sky cyan (above)
+    } else if (idy <= -3) {
+        std::snprintf(buf, n, "▼%dm", idy);
+        out_col = 0xFFAB40FFu;  // amber orange (below)
+    } else {
+        std::snprintf(buf, n, "●0m");
+        out_col = 0xC8E6C9FFu;  // soft green (same level)
+    }
+}
+
+void draw_beacon(const nxrt::gfx::HudCanvas& c, float x, float y, float scale,
+                 uint32_t col, float dist, float dy, bool primary, const char* extra_line) {
+    const float r = (primary ? 11.f : 8.f) * scale;
+    const uint32_t dark = 0x000000CCu;
+
+    // Subtle vertical drop-pin line under the diamond
+    c.line(x, y + r, x, y + r + 10.f * scale, (col & 0xFFFFFF00u) | 0xA0u, 2.f * scale);
+
+    // Outer dark diamond + colored fill + white core
+    c.quad_filled(x, y - r - 2.f * scale, x + r + 2.f * scale, y, x, y + r + 2.f * scale, x - r - 2.f * scale, y, dark);
+    c.quad_filled(x, y - r, x + r, y, x, y + r, x - r, y, col);
+    const float ir = r * 0.42f;
+    c.quad_filled(x, y - ir, x + ir, y, x, y + ir, x - ir, y, 0xFFFFFFEEu);
+
+    // Distance + Elevation label above the diamond
+    char dist_buf[32];
+    char elev_buf[32];
+    uint32_t elev_col = 0xFFFFFFFFu;
+    std::snprintf(dist_buf, sizeof dist_buf, "%dm", static_cast<int>(std::lround(dist)));
+    format_elev(dy, elev_buf, sizeof elev_buf, elev_col);
+
+    const float font_sz = (primary ? 16.f : 13.5f) * scale;
+    float dw = 0.f, dh = 0.f, ew = 0.f, eh = 0.f;
+    c.measure_text(font_sz, dist_buf, &dw, &dh);
+    c.measure_text(font_sz, elev_buf, &ew, &eh);
+    const float gap = 6.f * scale;
+    const float pad_x = 7.f * scale;
+    const float pad_y = 3.f * scale;
+    const float pill_w = dw + gap + ew + 2.f * pad_x;
+    const float pill_h = std::max(dh, eh) + 2.f * pad_y;
+    const float W = static_cast<float>(c.width);
+    const float H = static_cast<float>(c.height);
+    const float px0 = std::clamp(x - pill_w * 0.5f, 8.f, std::max(8.f, W - pill_w - 8.f));
+    const float py0 = std::clamp(y - r - 6.f * scale - pill_h, 8.f, std::max(8.f, H - pill_h - 8.f));
+
+    c.rect_filled(px0, py0, px0 + pill_w, py0 + pill_h, 0x0B1018C8u, 4.f * scale);
+    c.rect(px0, py0, px0 + pill_w, py0 + pill_h, (col & 0xFFFFFF00u) | 0x99u, 4.f * scale, 1.f);
+    c.text_outlined(px0 + pad_x, py0 + pad_y, font_sz, 0xFFFFFFFFu, dark, dist_buf);
+    c.text_outlined(px0 + pad_x + dw + gap, py0 + pad_y, font_sz, elev_col, dark, elev_buf);
+
+    if (extra_line && *extra_line) {
+        const float sub_sz = 13.5f * scale;
+        float sw = 0.f, sh = 0.f;
+        c.measure_text(sub_sz, extra_line, &sw, &sh);
+        const float sw_box = sw + 2.f * pad_x;
+        const float sh_box = sh + 2.f * pad_y;
+        const float spx0 = std::clamp(x - sw_box * 0.5f, 8.f, std::max(8.f, W - sw_box - 8.f));
+        const float spy0 = std::clamp(y + r + 12.f * scale, 8.f, std::max(8.f, H - sh_box - 8.f));
+        c.rect_filled(spx0, spy0, spx0 + sw_box, spy0 + sh_box, 0x071A24D8u, 4.f * scale);
+        c.rect(spx0, spy0, spx0 + sw_box, spy0 + sh_box, 0x4DD0E1BBu, 4.f * scale, 1.f);
+        c.text_outlined(spx0 + pad_x, spy0 + pad_y, sub_sz, 0x80DEEAFFu, dark, extra_line);
+    }
+}
+
+void draw_edge_arrow(const nxrt::gfx::HudCanvas& c, float sx, float sy, float scale,
+                     uint32_t col, float dist, float dy, const char* extra_line) {
+    const float W = static_cast<float>(c.width);
+    const float H = static_cast<float>(c.height);
+    const float cx = W * 0.5f, cy = H * 0.5f;
+    float dx = sx - cx, dy_s = sy - cy;
+    const float len = std::hypot(dx, dy_s);
+    if (len < 1e-3f) { dx = 0.f; dy_s = -1.f; }
+    else { dx /= len; dy_s /= len; }
+
+    const float margin_x = 90.f * scale;
+    const float margin_y = 110.f * scale;
+    const float max_x = cx - margin_x;
+    const float max_y = cy - margin_y;
+    const float tx = (std::fabs(dx) > 1e-4f) ? (max_x / std::fabs(dx)) : 1e9f;
+    const float ty = (std::fabs(dy_s) > 1e-4f) ? (max_y / std::fabs(dy_s)) : 1e9f;
+    const float t = std::min(tx, ty);
+    const float ex = cx + dx * t;
+    const float ey = cy + dy_s * t;
+
+    const float sz = 14.f * scale;
+    const float px = -dy_s, py = dx;  // perpendicular
+    const float tip_x = ex + dx * sz;
+    const float tip_y = ey + dy_s * sz;
+    const float b1_x = ex - dx * (sz * 0.6f) + px * (sz * 0.8f);
+    const float b1_y = ey - dy_s * (sz * 0.6f) + py * (sz * 0.8f);
+    const float b2_x = ex - dx * (sz * 0.6f) - px * (sz * 0.8f);
+    const float b2_y = ey - dy_s * (sz * 0.6f) - py * (sz * 0.8f);
+
+    c.triangle_filled(tip_x, tip_y, b1_x, b1_y, b2_x, b2_y, col);
+
+    char label[48];
+    char elev[24];
+    uint32_t elev_col = 0xFFFFFFFFu;
+    format_elev(dy, elev, sizeof elev, elev_col);
+    std::snprintf(label, sizeof label, "%dm %s", static_cast<int>(std::lround(dist)), elev);
+    const float font_sz = 16.f * scale;
+    float tw = 0.f, th = 0.f;
+    c.measure_text(font_sz, label, &tw, &th);
+    const float lx = std::clamp(ex - dx * (sz * 1.8f) - tw * 0.5f, 16.f, W - tw - 16.f);
+    const float ly = std::clamp(ey - dy_s * (sz * 1.8f) - th * 0.5f, 16.f, H - th - 16.f);
+    c.rect_filled(lx - 7.f * scale, ly - 3.f * scale, lx + tw + 7.f * scale, ly + th + 3.f * scale, 0x0B1018D8u, 4.f * scale);
+    c.rect(lx - 7.f * scale, ly - 3.f * scale, lx + tw + 7.f * scale, ly + th + 3.f * scale, (col & 0xFFFFFF00u) | 0xAAu, 4.f * scale, 1.f);
+    c.text_outlined(lx, ly, font_sz, 0xFFFFFFFFu, 0x000000DDu, label);
+
+    if (extra_line && *extra_line) {
+        const float sub_sz = 13.f * scale;
+        float sw = 0.f, sh = 0.f;
+        c.measure_text(sub_sz, extra_line, &sw, &sh);
+        const float pad_x = 7.f * scale, pad_y = 3.f * scale;
+        const float slx = std::clamp(lx + (tw - sw) * 0.5f, 16.f, W - sw - 16.f);
+        const float sly = std::clamp(ly + th + 8.f * scale, 16.f, H - sh - 16.f);
+        c.rect_filled(slx - pad_x, sly - pad_y, slx + sw + pad_x, sly + sh + pad_y, 0x071A24CCu, 4.f * scale);
+        c.rect(slx - pad_x, sly - pad_y, slx + sw + pad_x, sly + sh + pad_y, 0x4DD0E1AAu, 4.f * scale, 1.f);
+        c.text_outlined(slx, sly, sub_sz, 0x80DEEAFFu, 0x000000CCu, extra_line);
+    }
+}
+
+void draw_toast(const nxrt::gfx::HudCanvas& c, float scale) {
+    const int64_t until = g_toast_until_ms.load(std::memory_order_relaxed);
+    if (until <= 0 || now_ms() > until) return;
+    const bool on = g_enabled.load(std::memory_order_relaxed);
+    const char* msg = on ? "3D 任务指引：已开启 (F3)" : "3D 任务指引：已关闭 (F3)";
+    const float sz = 16.f * scale;
+    float tw = 0.f, th = 0.f;
+    c.measure_text(sz, msg, &tw, &th);
+    const float pad_x = 12.f * scale, pad_y = 6.f * scale;
+    const float x0 = (static_cast<float>(c.width) - tw) * 0.5f - pad_x;
+    const float y0 = 56.f * scale;
+    c.rect_filled(x0, y0, x0 + tw + 2.f * pad_x, y0 + th + 2.f * pad_y, 0x0B1018D8u, 6.f * scale);
+    c.rect(x0, y0, x0 + tw + 2.f * pad_x, y0 + th + 2.f * pad_y, on ? 0x4FC3F7CCu : 0x90A4AEAAu, 6.f * scale, 1.f);
+    c.text_outlined(x0 + pad_x, y0 + pad_y, sz, on ? 0xE1F5FEFFu : 0xCFD8DCFFu, 0x000000CCu, msg);
+}
+
+}  // namespace
+
+void init(uint64_t main_base) {
+    g_main_base.store(main_base, std::memory_order_relaxed);
+    const bool en = nxrt::config_get_bool("xc2", "nav_overlay", true);
+    const bool dbg = nxrt::config_get_bool("xc2", "nav_debug", false);
+    g_enabled.store(en, std::memory_order_relaxed);
+    g_debug.store(dbg, std::memory_order_relaxed);
+    NXLOG_I(kTag, "3D nav overlay ready (main=0x%llx, enabled=%d, debug=%d, toggle=F3)",
+            static_cast<unsigned long long>(main_base), en ? 1 : 0, dbg ? 1 : 0);
+}
+
+void toggle() {
+    const bool next = !g_enabled.load(std::memory_order_relaxed);
+    g_enabled.store(next, std::memory_order_relaxed);
+    g_toast_until_ms.store(now_ms() + 2200, std::memory_order_relaxed);
+    NXLOG_I(kTag, "3D nav overlay %s (F3)", next ? "ON" : "OFF");
+}
+
+bool enabled() {
+    return g_enabled.load(std::memory_order_relaxed);
+}
+
+void draw(const nxrt::gfx::HudCanvas& c) {
+    if (c.width < 320 || c.height < 240) return;
+    const float scale = std::clamp(static_cast<float>(c.height) / 1080.f, 0.75f, 2.25f);
+    draw_toast(c, scale);
+    if (!g_enabled.load(std::memory_order_relaxed)) return;
+
+    const uint64_t mb = g_main_base.load(std::memory_order_relaxed);
+    if (!mb) return;
+
+    // 1. Read camera view-projection matrix + camera pos/target.
+    float vp[16] = {};
+    Vec3 cam_pos{}, cam_tgt{};
+    if (!safe_read_bytes(mb + off301::kGfInfoViewProj, vp, sizeof vp)) return;
+    safe_read(mb + off301::kGfInfoCamPos, cam_pos);
+    safe_read(mb + off301::kGfInfoCamTgt, cam_tgt);
+
+    // Reject zero/uninitialized matrix (title screen / boot / movie).
+    float vp_norm = 0.f;
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(vp[i])) return;
+        vp_norm += std::fabs(vp[i]);
+    }
+    if (vp_norm < 1e-3f) return;
+
+    // 2. Read current map ID and player 3D position.
+    uint32_t map_id = 0;
+    if (!read_current_map_id(mb, map_id)) return;
+    Vec3 player{};
+    if (!read_player_pos(mb, cam_tgt, player)) return;
+
+    // 3. Collect active quest/objective locators on the current map.
+    std::vector<NavMarker> markers;
+    markers.reserve(16);
+    collect_locators(mb, map_id, markers);
+
+    for (auto& m : markers) {
+        const float dx = m.pos.x - player.x;
+        const float dy = m.pos.y - player.y;
+        const float dz = m.pos.z - player.z;
+        m.dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        m.dy = dy;
+    }
+
+    // Sort: MainStory first, then closest distance.
+    std::sort(markers.begin(), markers.end(), [](const NavMarker& a, const NavMarker& b) {
+        if ((a.kind == MarkerKind::MainStory) != (b.kind == MarkerKind::MainStory)) {
+            return a.kind == MarkerKind::MainStory;
+        }
+        return a.dist < b.dist;
+    });
+
+    // 4. Collect skip-travel landmarks on current map for nearest-landmark hint.
+    std::vector<LandmarkInfo> landmarks;
+    const bool need_lm = g_debug.load(std::memory_order_relaxed) || (!markers.empty() && markers[0].dist > 100.f);
+    if (need_lm) {
+        landmarks.reserve(32);
+        collect_landmarks(mb, landmarks);
+    }
+
+    // Find best skip-travel landmark for primary marker (if far away).
+    char lm_hint[160] = {};
+    const LandmarkInfo* best_lm = nullptr;
+    if (!markers.empty() && markers[0].dist > 100.f && !landmarks.empty()) {
+        float best_d = markers[0].dist * 0.75f;
+        for (const auto& lm : landmarks) {
+            const float dx = lm.pos.x - markers[0].pos.x;
+            const float dy = lm.pos.y - markers[0].pos.y;
+            const float dz = lm.pos.z - markers[0].pos.z;
+            const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (d < best_d) {
+                best_d = d;
+                best_lm = &lm;
+            }
+        }
+        if (best_lm) {
+            const int ldy = static_cast<int>(std::lround(markers[0].pos.y - best_lm->pos.y));
+            char lm_name[96] = {};
+            if (read_landmark_localized_name(mb, *best_lm, lm_name, sizeof lm_name)) {
+                std::snprintf(lm_hint, sizeof lm_hint, ">> %s · %dm (ΔY %+dm)",
+                              lm_name, static_cast<int>(std::lround(best_d)), ldy);
+            } else {
+                std::snprintf(lm_hint, sizeof lm_hint, ">> %dm (ΔY %+dm)",
+                              static_cast<int>(std::lround(best_d)), ldy);
+            }
+        }
+    }
+
+    // 5. Project and draw markers (draw secondary markers first so primary sits on top).
+    const float W = static_cast<float>(c.width);
+    const float H = static_cast<float>(c.height);
+    const size_t max_draw = std::min<size_t>(markers.size(), 8u);
+    for (size_t idx = max_draw; idx-- > 0;) {
+        const auto& m = markers[idx];
+        const bool is_primary = (idx == 0);
+        // Lift beacon 1.8 m above ground/NPC feet so it floats cleanly in 3D space.
+        const Vec3 lifted{m.pos.x, m.pos.y + 1.8f, m.pos.z};
+        const Projected pr = project_world(vp, lifted, W, H);
+        const uint32_t col = kind_color(m.kind);
+        if (pr.on_screen) {
+            draw_beacon(c, pr.sx, pr.sy, scale, col, m.dist, m.dy, is_primary, is_primary ? lm_hint : nullptr);
+        } else if (is_primary) {
+            draw_edge_arrow(c, pr.sx, pr.sy, scale, col, m.dist, m.dy, lm_hint);
+        }
+    }
+
+    // Draw subtle teal pin on the recommended skip-travel landmark if it is on screen.
+    if (best_lm) {
+        const Vec3 lifted{best_lm->pos.x, best_lm->pos.y + 2.2f, best_lm->pos.z};
+        const Projected pr = project_world(vp, lifted, W, H);
+        if (pr.on_screen) {
+            const float r = 6.5f * scale;
+            c.circle_filled(pr.sx, pr.sy, r + 1.5f * scale, 0x000000B0u);
+            c.circle_filled(pr.sx, pr.sy, r, 0x26C6DAEEu);
+            c.circle(pr.sx, pr.sy, r + 2.f * scale, 0xE0F7FACC, 1.5f * scale);
+        }
+    }
+
+    // 6. Optional debug telemetry strip ([xc2] nav_debug = 1).
+    if (g_debug.load(std::memory_order_relaxed)) {
+        char dbg[256];
+        if (!markers.empty()) {
+            std::snprintf(dbg, sizeof dbg,
+                          "NAV map=%u | P(%.1f, %.1f, %.1f) | T0(%.1f, %.1f, %.1f) d=%.0fm dy=%+.0fm | loc=%zu lm=%zu",
+                          map_id, player.x, player.y, player.z,
+                          markers[0].pos.x, markers[0].pos.y, markers[0].pos.z,
+                          markers[0].dist, markers[0].dy, markers.size(), landmarks.size());
+        } else {
+            std::snprintf(dbg, sizeof dbg,
+                          "NAV map=%u | P(%.1f, %.1f, %.1f) | loc=0 lm=%zu",
+                          map_id, player.x, player.y, player.z, landmarks.size());
+        }
+        const float sz = 14.f * scale;
+        float tw = 0.f, th = 0.f;
+        c.measure_text(sz, dbg, &tw, &th);
+        const float x0 = 14.f * scale, y0 = 14.f * scale;
+        c.rect_filled(x0 - 6.f, y0 - 3.f, x0 + tw + 6.f, y0 + th + 3.f, 0x000000B8u, 4.f);
+        c.text(x0, y0, sz, 0xA5D6A7FFu, dbg);
+    }
+}
+
+}  // namespace xc2::nav

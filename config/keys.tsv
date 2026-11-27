@@ -360,5 +360,7 @@ sr3md_fidelityfx_vk.dll` next to the executable, then the executable's folder.
 `nvn`	`tex_preupload_max`	`12`	`NXRT_NVN_TEX_PREUPLOAD_MAX`	`src/gfx/nvn/nvn_replay.cpp`	Maximum number of background-prepared textures pre-uploaded per frame when `[nvn] tex_preupload` is enabled (`1..1024`).
 `nvn`	`tex_preupload_kb`	`4096`	`NXRT_NVN_TEX_PREUPLOAD_KB`	`src/gfx/nvn/nvn_replay.cpp`	Per-frame byte budget in KiB for `[nvn] tex_preupload` uploads (`256..524288`).
 `xc2`	`cutscene_fps`	`60 (when fps > 60)`	`NXRT_XC2_CUTSCENE_FPS`	`xc2/src/xc2_boot.cpp`	Cutscene frame-rate cap on retail 3.0.1 when `[xc2] fps > 60`: defaults to `60` (`0` disables cutscene capping).
+`xc2`	`nav_overlay`	`true`	`NXRT_XC2_NAV_OVERLAY`	`xc2/src/xc2_nav_overlay.cpp`	Enable the read-only 3D quest/objective navigation overlay (3D floating beacons, elevation delta, off-screen edge arrow, and nearest skip-travel landmark hint). Press `F3` in-game to toggle live.
+`xc2`	`nav_debug`	`false`	`NXRT_XC2_NAV_DEBUG`	`xc2/src/xc2_nav_overlay.cpp`	Show a compact top-left navigation telemetry strip (current map ID, player coordinates, primary target coordinates, and locator/landmark counts).
 `nvn`	`auto_prepare`	`true`	`NXRT_NVN_AUTO_PREPARE`	`xc2/src/xc2_boot.cpp`	Automatically precompile paired `programs.bin` shader parts via `prepare_shaders` at launch when `prepare.state` is missing or stale for the active GPU/driver.
 

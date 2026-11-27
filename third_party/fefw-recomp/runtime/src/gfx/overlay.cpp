@@ -185,9 +185,63 @@ void clear_imgui_input(ImGuiContext* ctx) {
 
 namespace {
 std::atomic<int> g_shader_backlog{0};
+inline ImU32 rgba_to_imu32(uint32_t rgba) {
+    return IM_COL32((rgba >> 24) & 0xFF, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF, rgba & 0xFF);
+}
 }
 void set_shader_backlog(int pending) { g_shader_backlog.store(pending < 0 ? 0 : pending, std::memory_order_relaxed); }
 int shader_backlog() { return g_shader_backlog.load(std::memory_order_relaxed); }
+
+void HudCanvas::rect_filled(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), rgba_to_imu32(rgba), rounding);
+}
+void HudCanvas::rect(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding, float thickness) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), rgba_to_imu32(rgba), rounding, 0, thickness);
+}
+void HudCanvas::line(float x0, float y0, float x1, float y1, uint32_t rgba, float thickness) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), rgba_to_imu32(rgba), thickness);
+}
+void HudCanvas::triangle_filled(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t rgba) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddTriangleFilled(ImVec2(x0, y0), ImVec2(x1, y1), ImVec2(x2, y2), rgba_to_imu32(rgba));
+}
+void HudCanvas::quad_filled(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddQuadFilled(ImVec2(x0, y0), ImVec2(x1, y1), ImVec2(x2, y2), ImVec2(x3, y3), rgba_to_imu32(rgba));
+}
+void HudCanvas::quad(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba, float thickness) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddQuad(ImVec2(x0, y0), ImVec2(x1, y1), ImVec2(x2, y2), ImVec2(x3, y3), rgba_to_imu32(rgba), thickness);
+}
+void HudCanvas::circle_filled(float cx, float cy, float r, uint32_t rgba, int segments) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddCircleFilled(ImVec2(cx, cy), r, rgba_to_imu32(rgba), segments);
+}
+void HudCanvas::circle(float cx, float cy, float r, uint32_t rgba, float thickness, int segments) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddCircle(ImVec2(cx, cy), r, rgba_to_imu32(rgba), segments, thickness);
+}
+void HudCanvas::text(float x, float y, float size, uint32_t rgba, const char* str) const {
+    if (draw_list && font && str && *str) {
+        static_cast<ImDrawList*>(draw_list)->AddText(static_cast<ImFont*>(font), size, ImVec2(x, y), rgba_to_imu32(rgba), str);
+    }
+}
+void HudCanvas::text_outlined(float x, float y, float size, uint32_t rgba, uint32_t outline_rgba, const char* str) const {
+    if (!draw_list || !font || !str || !*str) return;
+    auto* dl = static_cast<ImDrawList*>(draw_list);
+    auto* f = static_cast<ImFont*>(font);
+    const ImU32 oc = rgba_to_imu32(outline_rgba);
+    dl->AddText(f, size, ImVec2(x - 1.f, y), oc, str);
+    dl->AddText(f, size, ImVec2(x + 1.f, y), oc, str);
+    dl->AddText(f, size, ImVec2(x, y - 1.f), oc, str);
+    dl->AddText(f, size, ImVec2(x, y + 1.f), oc, str);
+    dl->AddText(f, size, ImVec2(x, y), rgba_to_imu32(rgba), str);
+}
+void HudCanvas::measure_text(float size, const char* str, float* out_w, float* out_h) const {
+    if (!font || !str || !*str) {
+        if (out_w) *out_w = 0.f;
+        if (out_h) *out_h = 0.f;
+        return;
+    }
+    const ImVec2 sz = static_cast<ImFont*>(font)->CalcTextSizeA(size, FLT_MAX, 0.0f, str);
+    if (out_w) *out_w = sz.x;
+    if (out_h) *out_h = sz.y;
+}
 
 struct Overlay::Impl {
     Context ctx;
@@ -205,6 +259,9 @@ struct Overlay::Impl {
     struct Panel { std::string title; std::function<void()> fn; };
     std::vector<Panel> panels;
     std::function<void()> menu;           // set_menu: the game's own menu replaces the Diagnostics window and the panels
+    std::mutex hud_mu;
+    std::function<void(const HudCanvas&)> hud_cb;
+    std::atomic<bool> has_hud_cb{false};
     std::atomic<bool> want_hide{false};   // request_hide: applied at the start of the next draw (the menu runs with mu held)
 
     // The pad for the menu (set_menu_pad, on the thread that polls the pads)
@@ -1705,7 +1762,8 @@ void Overlay::draw(const FrameInfo& f) {
     const bool note_on = s.note_visible(now_s) && (s.counter_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
     const bool ptr_on = s.ptr_show.load(std::memory_order_relaxed) && (s.ptr_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
     const bool kb_on = s.kb_poll();
-    if (!s.visible && !counter_on && !note_on && !ptr_on && !kb_on) {
+    const bool hud_on = s.has_hud_cb.load(std::memory_order_relaxed);
+    if (!s.visible && !counter_on && !note_on && !ptr_on && !kb_on && !hud_on) {
         s.last_frame = now;
         s.counter_was_on = false;
         return;
@@ -1733,7 +1791,7 @@ void Overlay::draw(const FrameInfo& f) {
     }
     // a screenshot leaves the counter out unless asked for; with the menu hidden there is then nothing to draw
     const bool show_counter = counter_on && (s.counter_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
-    if (!s.visible && !show_counter && !note_on && !ptr_on && !kb_on) {
+    if (!s.visible && !show_counter && !note_on && !ptr_on && !kb_on && !hud_on) {
         s.last_frame = now;
         return;
     }
@@ -1753,6 +1811,18 @@ void Overlay::draw(const FrameInfo& f) {
     ImGui::NewFrame();
     if (s.visible && !kb_on) s.build_ui();    // the keyboard is modal: the menu comes back once it is answered
     if (kb_on) s.draw_keyboard(now_s);
+    if (hud_on && !kb_on) {
+        std::function<void(const HudCanvas&)> cb;
+        { std::lock_guard<std::mutex> hlk(s.hud_mu); cb = s.hud_cb; }
+        if (cb) {
+            HudCanvas canvas;
+            canvas.width = f.extent.width;
+            canvas.height = f.extent.height;
+            canvas.draw_list = ImGui::GetForegroundDrawList();
+            canvas.font = ImGui::GetFont();
+            cb(canvas);
+        }
+    }
     if (show_counter) s.draw_counter(f, now_s);
     if (note_on) s.draw_note(f);
     if (ptr_on) {   // a plain arrow, white with a dark outline, sized with the frame height
@@ -1800,6 +1870,13 @@ void Overlay::draw(const FrameInfo& f) {
 
 void Overlay::install_on_renderer() {
     impl_->ctx.renderer->set_overlay_hook([this](const FrameInfo& f) { draw(f); });
+}
+
+void Overlay::set_hud_callback(std::function<void(const HudCanvas&)> fn) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->hud_mu);
+    impl_->hud_cb = std::move(fn);
+    impl_->has_hud_cb.store(static_cast<bool>(impl_->hud_cb), std::memory_order_relaxed);
 }
 
 }  // namespace nxrt::gfx

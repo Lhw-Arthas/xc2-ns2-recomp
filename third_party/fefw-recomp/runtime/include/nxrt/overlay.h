@@ -22,6 +22,27 @@ namespace nxrt::gfx {
 void set_shader_backlog(int pending);
 int shader_backlog();
 
+// Lightweight game-agnostic 2D foreground canvas backed by ImGui's foreground draw list (no ImGui header needed by callers,
+// works transparently on both SDR and HDR swapchains, never captures input).
+struct HudCanvas {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    void* draw_list = nullptr;
+    void* font = nullptr;
+
+    void rect_filled(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding = 0.f) const;
+    void rect(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding = 0.f, float thickness = 1.f) const;
+    void line(float x0, float y0, float x1, float y1, uint32_t rgba, float thickness = 1.5f) const;
+    void triangle_filled(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t rgba) const;
+    void quad_filled(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba) const;
+    void quad(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba, float thickness = 1.5f) const;
+    void circle_filled(float cx, float cy, float r, uint32_t rgba, int segments = 0) const;
+    void circle(float cx, float cy, float r, uint32_t rgba, float thickness = 1.5f, int segments = 0) const;
+    void text(float x, float y, float size, uint32_t rgba, const char* str) const;
+    void text_outlined(float x, float y, float size, uint32_t rgba, uint32_t outline_rgba, const char* str) const;
+    void measure_text(float size, const char* str, float* out_w, float* out_h) const;
+};
+
 class Overlay {
 public:
     struct Context {
@@ -93,6 +114,10 @@ public:
 
     // A drawn arrow at a window pixel (test aid, S28: a screenshot of the game's own frame does not contain the OS cursor). Any thread.
     void set_pointer(bool show, float x, float y, bool in_screenshots);
+
+    // Optional per-frame foreground HUD callback (runs on the presenting thread inside the ImGui frame, even when the F1 menu is hidden).
+    // Pass an empty std::function to clear. Thread-safe.
+    void set_hud_callback(std::function<void(const HudCanvas&)> fn);
 
     // The Renderer overlay hook: builds and draws the menu on top of the frame (no-op while hidden, unless the counter is on).
     void draw(const FrameInfo& f);

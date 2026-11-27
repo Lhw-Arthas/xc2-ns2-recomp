@@ -57,6 +57,7 @@
 
 #include "xc2ns2/xc2ns2_game.h"
 #include "xc2_modules.h"
+#include "xc2_nav_overlay.h"
 
 #include "play_types.h"
 
@@ -389,6 +390,7 @@ private:
     unsigned shot_raw_idx = 0;
     void write_raw_frame();
     bool f12_was_down = false;
+    bool f3_was_down = false;
     bool f11_was_down = false;
 };
 
@@ -519,6 +521,9 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
             NXLOG_I("input", "F12: %d frame(s) into %s", shot_burst, shot_raw ? "shots_raw" : "shots_manual");
         }
         f12_was_down = f12;
+        const bool f3 = down(VK_F3) || tapped(VK_F3);
+        if (f3 && !f3_was_down) xc2::nav::toggle();
+        f3_was_down = f3;
         if (shot_raw) {
             if (f12_left > 0 && shot_raw_have) {
                 write_raw_frame();     // the buffer filled at the end of the previous frame
@@ -2825,6 +2830,10 @@ int main(int argc, char **argv) {
         po.window = !headless;
         po.overlay = !headless;
         nxrt::play::start(po);
+        if (!headless) {
+            xc2::nav::init(kMainBase);
+            nxrt::play::set_hud_callback(&xc2::nav::draw);
+        }
     }
     // Input: the hid service reads this source every 5 ms. It is live (keyboard + first gamepad, see LiveInput above)
     // and carries the scripted XC2_PRESS presses on top, so a run can be driven by a script, by a human, or both.

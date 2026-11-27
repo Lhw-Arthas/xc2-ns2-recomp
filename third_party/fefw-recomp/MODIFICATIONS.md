@@ -21,6 +21,10 @@ This directory is a **modified fork** of `Goldoire/fefw-recomp` (the original Gi
 
 | `file` | date | change |
 |---|---|---|
+| `runtime/include/nxrt/overlay.h` | 2026-11-27 | add game-agnostic `HudCanvas` 2D foreground drawing facade and `Overlay::set_hud_callback()` |
+| `runtime/src/gfx/overlay.cpp` | 2026-11-27 | implement `HudCanvas` primitives over `ImGui::GetForegroundDrawList()` and invoke `hud_cb` inside `Overlay::draw()` (SDR + HDR safe, zero input capture) |
+| `runtime/include/nxrt/play.h` | 2026-11-27 | expose `play::set_hud_callback()` to register a foreground HUD drawer |
+| `runtime/src/gfx/play/play.cpp` | 2026-11-27 | wire `play::set_hud_callback()` to `st.overlay` and clear it on `play::stop()` |
 | `runtime/src/gfx/nvn/nvn_prewarm.cpp` | 2026-11-27 | record and prewarm `uint_samplers` (`uint_tex_patch`) pipelines in player-local `pipeline_keys.bin` (`NXPKEYS2`), eliminating repeated draw-time fragment shader compiles for stencil/integer-sampler shaders |
 | `runtime/src/gfx/nvn/nvn_gpl.cpp` | 2026-11-27 | widen `frames_flowing()` window from 100 ms to 1500 ms and offload uncached `resolve_stage_modules()` (SPIR-V patching + `vkCreateShaderModule`) onto `gpl_async` background workers so cold scene loads do not stall the render thread |
 | `runtime/include/nxrt/gfx_tuning.h` | 2026-11-27 | declare `nxrt::gfx::prewarm_hwdec_async()` for post-device-init background Vulkan Video / D3D11VA prewarm |

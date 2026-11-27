@@ -21,10 +21,12 @@
 //   log_status = 0              1: one status line per second in the log (context, aim state, input counts)
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include "nxrt/frame_limiter.h"
 #include "nxrt/gfx.h"
+#include "nxrt/overlay.h"
 
 namespace nxrt::play {
 
@@ -51,6 +53,7 @@ struct StartOptions {
 };
 bool start(const StartOptions& opt);        // after nxrt::init, the renderer and the NVN back end; installs the hid input source and the hooks
 void stop();                                // saves changed settings, removes the hooks and the input source
+void set_hud_callback(std::function<void(const gfx::HudCanvas&)> fn);   // optional foreground HUD drawn over the game frame
 bool overlay_blocks_game();                 // true while the F1 overlay (or on-screen keyboard) wants keyboard/mouse/pad input
 
 // The binding engine's contribution at `now_ns`: Switch buttons plus stick deflection in -1..1. Play mode installs its
