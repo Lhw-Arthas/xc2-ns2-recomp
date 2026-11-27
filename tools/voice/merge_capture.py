@@ -10,23 +10,8 @@ import json
 import pathlib
 import re
 
-SPEAKER_MAP = {
-    1: 1,    # Rex
-    2: 2,    # Nia
-    3: 3,    # Tora
-    4: 4,    # Vandham
-    5: 5,    # Morag
-    6: 6,    # Zeke
-    10: 100, # Azurda (青龙)
-    11: 101, # Pyra (焰)
-    12: 102, # Mythra (光)
-    14: 103, # Dromarch (白虎)
-    15: 104, # Poppi alpha (花JS)
-    16: 105, # Brighid (迦具土)
-    17: 106, # Pandoria (彩歌)
-}
-
-RX_VOICE = re.compile(r"^voice_(\d{2})(\d{2})\d{4}_Play$")
+# Official common.bdat VoiceIDs are used directly as speaker_id (2-digit main/rare, 3-digit DLC 501..506 & Torna 701..709)
+RX_VOICE = re.compile(r"^voice_(\d{2,3})(\d{2})\d{4}_Play$")
 
 
 def main():
@@ -55,10 +40,10 @@ def main():
         tag = "None"
         if m:
             cc, kk = int(m.group(1)), int(m.group(2))
-            sp_id = SPEAKER_MAP.get(cc, 0)
+            sp_id = cc
             if kk == 44:
                 prio, tag = 0, "Banter"
-            elif kk in (49, 50):
+            elif kk in (38, 39, 49, 50):
                 prio, tag = 3, "None"
         cues[ev] = {
             "speaker_id": sp_id,

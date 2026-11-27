@@ -61,7 +61,7 @@ void VoiceDirector::record_history(uint64_t ts_ms, const SpeakerInfo* sp, Semant
     history_.push_back(std::move(e));
 }
 
-void VoiceDirector::process_event(const VoiceTriggerEvent& ev, const GameStateSnapshot& gs) {
+void VoiceDirector::process_event(const VoiceTriggerEvent& ev, const GameStateSnapshot& gs, bool hidden_history_only) {
     if (!db_) return;
     const CueEntry* cue = db_->find_cue(ev.event_name, ev.cue_id);
     CueEntry synth{};
@@ -69,9 +69,6 @@ void VoiceDirector::process_event(const VoiceTriggerEvent& ev, const GameStateSn
         if (debug_log_missing_) {
             NXLOG_I(kTag, "[MissingCue] event='%s' cue_id=%u speaker=%u combat=%d",
                     ev.event_name, ev.cue_id, ev.speaker_id, gs.in_combat ? 1 : 0);
-            // In debug mode, parse 8-digit (CC+KK+NNVV) or 9-digit (CCC+KK+NNVV) voice category KK,
-            // filter out short hit/jump/sprint grunts (KK=38/39/49/50) and common-blade spam (700..799),
-            // and render unmapped spoken lines live so automatic triggering is immediately visible.
             int kk = -1;
             if (std::strncmp(ev.event_name, "voice_", 6) == 0) {
                 const char* p = ev.event_name + 6;
@@ -82,8 +79,7 @@ void VoiceDirector::process_event(const VoiceTriggerEvent& ev, const GameStateSn
                     kk = (p[kpos] - '0') * 10 + (p[kpos + 1] - '0');
                 }
             }
-            // Only skip pure jump/sprint/damage grunts (KK=38/49/50); keep KK=39 (real spoken lines ~2s) and all banter/tactical!
-            if (kk == 38 || kk == 49 || kk == 50) return;
+            if (kk == 6 || kk == 38 || kk == 50) return;
             synth.key = ev.event_name;
             synth.speaker_id = ev.speaker_id;
             synth.priority = (kk == 44) ? VoicePriority::P0_StoryAndBanter : VoicePriority::P1_Tactical;
@@ -103,25 +99,49 @@ void VoiceDirector::process_event(const VoiceTriggerEvent& ev, const GameStateSn
     if (density_ == VoiceDensity::Minimal && cue->priority != VoicePriority::P0_StoryAndBanter) return;
     if (density_ == VoiceDensity::Balanced && cue->priority == VoicePriority::P2_AmbientCombat) return;
 
-    // 3. Semantic deduplication (1.5s mutex per non-None/non-Banter tag)
+    const uint16_t sp_id = cue->speaker_id ? cue->speaker_id : ev.speaker_id;
+    const SpeakerInfo* sp = db_->find_speaker(sp_id);
+
+    // If HUD is currently hidden (menus/cutscenes/chain attack), log into Ctrl+F5 history
+    // without triggering stale overlay popups or dropping them into a post-menu burst.
+    if (hidden_history_only) {
+        const std::string& log_text = !cue->text_full.empty() ? cue->text_full : cue->text_compact;
+        if (!log_text.empty()) {
+            record_history(ev.timestamp_ms, sp, cue->tag, log_text);
+        }
+        return;
+    }
+
+    // 3. Semantic deduplication:
+    //    - SpecialReady / LowHPHelp / AggroWarning / HealPotion dedup per (speaker, tag) so Driver+Blade
+    //      partner merges and multi-party callouts never swallow each other within 1.2s.
+    //    - Break/Topple/Launch/Smash still dedup globally across party within 1.2s.
     if (cue->tag != SemanticTag::None && cue->tag != SemanticTag::Banter) {
-        const size_t ti = static_cast<size_t>(cue->tag);
-        if (ti < last_tag_time_.size()) {
-            if (last_tag_time_[ti] > 0.0 && (clock_sec_ - last_tag_time_[ti]) < kSemanticDedupSec) {
+        if (cue->tag == SemanticTag::SpecialReady || cue->tag == SemanticTag::LowHPHelp ||
+            cue->tag == SemanticTag::AggroWarning || cue->tag == SemanticTag::HealPotion) {
+            const uint32_t key = (static_cast<uint32_t>(sp_id) << 8) | static_cast<uint32_t>(cue->tag);
+            auto it = last_sp_tag_time_.find(key);
+            if (it != last_sp_tag_time_.end() && (clock_sec_ - it->second) < kSemanticDedupSec) {
                 return;
             }
-            last_tag_time_[ti] = clock_sec_;
+            last_sp_tag_time_[key] = clock_sec_;
+        } else {
+            const size_t ti = static_cast<size_t>(cue->tag);
+            if (ti < last_tag_time_.size()) {
+                if (last_tag_time_[ti] > 0.0 && (clock_sec_ - last_tag_time_[ti]) < kSemanticDedupSec) {
+                    return;
+                }
+                last_tag_time_[ti] = clock_sec_;
+            }
         }
     }
 
-    // 4. Global P2 ambient combat cooldown (6.0s)
+    // 4. Global P2 ambient combat pacing (1.2s)
     if (cue->priority == VoicePriority::P2_AmbientCombat) {
         if ((clock_sec_ - last_p2_time_) < kAmbientP2CdSec) return;
         last_p2_time_ = clock_sec_;
     }
 
-    const uint16_t sp_id = cue->speaker_id ? cue->speaker_id : ev.speaker_id;
-    const SpeakerInfo* sp = db_->find_speaker(sp_id);
     const float dur_hint = (ev.duration_sec > 0.f) ? ev.duration_sec : cue->duration_sec;
 
     const std::string& log_text = !cue->text_full.empty() ? cue->text_full : cue->text_compact;
@@ -268,7 +288,16 @@ void VoiceDirector::update(float dt_sec, const GameStateSnapshot& gs) {
         if (state_.global_alpha <= 0.001f) {
             state_.mode = UIVisibilityMode::Hidden;
         }
-        // Pause card timers while hidden; still drain incoming queue only when visible
+        // Drain incoming queue to Ctrl+F5 history while hidden so stale menu/cutscene lines
+        // never burst out onto the HUD when returning to gameplay.
+        std::deque<VoiceTriggerEvent> hidden_batch;
+        {
+            std::lock_guard lk(queue_mu_);
+            hidden_batch.swap(pending_events_);
+        }
+        for (const auto& ev : hidden_batch) {
+            process_event(ev, gs, true);
+        }
         return;
     }
 

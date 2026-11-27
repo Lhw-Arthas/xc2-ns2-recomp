@@ -448,7 +448,7 @@ void VoiceDatabase::seed_mock_entries() {
     add_cue("mock_heal_byakko", 14, VoicePriority::P1_Tactical, SemanticTag::HealPotion,
             "小姐，恢复瓶已经准备好了，请及时拾取。", "恢复瓶已掉落，注意拾取");
     add_cue("mock_ambient_1", 15, VoicePriority::P2_AmbientCombat, SemanticTag::Banter,
-            "花会全力支援主人的，莫！", "花全力支援中，莫！");
+            "花会全力支援主人的，嗼！", "花全力支援中，嗼！");
 }
 
 const SpeakerInfo* VoiceDatabase::find_speaker(uint16_t id) const {

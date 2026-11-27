@@ -5,6 +5,7 @@
 #include <array>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "xc2_voice_db.h"
@@ -42,13 +43,13 @@ private:
     static constexpr size_t kMaxCombatCards    = 2;
     static constexpr size_t kMaxExplorationQ   = 4;
     static constexpr size_t kMaxHistory        = 30;
-    static constexpr float  kSemanticDedupSec  = 1.5f;
-    static constexpr float  kAmbientP2CdSec    = 6.0f;
+    static constexpr float  kSemanticDedupSec  = 1.2f;
+    static constexpr float  kAmbientP2CdSec    = 1.2f;
     static constexpr float  kPartnerMergeSec   = 2.0f;
     static constexpr float  kExitFadeSec       = 0.15f;
     static constexpr float  kSlideDurSec       = 0.15f;
 
-    void process_event(const VoiceTriggerEvent& ev, const GameStateSnapshot& gs);
+    void process_event(const VoiceTriggerEvent& ev, const GameStateSnapshot& gs, bool hidden_history_only = false);
     void enqueue_combat(const CueEntry& cue, const SpeakerInfo* sp, float dur_hint, const GameStateSnapshot& gs);
     void enqueue_exploration(const CueEntry& cue, const SpeakerInfo* sp, float dur_hint);
     void record_history(uint64_t ts_ms, const SpeakerInfo* sp, SemanticTag tag, const std::string& text);
@@ -63,6 +64,7 @@ private:
     double clock_sec_ = 0.0;
     uint32_t next_uid_ = 1;
     std::array<double, 16> last_tag_time_{};
+    std::unordered_map<uint32_t, double> last_sp_tag_time_;
     double last_p2_time_ = -100.0;
 
     UIVisibilityMode last_non_hidden_mode_ = UIVisibilityMode::Exploration;
