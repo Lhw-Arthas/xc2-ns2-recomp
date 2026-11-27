@@ -32,6 +32,7 @@
 #include "nvn_format.h"
 #include "nvn_gpu_internal.h"
 #include "nxrt/config.h"
+#include "nxrt/gfx_tuning.h"
 #include "nxrt/log.h"
 #include "nxrt/nvn_backend.h"
 
@@ -673,6 +674,24 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
     if (!n.logged) {
         n.logged = true;
         log_first(*e, c, ro, u);
+    }
+
+    // Automatic negative mip bias for temporal upscalers (DLSS / FSR / TAAU, issue #79):
+    // AMD & NVIDIA guidelines use log2(render_w / output_w) - 1, quantized to 0.25 steps so dynamic resolution
+    // does not churn the sampler cache. Applied in tuned_sampler() only to material samplers (game aniso > 1).
+    {
+        static const bool auto_mip_bias = config_get_bool("upscale", "auto_mip_bias", true);
+        float want_bias = 0.0f;
+        if (auto_mip_bias && u != Upscaler::Bilinear && in_img.width > 0 && out_img.width > 0) {
+            const float raw = std::log2(static_cast<float>(in_img.width) / static_cast<float>(out_img.width)) - 1.0f;
+            want_bias = std::clamp(std::round(raw * 4.0f) * 0.25f, -3.0f, 0.0f);
+        }
+        const float prev_bias = gfx::tuning().upscale_lod_bias.exchange(want_bias, std::memory_order_relaxed);
+        if (prev_bias != want_bias) {
+            NXLOG_I(kTag, "upscaler auto mip bias: %.2f (in %ux%u -> out %ux%u, auto_mip_bias=%d)",
+                    static_cast<double>(want_bias), in_img.width, in_img.height, out_img.width, out_img.height,
+                    auto_mip_bias ? 1 : 0);
+        }
     }
 
     // inputs

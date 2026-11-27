@@ -2481,17 +2481,23 @@ SamplerInfo tuned_sampler(const SamplerInfo& in) {
     SamplerInfo s = in;
     const int aniso = gfx::tuning().anisotropy.load(std::memory_order_relaxed);
     const float bias = gfx::tuning().lod_bias.load(std::memory_order_relaxed);
+    const float up_bias = gfx::tuning().upscale_lod_bias.load(std::memory_order_relaxed);
     if (s.compare_mode == NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE) return s;
     const bool mips = min_filter_uses_mips(s.min_filter);
-    if (aniso > 1 && mips && vk_min_filter(s.min_filter) == VK_FILTER_LINEAR && vk_mag_filter(s.mag_filter) == VK_FILTER_LINEAR)
+    const bool linear_mip = mips && vk_min_filter(s.min_filter) == VK_FILTER_LINEAR && vk_mag_filter(s.mag_filter) == VK_FILTER_LINEAR;
+    // Check the game's original anisotropy before our override: reflection cubemaps and blur chains do not ask
+    // for anisotropy, so restricting auto upscaler mip bias to game-aniso material samplers avoids corrupting them (#79).
+    const bool game_aniso = (in.max_anisotropy > 1.0f);
+    if (aniso > 1 && linear_mip)
         s.max_anisotropy = std::max(s.max_anisotropy, static_cast<float>(aniso));
+    if (up_bias != 0.0f && game_aniso && linear_mip) s.lod_bias += up_bias;
     if (bias != 0.0f && mips) s.lod_bias += bias;
     return s;
 }
 
 // sampler_for's last few answers, for the game's sampler and the tuning tuned_sampler applies (render thread, as the map): a draw's
 // samplers repeat from draw to draw (rt agent, notes/rt.md). Emptied with the map (tex_shutdown).
-struct SamplerLast { SamplerInfo in; int aniso = 0; float bias = 0.0f; VkSampler out = VK_NULL_HANDLE; };
+struct SamplerLast { SamplerInfo in; int aniso = 0; float bias = 0.0f; float up_bias = 0.0f; VkSampler out = VK_NULL_HANDLE; };
 static SamplerLast g_sampler_last[4];
 static unsigned g_sampler_last_next = 0;
 
@@ -2500,9 +2506,10 @@ VkSampler sampler_for(const SamplerInfo& game_sampler) {
     unsigned& last_next = g_sampler_last_next;
     const int aniso = gfx::tuning().anisotropy.load(std::memory_order_relaxed);
     const float bias = gfx::tuning().lod_bias.load(std::memory_order_relaxed);
+    const float up_bias = gfx::tuning().upscale_lod_bias.load(std::memory_order_relaxed);
     for (int i = 0; i < 4; ++i) {
         const SamplerLast& l = last[i];
-        if (l.out && l.aniso == aniso && l.bias == bias && l.in == game_sampler) {
+        if (l.out && l.aniso == aniso && l.bias == bias && l.up_bias == up_bias && l.in == game_sampler) {
             if (rt_check_on()) {   // [nvn] rt_check: the map gives the same sampler
                 const SamplerInfo s = tuned_sampler(game_sampler);
                 VkSampler m = VK_NULL_HANDLE;
@@ -2516,13 +2523,13 @@ VkSampler sampler_for(const SamplerInfo& game_sampler) {
     auto& bucket = g_sh.samplers[sampler_hash(s)];
     for (const auto& e : bucket)
         if (e.first == s) {
-            last[last_next++ % 4] = {game_sampler, aniso, bias, e.second};
+            last[last_next++ % 4] = {game_sampler, aniso, bias, up_bias, e.second};
             return e.second;
         }
     const VkSampler v = create_sampler(s);
     if (v == VK_NULL_HANDLE) return dummy_sampler();
     bucket.emplace_back(s, v);
-    last[last_next++ % 4] = {game_sampler, aniso, bias, v};
+    last[last_next++ % 4] = {game_sampler, aniso, bias, up_bias, v};
     return v;
 }
 

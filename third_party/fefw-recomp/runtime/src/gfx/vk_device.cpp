@@ -21,6 +21,7 @@
 #include "nxrt/gauge.h"
 #include "nxrt/memguard.h"
 #include "nxrt/gfx.h"
+#include "nxrt/gfx_tuning.h"
 #include "nxrt/log.h"
 #include "nxrt/platform.h"
 #include "vk_gauges.h"
@@ -657,6 +658,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     queue_family_ = cands[pick].qfam;
     NXLOG_I(kTag, "using GPU %zu: %s%s", pick, gpus_[pick].name.c_str(), gpu_want.empty() ? " (default rule)" : " (override)");
     vkGetPhysicalDeviceProperties(physical_, &props_);
+    note_render_gpu_info(static_cast<int>(pick), gpus_[pick].vendor_id, gpus_[pick].name.c_str());
 
     extras::streamline_check_framegen(physical_);   // before device/swapchain hooks can allocate FG resources
 

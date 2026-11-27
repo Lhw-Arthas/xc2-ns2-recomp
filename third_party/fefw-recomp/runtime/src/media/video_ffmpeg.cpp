@@ -1,6 +1,30 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "video_ffmpeg.h"
 
+#include <cstdio>
+#include <mutex>
+
+#include "nxrt/gfx_tuning.h"
+
+namespace nxrt::gfx {
+namespace {
+std::mutex g_render_gpu_mu;
+RenderGpuInfo g_render_gpu;
+}  // namespace
+
+void note_render_gpu_info(int index, uint32_t vendor_id, const char* name) {
+    std::lock_guard<std::mutex> lk(g_render_gpu_mu);
+    g_render_gpu.vulkan_index = index;
+    g_render_gpu.vendor_id = vendor_id;
+    std::snprintf(g_render_gpu.name, sizeof g_render_gpu.name, "%s", name ? name : "");
+}
+
+RenderGpuInfo render_gpu_info() {
+    std::lock_guard<std::mutex> lk(g_render_gpu_mu);
+    return g_render_gpu;
+}
+}  // namespace nxrt::gfx
+
 #if NXRT_HAVE_FFMPEG
 #include <windows.h>
 
@@ -13,8 +37,10 @@ extern "C" {
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 #include "nxrt/config.h"
+#include "nxrt/gfx_tuning.h"
 #include "nxrt/log.h"
 
 namespace nxrt::media {
@@ -32,21 +58,36 @@ AVCodecID codec_id(int codec) {
 // [media] hwdec_backend: which hardware decode the film uses. d3d11va is the long-standing path; vulkan goes through
 // FFmpeg's Vulkan Video decode, which on AMD avoids whatever makes D3D11VA hand back mosaic frames at 4K (2026-11-21).
 // Both end in the same av_hwframe_transfer_data -> NV12 copy; the CPU decoders stay the fallback for everything.
-AVHWDeviceType hw_device_type() {
-    static const AVHWDeviceType t = [] {
+struct HwBackendPref {
+    AVHWDeviceType type = AV_HWDEVICE_TYPE_VULKAN;
+    bool explicit_choice = false;
+};
+
+HwBackendPref hw_device_pref() {
+    static const HwBackendPref pref = [] {
+        HwBackendPref p;
         std::string b = config_get_str("media", "hwdec_backend", "auto");
         NXLOG_I(kTag, "hwdec_backend = '%s'", b.c_str());
         for (char& c : b)
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-        if (b == "d3d11va" || b == "d3d11") return AV_HWDEVICE_TYPE_D3D11VA;
-        return AV_HWDEVICE_TYPE_VULKAN;   // auto and vulkan: Vulkan Video first, D3D11VA if it cannot be created
+        if (b == "d3d11va" || b == "d3d11") {
+            p.type = AV_HWDEVICE_TYPE_D3D11VA;
+            p.explicit_choice = true;
+        } else if (b == "vulkan") {
+            p.type = AV_HWDEVICE_TYPE_VULKAN;
+            p.explicit_choice = true;
+        } else {
+            p.type = AV_HWDEVICE_TYPE_VULKAN;   // auto: Vulkan Video first, D3D11VA fallback
+            p.explicit_choice = false;
+        }
+        return p;
     }();
-    return t;
+    return pref;
 }
 // What was actually created: auto starts with Vulkan Video and falls back to D3D11VA, and the logs should say which one ran.
 AVHWDeviceType g_used_type = AV_HWDEVICE_TYPE_NONE;
 
-// One D3D11VA device for the whole process. Creating it is the expensive part of the first frame: on 0.1.4 the
+// One hardware decode device for the whole process. Creating it is the expensive part of the first frame: on 0.1.4 the
 // presenting thread sat 183 ms inside a 213 ms frame at the start of a film, waiting for the first picture while the
 // worker created the device under the decode. ffdec_prewarm() builds it during the loading screen instead, and every
 // stream takes a reference to the same one; an unused device is one COM object and no GPU work.
@@ -58,19 +99,41 @@ AVBufferRef* shared_device() {
     if (g_dev) return g_dev;
     AVBufferRef* hw = nullptr;
     const auto t0 = std::chrono::steady_clock::now();
-    AVHWDeviceType t = hw_device_type();
-    if (av_hwdevice_ctx_create(&hw, t, nullptr, nullptr, 0) < 0) {
+    const HwBackendPref pref = hw_device_pref();
+    AVHWDeviceType t = pref.type;
+    const gfx::RenderGpuInfo rgpu = gfx::render_gpu_info();
+
+    // Intel Vulkan Video (igvkMedia64.dll) crashes with 0xC0000005 on 4K AV1 cutscenes (#63, #87).
+    // On auto, skip Vulkan Video when the render GPU itself is Intel; on dual-GPU laptops, pass the
+    // render GPU's Vulkan device index so FFmpeg never silently picks GPU 0 (the Intel iGPU).
+    if (t == AV_HWDEVICE_TYPE_VULKAN && !pref.explicit_choice && rgpu.vendor_id == 0x8086u) {
+        NXLOG_I(kTag, "Intel render GPU (%s): skipping Vulkan Video (igvkMedia64 crash, #63/#87); trying D3D11VA",
+                rgpu.name[0] ? rgpu.name : "0x8086");
+        t = AV_HWDEVICE_TYPE_D3D11VA;
+    }
+
+    const std::string vk_dev_arg =
+        (t == AV_HWDEVICE_TYPE_VULKAN && rgpu.vulkan_index >= 0) ? std::to_string(rgpu.vulkan_index) : std::string();
+    const char* dev_cstr = vk_dev_arg.empty() ? nullptr : vk_dev_arg.c_str();
+
+    if (av_hwdevice_ctx_create(&hw, t, dev_cstr, nullptr, 0) < 0) {
         if (t != AV_HWDEVICE_TYPE_VULKAN) return nullptr;
-        // No Vulkan Video on this machine or driver: the D3D11VA path is the one that has been there all along.
+        // No Vulkan Video on the render GPU or driver: fall back to D3D11VA (never retry Vulkan with nullptr,
+        // which would silently land on GPU 0 / Intel iGPU on Optimus laptops).
         t = AV_HWDEVICE_TYPE_D3D11VA;
         if (av_hwdevice_ctx_create(&hw, t, nullptr, nullptr, 0) < 0) return nullptr;
-        NXLOG_I(kTag, "Vulkan Video is not available here; using D3D11VA");
+        NXLOG_I(kTag, "Vulkan Video is not available on GPU %d; using D3D11VA", rgpu.vulkan_index);
     }
     g_used_type = t;
     g_dev = hw;   // process lifetime: each decoder holds its own reference to it
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    NXLOG_I(kTag, "%s device in %lld ms (shared by every stream)", t == AV_HWDEVICE_TYPE_VULKAN ? "Vulkan Video" : "D3D11VA",
-            static_cast<long long>(ms));
+    if (t == AV_HWDEVICE_TYPE_VULKAN && rgpu.vulkan_index >= 0) {
+        NXLOG_I(kTag, "Vulkan Video device (GPU %d: %s) in %lld ms (shared by every stream)",
+                rgpu.vulkan_index, rgpu.name[0] ? rgpu.name : "?", static_cast<long long>(ms));
+    } else {
+        NXLOG_I(kTag, "%s device in %lld ms (shared by every stream)", t == AV_HWDEVICE_TYPE_VULKAN ? "Vulkan Video" : "D3D11VA",
+                static_cast<long long>(ms));
+    }
     return g_dev;
 }
 
