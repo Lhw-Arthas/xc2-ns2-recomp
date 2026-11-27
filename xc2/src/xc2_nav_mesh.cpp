@@ -189,8 +189,9 @@ bool load_arh_index(const std::filesystem::path& romfs_dir, ArhIndex& out) {
         std::reverse(rev.begin(), rev.end());
         const std::string full = to_lower_ascii(rev + tail);
         const bool is_nav = (full.find(".winvhe") != std::string::npos || full.find(".winvda") != std::string::npos);
-        const bool is_lmk = (full.find("_landmark.lvb") != std::string::npos);
-        if (!is_nav && !is_lmk) continue;
+        const bool is_lvb = (full.find("_landmark.lvb") != std::string::npos || full.find("_npc.lvb") != std::string::npos);
+        const bool is_gmk = (full == "/bdat/common_gmk.bdat");
+        if (!is_nav && !is_lvb && !is_gmk) continue;
 
         const uint8_t* ep = ents + static_cast<size_t>(entry_idx) * 24;
         ArhEntry ae;
@@ -663,9 +664,13 @@ struct WorkerState {
     // Output snapshot
     PathResult result;
 
-    // Cached LVLB landmark lists per map_res (for cross-map nearest skip-travel lookup)
+    // Cached LVLB lists & lazy-loaded common_gmk.bdat (for 3-level cross-map skip-travel lookup)
     std::unordered_map<std::string, std::vector<LvbLandmark>> lvb_cache;
+    std::unordered_map<std::string, std::vector<OffMapLandmark>> offmap_lm_cache;
     ArhIndex lvb_arh;
+    bool gmk_bdat_loaded = false;
+    std::vector<uint8_t> gmk_bdat_raw;
+    std::unordered_map<std::string, std::vector<uint8_t>> gmk_tables;
 };
 
 WorkerState& ws() {
@@ -783,41 +788,45 @@ void mesh_update_and_get(const std::string& map_res, NavVec3 player, NavVec3 goa
     if (wake) ws().cv.notify_one();
 }
 
-bool mesh_get_map_landmarks(const std::string& map_res, std::vector<LvbLandmark>& out) {
-    out.clear();
-    if (map_res.empty()) return false;
-    const std::string res_lo = to_lower_ascii(map_res);
+namespace {
 
-    std::lock_guard<std::mutex> lk(ws().mu);
-    auto cit = ws().lvb_cache.find(res_lo);
+bool read_ard_entry(const std::filesystem::path& ard_path, const ArhEntry& e, std::vector<uint8_t>& out) {
+    out.clear();
+    std::ifstream ard(ard_path, std::ios::binary);
+    if (!ard) return false;
+    const size_t read_sz = (e.flags == 2) ? (0x30u + e.comp) : (e.comp ? e.comp : e.unc);
+    if (read_sz == 0 || read_sz > 64u * 1024u * 1024u) return false;
+    std::vector<uint8_t> tmp(read_sz);
+    ard.seekg(static_cast<std::streamoff>(e.offset), std::ios::beg);
+    if (!ard.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(read_sz))) return false;
+    if (e.flags == 2 && tmp.size() >= 0x30 && std::memcmp(tmp.data(), "xbc1", 4) == 0) {
+        return xbc1_decompress(tmp.data(), tmp.size(), out);
+    }
+    out = std::move(tmp);
+    return !out.empty();
+}
+
+bool read_lvb_locked(const std::string& key, std::vector<LvbLandmark>& out) {
+    out.clear();
+    auto cit = ws().lvb_cache.find(key);
     if (cit != ws().lvb_cache.end()) {
         out = cit->second;
         return !out.empty();
     }
-
     if (!ws().lvb_arh.loaded && !ws().romfs_dir.empty()) {
         load_arh_index(ws().romfs_dir, ws().lvb_arh);
     }
-    const std::string key = "/gmk/" + res_lo + "_landmark.lvb";
     auto ait = ws().lvb_arh.by_path.find(key);
     if (ait == ws().lvb_arh.by_path.end()) {
-        ws().lvb_cache[res_lo] = {};
+        ws().lvb_cache[key] = {};
         return false;
     }
-
-    std::ifstream ard(ws().lvb_arh.ard_path, std::ios::binary);
-    if (!ard) return false;
-    const ArhEntry& e = ait->second;
-    const size_t read_sz = (e.flags == 2) ? (0x30u + e.comp) : (e.comp ? e.comp : e.unc);
-    std::vector<uint8_t> tmp(read_sz), raw;
-    ard.seekg(static_cast<std::streamoff>(e.offset), std::ios::beg);
-    if (!ard.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(read_sz))) return false;
-    if (e.flags == 2) {
-        if (!xbc1_decompress(tmp.data(), tmp.size(), raw)) return false;
-    } else {
-        raw = std::move(tmp);
+    std::vector<uint8_t> raw;
+    if (!read_ard_entry(ws().lvb_arh.ard_path, ait->second, raw) ||
+        raw.size() < 0x40 || std::memcmp(raw.data(), "LVLB", 4) != 0) {
+        ws().lvb_cache[key] = {};
+        return false;
     }
-    if (raw.size() < 0x40 || std::memcmp(raw.data(), "LVLB", 4) != 0) return false;
 
     // Parse XFRM (stride 0x40: Vec3 pos at +0x00, hash_id at +0x30) and STRG (NUL-terminated names) chunks.
     std::vector<LvbLandmark> parsed;
@@ -840,7 +849,6 @@ bool mesh_get_map_landmarks(const std::string& map_res, std::vector<LvbLandmark>
         } else if (std::memcmp(raw.data() + pos, "STRG", 4) == 0) {
             size_t sp = pos + 0x20;
             const size_t send = pos + csz;
-            // First byte may be empty string (cnt = entries + 1); collect non-empty NUL strings.
             while (sp < send) {
                 const char* s = reinterpret_cast<const char*>(raw.data() + sp);
                 size_t len = 0;
@@ -854,9 +862,257 @@ bool mesh_get_map_landmarks(const std::string& map_res, std::vector<LvbLandmark>
     for (size_t i = 0; i < parsed.size() && i < str_names.size(); ++i) {
         parsed[i].name = str_names[i];
     }
-    ws().lvb_cache[res_lo] = parsed;
+    ws().lvb_cache[key] = parsed;
     out = std::move(parsed);
     return !out.empty();
+}
+
+void decrypt_bdat_v2(std::vector<uint8_t>& d) {
+    if (d.size() < 0x20 || std::memcmp(d.data(), "BDAT", 4) != 0) return;
+    const uint16_t flags = rd_u16(d.data() + 0x04);
+    if ((flags & 2u) == 0u) return;
+    const uint16_t name_off = rd_u16(d.data() + 0x06);
+    const uint16_t b_off    = rd_u16(d.data() + 0x0A);
+    const uint32_t str_off  = rd_u32(d.data() + 0x18);
+    const uint32_t str_sz   = rd_u32(d.data() + 0x1C);
+    const uint8_t k1_init   = static_cast<uint8_t>(~d[0x17]);
+    const uint8_t k2_init   = static_cast<uint8_t>(~d[0x16]);
+
+    auto unscr = [&](size_t start, size_t end) {
+        if (start >= d.size() || end > d.size() || start >= end) return;
+        uint8_t p1 = k1_init, p2 = k2_init;
+        for (size_t i = start; i < end; i += 2) {
+            const uint8_t c1 = d[i];
+            d[i] = static_cast<uint8_t>(c1 ^ p1);
+            p1 = static_cast<uint8_t>(p1 + c1);
+            if (i + 1 < end) {
+                const uint8_t c2 = d[i + 1];
+                d[i + 1] = static_cast<uint8_t>(c2 ^ p2);
+                p2 = static_cast<uint8_t>(p2 + c2);
+            }
+        }
+    };
+    unscr(name_off, b_off);
+    unscr(str_off, static_cast<size_t>(str_off) + str_sz);
+    // Clear encrypted bit in our private host copy.
+    const uint16_t clear_flags = static_cast<uint16_t>(flags & ~2u);
+    std::memcpy(d.data() + 0x04, &clear_flags, 2);
+}
+
+const std::vector<uint8_t>* get_gmk_table_locked(const std::string& target_name) {
+    auto it = ws().gmk_tables.find(target_name);
+    if (it != ws().gmk_tables.end()) {
+        return it->second.empty() ? nullptr : &it->second;
+    }
+    if (!ws().gmk_bdat_loaded) {
+        ws().gmk_bdat_loaded = true;
+        if (!ws().lvb_arh.loaded && !ws().romfs_dir.empty()) {
+            load_arh_index(ws().romfs_dir, ws().lvb_arh);
+        }
+        auto ait = ws().lvb_arh.by_path.find("/bdat/common_gmk.bdat");
+        if (ait != ws().lvb_arh.by_path.end()) {
+            read_ard_entry(ws().lvb_arh.ard_path, ait->second, ws().gmk_bdat_raw);
+        }
+    }
+    const auto& raw = ws().gmk_bdat_raw;
+    if (raw.size() < 16) return nullptr;
+    const uint32_t tcnt = rd_u32(raw.data());
+    if (tcnt == 0 || 8ull + static_cast<uint64_t>(tcnt) * 4ull > raw.size()) return nullptr;
+
+    // Scan tables once and match decrypted table name (tables are small, ~258 total).
+    for (uint32_t i = 0; i < tcnt; ++i) {
+        const uint32_t off = rd_u32(raw.data() + 8 + i * 4);
+        const uint32_t end = (i + 1 < tcnt) ? rd_u32(raw.data() + 8 + (i + 1) * 4) : static_cast<uint32_t>(raw.size());
+        if (off >= raw.size() || end <= off || end > raw.size() || end - off < 0x20) continue;
+
+        // Fast check: decrypt only the table name header first if encrypted, or decrypt whole table.
+        std::vector<uint8_t> tbl(raw.begin() + off, raw.begin() + end);
+        decrypt_bdat_v2(tbl);
+        const uint16_t name_off = rd_u16(tbl.data() + 0x06);
+        if (name_off >= tbl.size()) continue;
+        size_t nul = name_off;
+        while (nul < tbl.size() && tbl[nul] != 0) ++nul;
+        if (nul - name_off == target_name.size() &&
+            std::memcmp(tbl.data() + name_off, target_name.data(), target_name.size()) == 0) {
+            auto [ins, _] = ws().gmk_tables.emplace(target_name, std::move(tbl));
+            return &ins->second;
+        }
+    }
+    ws().gmk_tables[target_name] = {};
+    return nullptr;
+}
+
+bool host_bdat_find_col(const std::vector<uint8_t>& d, const char* col_name, uint16_t& out_voff, uint8_t& out_typ) {
+    if (d.size() < 0x20 || std::memcmp(d.data(), "BDAT", 4) != 0) return false;
+    const uint16_t b_off = rd_u16(d.data() + 0x0A);
+    const uint16_t b_cnt = rd_u16(d.data() + 0x0C);
+    if (b_cnt == 0 || b_cnt > 256 || b_off + b_cnt * 2u > d.size()) return false;
+    for (uint16_t b = 0; b < b_cnt; ++b) {
+        uint16_t e = rd_u16(d.data() + b_off + b * 2u);
+        for (int guard = 0; guard < 64 && e != 0 && static_cast<size_t>(e) + 6 <= d.size(); ++guard) {
+            const uint16_t desc = rd_u16(d.data() + e);
+            const uint16_t nxt  = rd_u16(d.data() + e + 2);
+            const uint16_t noff = rd_u16(d.data() + e + 4);
+            if (noff < d.size() && static_cast<size_t>(desc) + 4 <= d.size()) {
+                size_t nul = noff;
+                while (nul < d.size() && d[nul] != 0) ++nul;
+                if (std::strlen(col_name) == nul - noff &&
+                    std::memcmp(d.data() + noff, col_name, nul - noff) == 0) {
+                    out_typ  = d[desc + 1];
+                    out_voff = rd_u16(d.data() + desc + 2);
+                    return true;
+                }
+            }
+            e = nxt;
+        }
+    }
+    return false;
+}
+
+bool host_bdat_read_u32(const std::vector<uint8_t>& d, uint16_t r_idx, uint16_t voff, uint8_t typ, uint32_t& out) {
+    const uint16_t row_sz  = rd_u16(d.data() + 0x08);
+    const uint16_t row_off = rd_u16(d.data() + 0x0E);
+    const size_t off = static_cast<size_t>(row_off) + static_cast<size_t>(r_idx) * row_sz + voff;
+    if (typ == 1 || typ == 4) {
+        if (off + 1 > d.size()) return false;
+        out = d[off];
+        return true;
+    }
+    if (typ == 2 || typ == 5) {
+        if (off + 2 > d.size()) return false;
+        out = rd_u16(d.data() + off);
+        return true;
+    }
+    if (off + 4 > d.size()) return false;
+    out = rd_u32(d.data() + off);
+    return true;
+}
+
+bool host_bdat_read_str(const std::vector<uint8_t>& d, uint16_t r_idx, uint16_t voff, std::string& out) {
+    out.clear();
+    const uint16_t row_sz  = rd_u16(d.data() + 0x08);
+    const uint16_t row_off = rd_u16(d.data() + 0x0E);
+    const size_t off = static_cast<size_t>(row_off) + static_cast<size_t>(r_idx) * row_sz + voff;
+    if (off + 4 > d.size()) return false;
+    const uint32_t so = rd_u32(d.data() + off);
+    if (so == 0 || so >= d.size()) return false;
+    size_t nul = so;
+    while (nul < d.size() && d[nul] != 0) ++nul;
+    out.assign(reinterpret_cast<const char*>(d.data() + so), nul - so);
+    return !out.empty();
+}
+
+}  // namespace
+
+bool mesh_get_map_landmarks(const std::string& map_res, std::vector<LvbLandmark>& out) {
+    out.clear();
+    if (map_res.empty()) return false;
+    const std::string key = "/gmk/" + to_lower_ascii(map_res) + "_landmark.lvb";
+    std::lock_guard<std::mutex> lk(ws().mu);
+    return read_lvb_locked(key, out);
+}
+
+bool mesh_get_offmap_landmarks(const std::string& map_res, std::vector<OffMapLandmark>& out) {
+    out.clear();
+    if (map_res.empty()) return false;
+    const std::string res_lo = to_lower_ascii(map_res);
+
+    std::lock_guard<std::mutex> lk(ws().mu);
+    auto cit = ws().offmap_lm_cache.find(res_lo);
+    if (cit != ws().offmap_lm_cache.end()) {
+        out = cit->second;
+        return !out.empty();
+    }
+
+    std::vector<LvbLandmark> lvbs;
+    if (!read_lvb_locked("/gmk/" + res_lo + "_landmark.lvb", lvbs)) {
+        ws().offmap_lm_cache[res_lo] = {};
+        return false;
+    }
+    std::unordered_map<std::string, NavVec3> pos_by_name;
+    for (const auto& lv : lvbs) {
+        if (!lv.name.empty()) pos_by_name[lv.name] = lv.pos;
+    }
+
+    const auto* tbl = get_gmk_table_locked(res_lo + "_FLD_LandmarkPop");
+    if (!tbl || tbl->size() < 0x20) {
+        ws().offmap_lm_cache[res_lo] = {};
+        return false;
+    }
+
+    uint16_t v_name = 0, v_cat = 0, v_msg = 0, v_mg = 0, v_mi = 0;
+    uint8_t t_name = 0, t_cat = 0, t_msg = 0, t_mg = 0, t_mi = 0;
+    const bool has_name = host_bdat_find_col(*tbl, "name", v_name, t_name);
+    const bool has_cat  = host_bdat_find_col(*tbl, "category", v_cat, t_cat);
+    const bool has_msg  = host_bdat_find_col(*tbl, "MSGID", v_msg, t_msg);
+    const bool has_mg   = host_bdat_find_col(*tbl, "menuGroup", v_mg, t_mg);
+    const bool has_mi   = host_bdat_find_col(*tbl, "menuMapImage", v_mi, t_mi);
+    if (!has_name || !has_msg) {
+        ws().offmap_lm_cache[res_lo] = {};
+        return false;
+    }
+
+    const uint16_t row_cnt = rd_u16(tbl->data() + 0x10);
+    std::vector<OffMapLandmark> parsed;
+    parsed.reserve(row_cnt);
+    for (uint16_t r = 0; r < row_cnt; ++r) {
+        uint32_t cat = 0, msg = 0, mg = 0, mi = 0;
+        if (has_cat && (!host_bdat_read_u32(*tbl, r, v_cat, t_cat, cat) || cat > 1u)) continue;
+        if (!host_bdat_read_u32(*tbl, r, v_msg, t_msg, msg) || msg == 0) continue;
+        std::string nm;
+        if (!host_bdat_read_str(*tbl, r, v_name, nm)) continue;
+        auto pit = pos_by_name.find(nm);
+        if (pit == pos_by_name.end()) continue;
+        if (has_mg) host_bdat_read_u32(*tbl, r, v_mg, t_mg, mg);
+        if (has_mi) host_bdat_read_u32(*tbl, r, v_mi, t_mi, mi);
+        OffMapLandmark om;
+        om.pos = pit->second;
+        om.msg_id = msg;
+        om.menu_group = mg;
+        om.menu_map_image = mi;
+        om.category = static_cast<uint8_t>(cat);
+        parsed.push_back(om);
+    }
+
+    ws().offmap_lm_cache[res_lo] = parsed;
+    out = std::move(parsed);
+    return !out.empty();
+}
+
+bool mesh_find_offmap_npc_pos(const std::string& map_res, uint32_t npc_id, NavVec3& out_pos) {
+    if (map_res.empty() || npc_id == 0) return false;
+    const std::string res_lo = to_lower_ascii(map_res);
+
+    std::lock_guard<std::mutex> lk(ws().mu);
+    const auto* tbl = get_gmk_table_locked(res_lo + "_FLD_NpcPop");
+    if (!tbl || tbl->size() < 0x20) return false;
+
+    uint16_t v_name = 0, v_nid = 0;
+    uint8_t t_name = 0, t_nid = 0;
+    if (!host_bdat_find_col(*tbl, "name", v_name, t_name) ||
+        !host_bdat_find_col(*tbl, "NpcID", v_nid, t_nid)) {
+        return false;
+    }
+
+    std::string target_lvb_name;
+    const uint16_t row_cnt = rd_u16(tbl->data() + 0x10);
+    for (uint16_t r = 0; r < row_cnt; ++r) {
+        uint32_t nid = 0;
+        if (host_bdat_read_u32(*tbl, r, v_nid, t_nid, nid) && nid == npc_id) {
+            if (host_bdat_read_str(*tbl, r, v_name, target_lvb_name)) break;
+        }
+    }
+    if (target_lvb_name.empty()) return false;
+
+    std::vector<LvbLandmark> npcs;
+    if (!read_lvb_locked("/gmk/" + res_lo + "_npc.lvb", npcs)) return false;
+    for (const auto& n : npcs) {
+        if (n.name == target_lvb_name) {
+            out_pos = n.pos;
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace xc2::nav

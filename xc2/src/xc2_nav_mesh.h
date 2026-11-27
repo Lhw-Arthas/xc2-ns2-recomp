@@ -29,6 +29,14 @@ struct LvbLandmark {
     std::string name;  // e.g. "landmark_ma17a_001"
 };
 
+struct OffMapLandmark {
+    NavVec3 pos;
+    uint32_t msg_id = 0;          // -> fld_landmark [443] (Level-3 bottom skip-travel landmark name)
+    uint32_t menu_group = 0;      // -> MNU_MapGroup.disp_name -> fld_mapinfo [444] (Level-2 sub-area)
+    uint32_t menu_map_image = 0;  // -> MNU_MapInfo.disp_name -> fld_mapinfo [444] (fallback floor/zone)
+    uint8_t category = 0;         // <= 1 = Skip-Travel Landmark
+};
+
 // Initialize / shut down the background worker (safe to call multiple times).
 void mesh_init(const std::string& romfs_dir);
 void mesh_shutdown();
@@ -37,7 +45,11 @@ void mesh_shutdown();
 // and copies the latest completed PathResult snapshot for the render thread.
 void mesh_update_and_get(const std::string& map_res, NavVec3 player, NavVec3 goal, PathResult& out);
 
-// Cached lightweight lookup of /gmk/<map_res>_landmark.lvb from bf2.arh/bf2.ard (for cross-map nearest skip-travel hints).
+// Cached lightweight lookup of /gmk/<map_res>_landmark.lvb from bf2.arh/bf2.ard.
 bool mesh_get_map_landmarks(const std::string& map_res, std::vector<LvbLandmark>& out);
+
+// Cached 3-level cross-map Skip-Travel helpers (reads /bdat/common_gmk.bdat + /gmk/<res>_{landmark,npc}.lvb on demand).
+bool mesh_get_offmap_landmarks(const std::string& map_res, std::vector<OffMapLandmark>& out);
+bool mesh_find_offmap_npc_pos(const std::string& map_res, uint32_t npc_id, NavVec3& out_pos);
 
 }  // namespace xc2::nav

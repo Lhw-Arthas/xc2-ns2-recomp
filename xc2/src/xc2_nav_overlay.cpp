@@ -207,6 +207,8 @@ struct OffMapTarget {
     uint32_t cat = 0;
     Vec3 pos{};
     bool has_pos = false;
+    uint64_t vt_rva = 0;
+    uint32_t target_id = 0;  // e.g. NpcID at impl+0x18 for kVtTalkNpcId
 };
 
 bool read_in_battle(uint64_t mb) {
@@ -272,6 +274,11 @@ void collect_locators(uint64_t mb, uint32_t current_map_id, std::vector<NavMarke
                     out_offmap.map_id = map_id;
                     out_offmap.cat = cat;
                     out_offmap.has_pos = false;
+                    out_offmap.vt_rva = vt_rva;
+                    out_offmap.target_id = 0;
+                    if (vt_rva == off301::kVtTalkNpcId) {
+                        safe_read(impl + 0x18ull, out_offmap.target_id);
+                    }
                     // Try to extract 3D target coordinates even for off-map locators (active flag may be 0 while off-map).
                     Vec3 p{};
                     uint32_t cnt = 0;
@@ -537,21 +544,49 @@ bool bdat_read_string(uint64_t tbl, uint32_t row_id, const char* col_name, char*
     return out[0] != '\0';
 }
 
-// Resolve localized Titan/Map name and (when 3D pos is available) nearest Skip-Travel landmark on an off-map target.
-void resolve_cross_map_hint(uint64_t mb, const OffMapTarget& offmap, char* out_map, size_t map_n, char* out_lm, size_t lm_n) {
+// Resolve full 3-level localized Skip-Travel breadcrumb for an off-map objective:
+//   Level 1 (out_map): Titan / Big Map  (FLD_maplist.nameID -> fld_mapinfo [444])
+//   Level 2 (out_sub): Sub-area / Floor (nearest landmark.menuGroup -> MNU_MapGroup.disp_name -> fld_mapinfo [444])
+//   Level 3 (out_lm):  Bottom-most nearest Skip-Travel Landmark (landmark.MSGID -> fld_landmark [443])
+void resolve_cross_map_hint(uint64_t mb, const OffMapTarget& offmap,
+                            char* out_map, size_t map_n,
+                            char* out_sub, size_t sub_n,
+                            char* out_lm, size_t lm_n) {
     out_map[0] = '\0';
+    out_sub[0] = '\0';
     out_lm[0] = '\0';
     if (!offmap.valid || offmap.map_id == 0) return;
 
-    uint64_t bdat_mgr = 0, map_tbl = 0, lm_msg_tbl = 0;
+    // Lightweight cache so per-frame HUD rendering does zero archive/BDAT work after first resolution.
+    struct Cache {
+        uint32_t map_id = 0;
+        uint64_t vt_rva = 0;
+        uint32_t target_id = 0;
+        bool has_pos = false;
+        int32_t qx = 0, qy = 0, qz = 0;
+        std::string map_s, sub_s, lm_s;
+    };
+    static Cache s_cache;
+    const int32_t qx = offmap.has_pos ? static_cast<int32_t>(std::lround(offmap.pos.x)) : 0;
+    const int32_t qy = offmap.has_pos ? static_cast<int32_t>(std::lround(offmap.pos.y)) : 0;
+    const int32_t qz = offmap.has_pos ? static_cast<int32_t>(std::lround(offmap.pos.z)) : 0;
+    if (s_cache.map_id == offmap.map_id && s_cache.vt_rva == offmap.vt_rva &&
+        s_cache.target_id == offmap.target_id && s_cache.has_pos == offmap.has_pos &&
+        s_cache.qx == qx && s_cache.qy == qy && s_cache.qz == qz && !s_cache.map_s.empty()) {
+        std::snprintf(out_map, map_n, "%s", s_cache.map_s.c_str());
+        std::snprintf(out_sub, sub_n, "%s", s_cache.sub_s.c_str());
+        std::snprintf(out_lm,  lm_n,  "%s", s_cache.lm_s.c_str());
+        return;
+    }
+
+    uint64_t bdat_mgr = 0, map_tbl = 0, lm_msg_tbl = 0, map_msg_tbl = 0;
     if (!safe_read(mb + off301::kDataBdatSingleton, bdat_mgr) || !bdat_mgr) return;
     safe_read(bdat_mgr + 0x10ull + static_cast<uint64_t>(off301::kBdatIdxFldMapList) * 8ull, map_tbl);
     safe_read(bdat_mgr + 0x10ull + static_cast<uint64_t>(off301::kBdatIdxFldLandmarkMsg) * 8ull, lm_msg_tbl);
+    safe_read(bdat_mgr + 0x10ull + static_cast<uint64_t>(off301::kBdatIdxFldMapInfoMsg) * 8ull, map_msg_tbl);
     if (!map_tbl) return;
 
-    // 1. Localized map name: FLD_maplist.nameID -> fld_mapinfo (index 444, active language)
-    uint64_t map_msg_tbl = 0;
-    safe_read(bdat_mgr + 0x10ull + static_cast<uint64_t>(off301::kBdatIdxFldMapInfoMsg) * 8ull, map_msg_tbl);
+    // 1. Level-1 localized Titan/Map name: FLD_maplist.nameID -> fld_mapinfo [444]
     if (map_msg_tbl) {
         uint32_t map_name_id = 0;
         if (bdat_read_uint(map_tbl, offmap.map_id, "nameID", map_name_id) && map_name_id > 0) {
@@ -559,50 +594,81 @@ void resolve_cross_map_hint(uint64_t mb, const OffMapTarget& offmap, char* out_m
         }
     }
 
-    // 2. Nearest Skip-Travel landmark on target map (if 3D pos is present on the off-map locator)
     char res[32] = {};
     if (!read_map_resource_name(mb, offmap.map_id, res, sizeof res)) return;
     if (out_map[0] == '\0') std::snprintf(out_map, map_n, "%s", res);
 
-    if (offmap.has_pos && lm_msg_tbl) {
-        std::vector<LvbLandmark> lvbs;
-        if (mesh_get_map_landmarks(res, lvbs) && !lvbs.empty()) {
-            // Find target map's <res>_FLD_LandmarkPop table in GfDataBdat (if resident in common_gmk)
-            char pop_name[64];
-            std::snprintf(pop_name, sizeof pop_name, "%s_FLD_LandmarkPop", res);
-            const uint64_t pop_tbl = bdat_find_table_by_name(mb, pop_name);
-            if (pop_tbl) {
-                uint16_t row_cnt = 0, id_top = 0;
-                if (safe_read(pop_tbl + 0x10, row_cnt) && safe_read(pop_tbl + 0x12, id_top)) {
-                    float best_d2 = 1e30f;
-                    uint32_t best_msg = 0;
-                    for (uint16_t r = 0; r < row_cnt; ++r) {
-                        const uint32_t rid = static_cast<uint32_t>(id_top) + r;
-                        uint32_t cat = 99, msg_id = 0, hash_id = 0;
-                        if (!bdat_read_uint(pop_tbl, rid, "category", cat) || cat > 1u) continue;
-                        if (!bdat_read_uint(pop_tbl, rid, "MSGID", msg_id) || msg_id == 0) continue;
-                        // Match LVB entry by hash_id (or fallback by sequential index if hash column absent)
-                        bool has_hash = bdat_read_uint(pop_tbl, rid, "ID", hash_id);
-                        for (const auto& lv : lvbs) {
-                            if (has_hash && lv.hash_id != hash_id) continue;
-                            const float dx = lv.pos.x - offmap.pos.x;
-                            const float dy = lv.pos.y - offmap.pos.y;
-                            const float dz = lv.pos.z - offmap.pos.z;
-                            const float d2 = dx * dx + dy * dy + dz * dz;
-                            if (d2 < best_d2) {
-                                best_d2 = d2;
-                                best_msg = msg_id;
-                            }
-                            if (has_hash) break;
-                        }
+    // 2. Resolve target 3D position on target map (direct pos on locator, or NpcID -> _FLD_NpcPop + _npc.lvb).
+    NavVec3 tgt_pos{offmap.pos.x, offmap.pos.y, offmap.pos.z};
+    bool has_tgt_pos = offmap.has_pos;
+    if (!has_tgt_pos && offmap.vt_rva == off301::kVtTalkNpcId && offmap.target_id > 0) {
+        has_tgt_pos = mesh_find_offmap_npc_pos(res, offmap.target_id, tgt_pos);
+    }
+
+    // 3. Find nearest Skip-Travel Landmark (category <= 1) on target map -> Level-3 & Level-2 localized names.
+    if (has_tgt_pos && lm_msg_tbl) {
+        std::vector<OffMapLandmark> lms;
+        if (mesh_get_offmap_landmarks(res, lms) && !lms.empty()) {
+            const OffMapLandmark* best = nullptr;
+            float best_d2 = 1e30f;
+            for (const auto& lm : lms) {
+                const float dx = lm.pos.x - tgt_pos.x;
+                const float dy = lm.pos.y - tgt_pos.y;
+                const float dz = lm.pos.z - tgt_pos.z;
+                const float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < best_d2) {
+                    best_d2 = d2;
+                    best = &lm;
+                }
+            }
+            if (best && best->msg_id > 0) {
+                // Level-3: bottom-most Skip-Travel landmark name
+                bdat_read_string(lm_msg_tbl, best->msg_id, "name", out_lm, lm_n);
+
+                // Level-2: Skip-Travel sub-area group (MNU_MapGroup.disp_name -> mnu_map_level_name_ms),
+                // with fallback to MNU_MapInfo.disp_name if group name is missing or identical to Level-1.
+                static uint64_t s_mnu_grp = 0;
+                static uint64_t s_mnu_info = 0;
+                static uint64_t s_level_msg = 0;
+                static bool s_mnu_probed = false;
+                if (!s_mnu_probed) {
+                    s_mnu_probed = true;
+                    s_mnu_grp   = bdat_find_table_by_name(mb, "MNU_MapGroup");
+                    s_mnu_info  = bdat_find_table_by_name(mb, "MNU_MapInfo");
+                    s_level_msg = bdat_find_table_by_name(mb, "mnu_map_level_name_ms");
+                }
+                if (s_level_msg) {
+                    uint32_t sub_disp = 0;
+                    if (s_mnu_grp && best->menu_group > 0 &&
+                        bdat_read_uint(s_mnu_grp, best->menu_group, "disp_name", sub_disp) && sub_disp > 0) {
+                        bdat_read_string(s_level_msg, sub_disp, "name", out_sub, sub_n);
                     }
-                    if (best_msg > 0) {
-                        bdat_read_string(lm_msg_tbl, best_msg, "name", out_lm, lm_n);
+                    if ((out_sub[0] == '\0' || std::strcmp(out_sub, out_map) == 0) &&
+                        s_mnu_info && best->menu_map_image > 0 &&
+                        bdat_read_uint(s_mnu_info, best->menu_map_image, "disp_name", sub_disp) && sub_disp > 0) {
+                        bdat_read_string(s_level_msg, sub_disp, "name", out_sub, sub_n);
+                    }
+                    // Deduplicate if Level-2 is still identical to Level-1 or Level-3
+                    if (std::strcmp(out_sub, out_map) == 0 || std::strcmp(out_sub, out_lm) == 0) {
+                        out_sub[0] = '\0';
                     }
                 }
             }
         }
     }
+
+    s_cache.map_id = offmap.map_id;
+    s_cache.vt_rva = offmap.vt_rva;
+    s_cache.target_id = offmap.target_id;
+    s_cache.has_pos = offmap.has_pos;
+    s_cache.qx = qx;
+    s_cache.qy = qy;
+    s_cache.qz = qz;
+    s_cache.map_s = out_map;
+    s_cache.sub_s = out_sub;
+    s_cache.lm_s  = out_lm;
+    NXLOG_I(kTag, "cross-map skip-travel: map_id=%u (%s) -> '%s' > '%s' > '%s'",
+            offmap.map_id, res, out_map, out_sub, out_lm);
 }
 
 void collect_landmarks(uint64_t mb, std::vector<LandmarkInfo>& out) {
@@ -1033,11 +1099,13 @@ void submit_ground_ribbon(const nxrt::gfx::HudCanvas& c, const float vp[16],
 }
 
 void draw_cross_map_banner(const nxrt::gfx::HudCanvas& c, float scale, float vis_alpha,
-                           const char* prefix, const char* map_name, const char* lm_name, uint32_t accent_rgb) {
-    if (vis_alpha <= 0.02f || (!map_name[0] && !lm_name[0])) return;
-    char msg[240];
-    if (map_name[0] && lm_name[0]) {
-        std::snprintf(msg, sizeof msg, "%s%s · %s", prefix, map_name, lm_name);
+                           const char* prefix, const char* map_name, const char* sub_name, const char* lm_name, uint32_t accent_rgb) {
+    if (vis_alpha <= 0.02f || (!map_name[0] && !sub_name[0] && !lm_name[0])) return;
+    char msg[320];
+    if (map_name[0] && sub_name[0] && lm_name[0]) {
+        std::snprintf(msg, sizeof msg, "%s%s > %s > %s", prefix, map_name, sub_name, lm_name);
+    } else if (map_name[0] && lm_name[0]) {
+        std::snprintf(msg, sizeof msg, "%s%s > %s", prefix, map_name, lm_name);
     } else if (lm_name[0]) {
         std::snprintf(msg, sizeof msg, "%s%s", prefix, lm_name);
     } else {
@@ -1241,23 +1309,21 @@ void draw(const nxrt::gfx::HudCanvas& c) {
         }
     }
 
-    // 4c. Cross-map nearest skip-travel recommendation OR active Custom Pin top strip.
+    // 4c. Cross-map 3-level Skip-Travel recommendation OR active Custom Pin top strip.
     char cross_map_name[96] = {};
+    char cross_sub_name[96] = {};
     char cross_lm_name[96] = {};
     if (using_custom_pin && s_vis_alpha > 0.02f) {
         char pin_hdr[192];
         std::snprintf(pin_hdr, sizeof pin_hdr, "%s  (F4 切换 / 取消)", custom_pin_name.c_str());
-        draw_cross_map_banner(c, scale, s_vis_alpha, ">> 自定义导航  ", pin_hdr, "", 0xCE93D800u);
+        draw_cross_map_banner(c, scale, s_vis_alpha, ">> 自定义导航  ", pin_hdr, "", "", 0xCE93D800u);
     } else if (markers.empty() && offmap.valid && s_vis_alpha > 0.02f) {
-        resolve_cross_map_hint(mb, offmap, cross_map_name, sizeof cross_map_name, cross_lm_name, sizeof cross_lm_name);
-        static uint32_t s_logged_offmap = 0;
-        if (s_logged_offmap != offmap.map_id) {
-            s_logged_offmap = offmap.map_id;
-            NXLOG_I(kTag, "cross-map target: map_id=%u cat=%u has_pos=%d pos=(%.1f,%.1f,%.1f) map='%s' lm='%s'",
-                    offmap.map_id, offmap.cat, offmap.has_pos ? 1 : 0,
-                    offmap.pos.x, offmap.pos.y, offmap.pos.z, cross_map_name, cross_lm_name);
-        }
-        draw_cross_map_banner(c, scale, s_vis_alpha, ">> 跨图传送指引  ", cross_map_name, cross_lm_name,
+        resolve_cross_map_hint(mb, offmap,
+                               cross_map_name, sizeof cross_map_name,
+                               cross_sub_name, sizeof cross_sub_name,
+                               cross_lm_name, sizeof cross_lm_name);
+        draw_cross_map_banner(c, scale, s_vis_alpha, ">> 跨图传送指引  ",
+                              cross_map_name, cross_sub_name, cross_lm_name,
                               offmap.cat == 0 ? 0xFFD54F00u : 0x4FC3F700u);
     }
 
