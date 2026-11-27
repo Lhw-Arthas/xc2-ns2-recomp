@@ -5,19 +5,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        **If you are on an older build, update first.** Releases before **0.2.5** have known issues already fixed
-        (`#54`/`#61`/`#62`/`#64` NVIDIA 3D oblique black stripes/hatching, `#15` flicker, cutscene freezes, Intel `vkGetPipelineCacheData` exit `4`,
-        `v0.2.3` `FORCE_UNORM` dark bands, FSR 3 FG HUD ghosting, 4K dynres blur, `dav1d` EOS hang, PS 5.1 Setup fallback, and stronger NVIDIA/Intel GPU fault diagnostics).
-        Use **About → Check now** in `xc2-launcher.exe` or grab the latest build:
-        <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>
+        **Please make sure you are on the latest release** (Launcher: **About → Check now**, or <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>).
+        Before filing, a quick glance at [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) (known issues) and [docs/INVARIANTS.md](docs/INVARIANTS.md) can save time.
 
-        **请先确认版本是 0.2.5 或更新。** `0.2.5` 之前的多项已知问题已修复（`#54`/`#61`/`#62`/`#64` N 卡 3D 斜向黑条/摩尔纹、`#15` 闪烁、过场冻结、Intel `vkGetPipelineCacheData`
-        闪退、`v0.2.3` 黑条回归、FSR 3 FG HUD 重影、4K 动态分辨率变糊、`dav1d` 结尾卡死、无 `pwsh` 安装报错等，并增强了 N 卡/I 卡图形错误与 TDR 诊断）。
-        可通过启动器 **关于 → 检查更新** 一键升级，或前往上方链接下载最新版。
-
-        Before you open this: please read [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) —
-        the known issues are listed there, and the three project invariants are in
-        [docs/INVARIANTS.md](docs/INVARIANTS.md).
+        **请先确认已升级到最新版**（启动器 **关于 → 检查更新**，或点上方链接下载）；提交前可先扫一眼已知问题列表 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
   - type: input
     id: build
     attributes:
@@ -81,6 +72,18 @@ body:
         - "Not tried"
         - "Yes, it happens on TAAU (FG off) too"
         - "No, only with FSR / DLSS / Frame Gen"
+  - type: checkboxes
+    id: custom_env
+    attributes:
+      label: Custom setup or external tweaks (optional — check any that apply)
+      description: Helps us narrow things down quickly. If any of these are active, trying once with defaults often rules out external conflicts.
+      options:
+        - label: GPU driver overrides active (e.g. NVIDIA App DLSS model override, Low Latency Ultra)
+          required: false
+        - label: Mods or cheats enabled
+          required: false
+        - label: Third-party overlay (RTSS / ReShade), custom CPU affinity, or manual `nxrt.ini` edits
+          required: false
   - type: checkboxes
     id: confirm
     attributes:

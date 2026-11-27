@@ -5,17 +5,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        **If you are on an older build, update first.** Releases before **0.2.5** have known issues already fixed
-        (including `v0.2.3` dynamic-resolution / render-scale regressions, `#54` 3D stencil sampling, and cutscene sync hitches).
-        Use **About → Check now** in `xc2-launcher.exe` or grab the latest build:
-        <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>
+        **Please make sure you are on the latest release** (Launcher: **About → Check now**, or <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>).
+        **请先确认已升级到最新版**（启动器 **关于 → 检查更新**）。
 
-        **请先确认版本是 0.2.5 或更新。** `0.2.5` 包含此前动态分辨率与渲染缩放回归、3D 斜向黑纹与过场卡顿修复，建议先通过启动器 **关于 → 检查更新** 升级再测。
-
-        Three things and you are done - the log below carries the rest.
-
-        The report zip is the important one: it holds the frame times, what grew during a slow frame, and whether a
-        cutscene had just ended. Without it a stutter report can only be guessed at.
+        The report zip carries the frame times, what grew during a slow frame, and whether a cutscene had just ended. Without it a stutter report can only be guessed at.
   - type: dropdown
     id: os
     attributes:
@@ -44,7 +37,7 @@ body:
         Open a command prompt in the folder you unzipped and run:
 
         ```
-        tools\python\python.exe tools\report.py
+        tools\python\python.exe tools\report.py --no-validation
         ```
 
         Play until it goes slow, keep going for a few seconds of the slow part, then close the game. It writes
@@ -76,6 +69,18 @@ body:
       description: |
         What you saw, the upscaler and "Lock render resolution" if you changed them, and whether the game had just
         played a cutscene when it started. A screenshot is welcome here.
+  - type: checkboxes
+    id: custom_env
+    attributes:
+      label: Custom setup or external tweaks (optional — check any that apply)
+      description: Helps us spot external bottlenecks quickly (e.g. driver Low Latency Ultra, CPU core pinning, or FIFO VSync).
+      options:
+        - label: GPU driver overrides active (e.g. Low Latency Ultra, DLSS model override)
+          required: false
+        - label: Custom CPU affinity / core pinning, or third-party overlay (RTSS / ReShade)
+          required: false
+        - label: Mods / cheats enabled, or manual `nxrt.ini` edits
+          required: false
   - type: checkboxes
     id: confirm
     attributes:
