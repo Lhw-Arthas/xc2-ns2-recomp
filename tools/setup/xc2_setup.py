@@ -834,33 +834,168 @@ def romfs_missing(looked_near, romfs_in):
             % (looked_near, looked_near / "romfs", looked_near.parent, looked_near.parent / "romfs"))
 
 
+NS2_UPGRADE_PACK_ID = "0100e95004039062"
+
+
+def _is_title_id(name):
+    return len(name) == 16 and all(c in "0123456789abcdefABCDEF" for c in name)
+
+
+def _update_version_in_path(path):
+    parts = [p.lower() for p in path.parts]
+    best = 0
+    for i in range(len(parts) - 1):
+        if parts[i] == "updates" and parts[i + 1].isdigit():
+            best = max(best, int(parts[i + 1]))
+    return best
+
+
+def find_addon_romfs(addon_dir, max_depth=6):
+    """Locate the best `romfs/` inside a title-ID folder, supporting both flat `<id>/romfs` and
+    raw nested layouts such as `<id>/0/updates/65536/program/0/romfs` or `<id>/0/data/0/romfs`."""
+    direct = addon_dir / "romfs"
+    if direct.is_dir():
+        return direct
+    found = []
+    stack = [(addon_dir, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        if depth >= max_depth:
+            continue
+        try:
+            entries = list(cur.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            low = entry.name.lower()
+            if low == "romfs":
+                found.append((entry, depth + 1))
+            elif low != "exefs":
+                stack.append((entry, depth + 1))
+    if not found:
+        return None
+
+    def rank(item):
+        p, depth = item
+        ard = p / "bf2.ard"
+        has_ard = ard.is_file()
+        ard_size = ard.stat().st_size if has_ard else 0
+        return (1 if has_ard else 0, ard_size, _update_version_in_path(p), -depth)
+
+    return max(found, key=rank)[0]
+
+
+def find_ns2_upgrade_romfs(root):
+    """In an un-trimmed raw Switch 2 dump, the full ~24 GB NS2 3.0.1 RomFS lives inside
+    `0100e95004039062` (e.g. `0100e95004039062/0/updates/65536/program/0/romfs`)."""
+    roots = [root]
+    if root.parent != root:
+        roots.append(root.parent)
+    for base in roots:
+        for parent in (base / "dlc", base):
+            if not parent.is_dir():
+                continue
+            try:
+                entries = list(parent.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.is_dir() and entry.name.lower() == NS2_UPGRADE_PACK_ID:
+                    romfs = find_addon_romfs(entry)
+                    if romfs is not None and (romfs / "bf2.ard").is_file():
+                        return romfs
+    return None
+
+
 def find_romfs(dump, explicit):
     # --romfs wins when it is given. Measured 2026-11-17: a run that passed --romfs looked like it had linked the
     # maintainer tree instead, and had not - Path.resolve() dereferences a junction, and the folder passed in WAS a
     # junction to that one, so the install's link named the real target. Both names reach the same files.
     if explicit:
         return explicit if (explicit / "bf2.ard").is_file() else None
+    upgrade = find_ns2_upgrade_romfs(dump)
+    if upgrade is not None:
+        return upgrade
     for candidate in (dump, dump / "romfs", dump.parent, dump.parent / "romfs"):
         if (candidate / "bf2.ard").is_file():
             return candidate
     return None
 
 
-def link_dlc(install, r):
-    """Link the dump's add-on content in: without it the game loads no DLC at all.
+def discover_dlc_romfs(src_dir):
+    """Return sorted list of (lowercase_title_id, romfs_path) for valid DLCs in `src_dir`,
+    skipping the NS2 upgrade pack (0100e95004039062)."""
+    if not src_dir or not src_dir.is_dir():
+        return []
+    found = {}
+    try:
+        entries = list(src_dir.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if not _is_title_id(name) or name.lower() == NS2_UPGRADE_PACK_ID:
+            continue
+        romfs = find_addon_romfs(entry)
+        if romfs is not None:
+            found[name.lower()] = romfs
+    return sorted(found.items())
 
-    The launcher hands the folder over as XC2_AOC_DIR, because it is the side that scanned the dump; the game reads
-    <install>/game/dlc-301, so that path gets the junction. A dump without add-ons is not an error.
+
+def _is_reparse_point(path):
+    if path.is_symlink():
+        return True
+    is_junc = getattr(path, "is_junction", None)
+    if callable(is_junc):
+        try:
+            return is_junc()
+        except OSError:
+            return False
+    return False
+
+
+def link_dlc(install, r, dump_hint=None):
+    """Link each valid add-on's `romfs/` into `<install>/game/dlc-301/<id>/romfs` via per-DLC junctions.
+
+    This keeps the player's dump read-only with zero file copies while normalizing raw nested DLC dumps
+    (`<id>/0/.../romfs` or DLC folders placed directly in the dump root) into the flat `<id>/romfs`
+    layout that the runtime (`misc.cpp`) expects, and always skips `0100e95004039062`.
     """
-    src = os.environ.get("XC2_AOC_DIR", "")
-    if not src or not Path(src).is_dir():
+    candidates = []
+    env_src = os.environ.get("XC2_AOC_DIR", "")
+    if env_src:
+        candidates.append(Path(env_src))
+    if dump_hint is not None:
+        hint = Path(dump_hint)
+        candidates.extend([hint / "dlc", hint])
+        if hint.parent != hint:
+            candidates.extend([hint.parent / "dlc", hint.parent])
+    src = None
+    addons = []
+    for cand in candidates:
+        found = discover_dlc_romfs(cand)
+        if found:
+            src = cand
+            addons = found
+            break
+    if not addons:
         r.log("  dlc: none in the dump (the game runs without add-on content)")
         return
-    game = install / "game"
+    dlc_root = install / "game" / "dlc-301"
     if not r.dry:
-        game.mkdir(parents=True, exist_ok=True)
-    if junction(game / "dlc-301", Path(src), r) == 0:
-        r.log("  dlc: linked %s" % src)
+        if _is_reparse_point(dlc_root):
+            # Replace legacy whole-folder junction with a real directory holding per-DLC junctions.
+            os.rmdir(dlc_root)
+        dlc_root.mkdir(parents=True, exist_ok=True)
+    linked = 0
+    for tid, target_romfs in addons:
+        if junction(dlc_root / tid / "romfs", target_romfs, r) == 0:
+            linked += 1
+    r.log("  dlc: linked %d add-on(s) from %s -> %s" % (linked, src, dlc_root))
 
 
 def step_ingest(r, repo, install, nup, dump, exefs_in, romfs_in):
@@ -868,6 +1003,7 @@ def step_ingest(r, repo, install, nup, dump, exefs_in, romfs_in):
     exefs = install / "exefs"
     romfs = install / "romfs"
     if have_modules(exefs) and romfs.is_dir():
+        link_dlc(install, r, dump_hint=dump or exefs_in)
         return r.end_step("ingest", started, True, "the game files are already installed")
     py = os.environ.get("XC2_PYTHON") or sys.executable
     extract = repo / "tools" / "analysis" / "nup_extract.py"
@@ -887,7 +1023,7 @@ def step_ingest(r, repo, install, nup, dump, exefs_in, romfs_in):
             return r.end_step("ingest", started, False, "could not link exefs")
         if junction(romfs, rom, r) != 0:
             return r.end_step("ingest", started, False, "could not link romfs")
-        link_dlc(install, r)
+        link_dlc(install, r, dump_hint=exefs_in)
     elif dump:
         found = dump if (dump / "main").is_file() else dump / "exefs"
         if not have_modules(found):
@@ -899,7 +1035,7 @@ def step_ingest(r, repo, install, nup, dump, exefs_in, romfs_in):
             return r.end_step("ingest", started, False, romfs_missing(dump, romfs_in))
         if junction(romfs, rom, r) != 0:
             return r.end_step("ingest", started, False, "could not link romfs")
-        link_dlc(install, r)
+        link_dlc(install, r, dump_hint=dump)
     else:
         return r.end_step("ingest", started, False, "give --nup or --dump")
     return r.end_step("ingest", started, True)
@@ -1311,7 +1447,7 @@ def step_done_package(r, repo, install):
         game.mkdir(parents=True, exist_ok=True)
     junction(game / "romfs-301", install / "romfs", r)
     if (install / "nup_dump" / "dlc").is_dir():
-        junction(game / "dlc-301", install / "nup_dump" / "dlc", r)
+        link_dlc(install, r, dump_hint=install / "nup_dump")
     if not r.dry:
         (install / "setup_state.tsv").write_text("mprs_setup_state\t1\nmeta\tfinished\t1\n", encoding="utf-8")
     r.write_status(state="done", note="ready to play")
@@ -1381,7 +1517,7 @@ def write_ini(install, repo):
     if template is None:
         return None
     dlc = install / "dlc"
-    for cand in (install / "nup_dump" / "dlc", install / "game" / "dlc-301", install / "dlc"):
+    for cand in (install / "game" / "dlc-301", install / "nup_dump" / "dlc", install / "dlc"):
         if cand.is_dir():
             dlc = cand
             break

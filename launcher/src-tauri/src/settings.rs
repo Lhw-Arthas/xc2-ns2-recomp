@@ -119,12 +119,18 @@ pub fn apply(dir: &Path, edits: &[Edit]) -> Result<(), String> {
 /// The ini values setup owns: where the game code, the romfs, the dumped add-on content, the mods, the shader cache and the texture
 /// cache are. With no dlc/ in the dump, [aoc] dir is empty: no add-on content.
 fn owned(p: &Paths) -> Vec<(&'static str, &'static str, String)> {
+    let norm_dlc = p.game_dir.join("game").join("dlc-301");
+    let aoc_dir = if norm_dlc.is_dir() {
+        Some(norm_dlc)
+    } else {
+        p.dlc.clone()
+    };
     vec![
         ("fs", "exefs", crate::dump::game_path(&p.plain_exefs())),
         ("fs", "main", String::new()),
         ("fs", "romfs", crate::dump::game_path(&p.romfs)),
         ("fs", "mods", crate::dump::game_path(&p.mods())),
-        ("aoc", "dir", p.dlc.as_deref().map(crate::dump::game_path).unwrap_or_default()),
+        ("aoc", "dir", aoc_dir.as_deref().map(crate::dump::game_path).unwrap_or_default()),
         ("nvn", "shader_cache", crate::dump::game_path(&p.spirv())),
         ("nvn", "bc7_cache", crate::dump::game_path(&p.bc7())),
     ]
