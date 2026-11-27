@@ -4304,6 +4304,7 @@ dependencies = [
 name = "xc2-launcher"
 version = "0.2.7"
 dependencies = [
+ "flate2",
  "serde",
  "serde_json",
  "sha2",

@@ -89,6 +89,25 @@ pub struct ConflictGroup {
 }
 
 #[derive(Serialize, Clone)]
+pub struct ModCategory {
+    /// "bdat" | "ui" | "model" | "map" | "media" | "archive" | "code" | "cheats" | "other"
+    pub key: String,
+    pub count: usize,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct ModRuntimeStatus {
+    pub seen: bool,
+    pub files: usize,
+    pub replaced: usize,
+    pub added: usize,
+    pub ard_overrides: usize,
+    pub archive_recs: usize,
+    pub held_off: bool,
+    pub skipped: bool,
+}
+
+#[derive(Serialize, Clone)]
 pub struct ModItem {
     pub folder: String,
     pub enabled: bool,
@@ -96,6 +115,17 @@ pub struct ModItem {
     pub meta: Option<ModMeta>,
     pub meta_error: Option<String>,
     pub version_mismatch: bool,
+    pub empty: bool,
+    pub bdat_error: Option<String>,
+    pub unmatched_cheats: usize,
+    pub unmatched_paths_count: usize,
+    pub unmatched_paths_sample: Vec<String>,
+    /// Traffic-light health indicator: "green" | "yellow" | "red" | "off"
+    pub health: String,
+    /// Machine-readable reason key for UI tooltip/chip: "active" | "partial" | "pending_rebuild" | "not_verified" | "incompatible" | "empty" | "disabled"
+    pub health_reason: String,
+    pub runtime_status: ModRuntimeStatus,
+    pub categories: Vec<ModCategory>,
     pub caps: ModCaps,
     pub pending_rebuild: bool,
     pub options: Vec<ModOptionSpec>,
@@ -107,11 +137,36 @@ pub struct ModItem {
 #[derive(Serialize, Clone)]
 pub struct ModsSnapshot {
     pub mods_dir: String,
+    pub main_build_id: String,
+    pub has_exefs_patched: bool,
+    pub arh_loaded: bool,
     pub game_running: bool,
     pub needs_rebuild: bool,
     pub rebuild_modules: Vec<String>,
     pub mods: Vec<ModItem>,
     pub conflicts: Vec<ConflictGroup>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ImportModResult {
+    pub folder: String,
+    pub warnings: Vec<String>,
+    pub has_exefs: bool,
+    pub snapshot: ModsSnapshot,
+}
+
+#[derive(Serialize, Clone)]
+pub struct DeleteModResult {
+    pub deleted: String,
+    pub had_code_mods: bool,
+    pub snapshot: ModsSnapshot,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ModLogView {
+    pub file: String,
+    pub lines: Vec<String>,
+    pub total_matched: usize,
 }
 
 #[derive(Deserialize, Default)]
@@ -438,6 +493,10 @@ fn strip_pchtxt_comment(line: &str) -> &str {
         i += 1;
     }
     line
+}
+
+pub fn parse_pchtxt_header_pub(text: &str) -> (String, bool) {
+    parse_pchtxt_header(text)
 }
 
 fn parse_pchtxt_header(text: &str) -> (String, bool) {
@@ -878,7 +937,230 @@ fn read_applied_modules(game_dir: &Path) -> HashMap<String, String> {
     out
 }
 
-pub fn compute_snapshot(game_dir: &Path, exefs: &ExefsTargetInfo, game_running: bool) -> ModsSnapshot {
+fn count_unmatched_cheat_files(mod_dir: &Path, main_bid: Option<&str>) -> usize {
+    let Some(bid) = main_bid else { return 0 };
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut unmatched = 0usize;
+    for root in cheat_roots(mod_dir) {
+        let Ok(rd) = fs::read_dir(&root) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_file() || !p.extension().and_then(|s| s.to_str()).map_or(false, |x| x.eq_ignore_ascii_case("txt")) {
+                continue;
+            }
+            let canon = fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if !seen.insert(canon) {
+                continue;
+            }
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            if !cheat_bid_matches(stem, bid) {
+                unmatched += 1;
+            }
+        }
+    }
+    unmatched
+}
+
+fn check_layers_common_bdat(layers: &[PathBuf]) -> Option<String> {
+    fn find_bdat(dir: &Path) -> Option<PathBuf> {
+        let Ok(rd) = fs::read_dir(dir) else { return None };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Some(hit) = find_bdat(&p) {
+                    return Some(hit);
+                }
+            } else if p.is_file()
+                && e.file_name().to_string_lossy().eq_ignore_ascii_case("common.bdat")
+            {
+                return Some(p);
+            }
+        }
+        None
+    }
+    for layer in layers {
+        if let Some(bdat) = find_bdat(layer) {
+            match crate::arh::inspect_common_bdat(&bdat) {
+                crate::arh::BdatCheck::Ok { .. } => {}
+                crate::arh::BdatCheck::Mismatch { tables, .. } => {
+                    return Some(format!(
+                        "common.bdat has {tables} tables (NS2 3.0.1 requires {}; NS1 has 844)",
+                        crate::arh::NS2_COMMON_BDAT_TABLES
+                    ));
+                }
+                crate::arh::BdatCheck::Invalid(msg) => {
+                    return Some(msg);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn classify_mod_categories(
+    romfs_paths: &HashSet<String>,
+    has_archive: bool,
+    code_patches: usize,
+    cheats_total: usize,
+) -> Vec<ModCategory> {
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for lp in romfs_paths {
+        let p = lp.trim_start_matches('/');
+        let first = p.split('/').next().unwrap_or("");
+        let cat = if first == "bdat" || p.ends_with(".bdat") {
+            "bdat"
+        } else if matches!(first, "menu" | "ui") || p.ends_with(".wilay") {
+            "ui"
+        } else if matches!(first, "chr" | "model" | "effect" | "event") || p.ends_with(".wimdo") {
+            "model"
+        } else if matches!(first, "map" | "shader") {
+            "map"
+        } else if matches!(first, "sound" | "stream" | "movie")
+            || p.ends_with(".bnk")
+            || p.ends_with(".wem")
+            || p.ends_with(".mp4")
+            || p.ends_with(".webm")
+        {
+            "media"
+        } else if matches!(p, "bf2.arh" | "bf2.ard" | "append.bin") || first.ends_with(".ard") || first == "ard" {
+            "archive"
+        } else {
+            "other"
+        };
+        *counts.entry(cat).or_insert(0) += 1;
+    }
+    if has_archive && !counts.contains_key("archive") {
+        counts.insert("archive", 1);
+    }
+    if code_patches > 0 {
+        counts.insert("code", code_patches);
+    }
+    if cheats_total > 0 {
+        counts.insert("cheats", cheats_total);
+    }
+    let order = ["bdat", "ui", "model", "map", "media", "archive", "code", "cheats", "other"];
+    let mut out = Vec::new();
+    for k in order {
+        if let Some(&c) = counts.get(k) {
+            out.push(ModCategory { key: k.to_string(), count: c });
+        }
+    }
+    out
+}
+
+fn find_latest_log_path(game_dir: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let logs_dir = game_dir.join("work").join("logs");
+    if let Ok(rd) = fs::read_dir(&logs_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let fname = e.file_name().to_string_lossy().to_string();
+            if !(fname.starts_with("play-") && fname.ends_with(".log")) {
+                continue;
+            }
+            let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            candidates.push((mtime, p));
+        }
+    }
+    for name in ["nxrt.log", "fefw.log"] {
+        let p = game_dir.join(name);
+        if p.is_file() {
+            let mtime = fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            candidates.push((mtime, p));
+        }
+    }
+    candidates.sort_by_key(|(t, _)| *t);
+    candidates.pop().map(|(_, p)| p)
+}
+
+fn parse_first_usize(s: &str) -> Option<usize> {
+    s.trim().split_whitespace().next()?.parse::<usize>().ok()
+}
+
+/// Parses the latest launch log to extract per-mod runtime effectiveness (`mods:` / `cheats:` lines).
+fn parse_runtime_log_statuses(game_dir: &Path) -> (HashMap<String, ModRuntimeStatus>, usize) {
+    let mut map: HashMap<String, ModRuntimeStatus> = HashMap::new();
+    let mut active_cheats = 0usize;
+    let Some(log_path) = find_latest_log_path(game_dir) else {
+        return (map, 0);
+    };
+    let Ok(text) = fs::read_to_string(&log_path) else {
+        return (map, 0);
+    };
+    for line in text.lines() {
+        // e.g. "[...] cheats: loaded 3 active runtime cheat(s) from ..."
+        if let Some(idx) = line.find("loaded ") {
+            if line.contains("active runtime cheat(s)") {
+                if let Some(n) = parse_first_usize(&line[idx + 7..]) {
+                    active_cheats = active_cheats.max(n);
+                }
+            }
+        }
+        // Look for "mods: <mod_name>..."
+        let Some(pos) = line.find("mods: ") else { continue };
+        let body = &line[pos + 6..];
+        if let Some(rest) = body.strip_suffix(" held off until Set up rebuilds code patches") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                let st = map.entry(name.to_string()).or_default();
+                st.seen = true;
+                st.held_off = true;
+            }
+            continue;
+        }
+        if let Some(rest) = body.strip_suffix(" has no romfs folder: skipped") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                let st = map.entry(name.to_string()).or_default();
+                st.seen = true;
+                st.skipped = true;
+            }
+            continue;
+        }
+        if let Some((name_raw, detail)) = body.split_once(": ") {
+            let name = name_raw.trim();
+            if name.is_empty() || name.contains(' ') && !detail.contains("file(s)") && !detail.starts_with("loose romfs/") && !detail.contains("archive record(s)") {
+                // Skip generic lines like "mods: 1 enabled, 0 disabled..." or "mods: ard: ..."
+                if matches!(name, "ard" | "no folder at" | "bf2.arh") {
+                    continue;
+                }
+            }
+            if detail.starts_with("loose romfs/") && detail.contains("-> bf2.ard") {
+                let st = map.entry(name.to_string()).or_default();
+                st.seen = true;
+                st.ard_overrides += 1;
+            } else if detail.contains(" file(s), ") && detail.contains(" replaced, ") {
+                let st = map.entry(name.to_string()).or_default();
+                st.seen = true;
+                if let Some(f) = parse_first_usize(detail) {
+                    st.files = f;
+                }
+                if let Some(r_idx) = detail.find("file(s), ") {
+                    if let Some(r) = parse_first_usize(&detail[r_idx + 9..]) {
+                        st.replaced = r;
+                    }
+                }
+                if let Some(a_idx) = detail.find("replaced, ") {
+                    if let Some(a) = parse_first_usize(&detail[a_idx + 10..]) {
+                        st.added = a;
+                    }
+                }
+            } else if detail.contains(" archive record(s)") {
+                let st = map.entry(name.to_string()).or_default();
+                st.seen = true;
+                if let Some(n) = parse_first_usize(detail) {
+                    st.archive_recs += n;
+                }
+            }
+        }
+    }
+    (map, active_cheats)
+}
+
+pub fn compute_snapshot(game_dir: &Path, exefs: &ExefsTargetInfo, vanilla_romfs: Option<&Path>, game_running: bool) -> ModsSnapshot {
     let mods_dir = game_dir.join("mods");
     let present = discover_mod_folders(&mods_dir);
     let ini = fs::read_to_string(game_dir.join(GAME_INI)).map(|t| Ini::parse(&t)).unwrap_or_else(|_| Ini::empty());
@@ -888,6 +1170,8 @@ pub fn compute_snapshot(game_dir: &Path, exefs: &ExefsTargetInfo, game_running: 
 
     let saved_choices = read_choices_file(&mods_dir);
     let cheats_enabled = read_cheats_enabled_tsv(&mods_dir);
+    let arh_index = crate::arh::cached_arh_index(vanilla_romfs);
+    let (runtime_statuses, runtime_cheats_loaded) = parse_runtime_log_statuses(game_dir);
 
     let mut items = Vec::with_capacity(ordered.len());
     // Accumulate M3 patches per module in lowest -> highest priority order (so SHA-256 matches exefs_patch.py).
@@ -917,12 +1201,33 @@ pub fn compute_snapshot(game_dir: &Path, exefs: &ExefsTargetInfo, game_running: 
                 }
             }
         }
-        let has_romfs = !active_layers.is_empty();
+        let mut my_paths: HashSet<String> = HashSet::new();
+        for layer in &active_layers {
+            collect_tree_logical_paths(layer, &mut my_paths);
+        }
+        let has_romfs = !my_paths.is_empty();
         let has_archive = active_layers.iter().any(|p| has_archive_content(p));
+        let bdat_error = check_layers_common_bdat(&active_layers);
+
+        let mut unmatched_paths_count = 0usize;
+        let mut unmatched_paths_sample = Vec::new();
+        if let Some(ref idx) = arh_index {
+            let mut sorted_paths: Vec<&String> = my_paths.iter().collect();
+            sorted_paths.sort();
+            for lp in sorted_paths {
+                if !idx.is_known_romfs_path(lp, vanilla_romfs) {
+                    unmatched_paths_count += 1;
+                    if unmatched_paths_sample.len() < 10 {
+                        unmatched_paths_sample.push(lp.clone());
+                    }
+                }
+            }
+        }
 
         let exefs_patches = scan_mod_exefs_patches(folder, &mod_dir);
         let main_bid = exefs.build_ids.get("main").map(|s| s.as_str());
         let scanned_cheats = scan_mod_cheats(folder, &mod_dir, main_bid, exefs.main_text_end, cheats_enabled.get(folder));
+        let unmatched_cheats = count_unmatched_cheat_files(&mod_dir, main_bid);
 
         let mut matched_count = 0usize;
         let mut unmatched_count = 0usize;
@@ -946,12 +1251,15 @@ pub fn compute_snapshot(game_dir: &Path, exefs: &ExefsTargetInfo, game_running: 
 
         let cheats_mem = scanned_cheats.items.iter().filter(|c| c.kind == "memory").count();
         let cheats_code = scanned_cheats.items.iter().filter(|c| c.kind == "code").count();
+        let categories = classify_mod_categories(&my_paths, has_archive, matched_count, scanned_cheats.items.len());
+        let rt_status = runtime_statuses.get(folder).cloned().unwrap_or_default();
+        let empty = !has_romfs
+            && matched_count == 0
+            && unmatched_count == 0
+            && scanned_cheats.items.is_empty()
+            && unmatched_cheats == 0;
 
         if enabled {
-            let mut my_paths: HashSet<String> = HashSet::new();
-            for layer in &active_layers {
-                collect_tree_logical_paths(layer, &mut my_paths);
-            }
             for lp in my_paths {
                 path_owners.entry(lp).or_default().push(folder.clone());
             }
@@ -969,6 +1277,15 @@ pub fn compute_snapshot(game_dir: &Path, exefs: &ExefsTargetInfo, game_running: 
                 meta,
                 meta_error,
                 version_mismatch,
+                empty,
+                bdat_error,
+                unmatched_cheats,
+                unmatched_paths_count,
+                unmatched_paths_sample,
+                health: "off".into(),
+                health_reason: "disabled".into(),
+                runtime_status: rt_status,
+                categories,
                 caps: ModCaps {
                     romfs: has_romfs,
                     archive: has_archive,
@@ -1050,12 +1367,59 @@ pub fn compute_snapshot(game_dir: &Path, exefs: &ExefsTargetInfo, game_running: 
                 item.conflict_count = cs.len();
                 item.conflicts = cs;
             }
+            // Compute MO2-style traffic light (green / yellow / red / off)
+            let has_effective_payload = item.caps.romfs
+                || item.caps.archive
+                || item.caps.code_patches > 0
+                || !item.cheats.is_empty();
+            let has_enabled_mem_cheat = item.cheats.iter().any(|c| c.kind == "memory" && c.enabled);
+            let rt_applied = item.runtime_status.files > 0
+                || item.runtime_status.ard_overrides > 0
+                || item.runtime_status.archive_recs > 0
+                || (has_enabled_mem_cheat && runtime_cheats_loaded > 0)
+                || (item.caps.code_patches > 0 && !item.pending_rebuild);
+            let has_warnings = item.unmatched_paths_count > 0
+                || item.caps.unmatched_patches > 0
+                || item.unmatched_cheats > 0
+                || item.version_mismatch
+                || item.conflicts.iter().any(|c| c.role == "loses");
+
+            let (health, reason) = if !item.enabled {
+                ("off", "disabled")
+            } else if item.empty {
+                ("red", "empty")
+            } else if item.bdat_error.is_some() || !has_effective_payload {
+                ("red", "incompatible")
+            } else if item.pending_rebuild || item.runtime_status.held_off {
+                ("yellow", "pending_rebuild")
+            } else if rt_applied && !has_warnings {
+                ("green", "active")
+            } else if rt_applied && has_warnings {
+                ("yellow", "partial")
+            } else if item.runtime_status.skipped && !has_enabled_mem_cheat && item.caps.code_patches == 0 {
+                ("red", "incompatible")
+            } else {
+                ("yellow", "not_verified")
+            };
+            item.health = health.into();
+            item.health_reason = reason.into();
             item
         })
         .collect();
 
+    let main_build_id = exefs
+        .build_ids
+        .get("main")
+        .map(|b| b.chars().take(16).collect::<String>().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "8BEF68ED1EEBC24B".to_string());
+    let has_exefs_patched = game_dir.join("build").join("exefs-patched").join("m3_state.json").is_file();
+
     ModsSnapshot {
         mods_dir: crate::dump::fwd(&mods_dir),
+        main_build_id,
+        has_exefs_patched,
+        arh_loaded: arh_index.is_some(),
         game_running,
         needs_rebuild,
         rebuild_modules,
@@ -1064,7 +1428,13 @@ pub fn compute_snapshot(game_dir: &Path, exefs: &ExefsTargetInfo, game_running: 
     }
 }
 
-pub fn save_state(game_dir: &Path, exefs: &ExefsTargetInfo, input: SaveModsStateInput, game_running: bool) -> Result<ModsSnapshot, String> {
+pub fn save_state(
+    game_dir: &Path,
+    exefs: &ExefsTargetInfo,
+    vanilla_romfs: Option<&Path>,
+    input: SaveModsStateInput,
+    game_running: bool,
+) -> Result<ModsSnapshot, String> {
     let mods_dir = game_dir.join("mods");
     fs::create_dir_all(&mods_dir).map_err(|e| format!("cannot create {}: {e}", mods_dir.display()))?;
     let present = discover_mod_folders(&mods_dir);
@@ -1135,7 +1505,7 @@ pub fn save_state(game_dir: &Path, exefs: &ExefsTargetInfo, input: SaveModsState
     ini.set("mods", "disabled", &clean_disabled.join(","));
     write_atomic(&ini_path, &ini.to_text())?;
 
-    let snap = compute_snapshot(game_dir, exefs, game_running);
+    let snap = compute_snapshot(game_dir, exefs, vanilla_romfs, game_running);
     let pending_list: Vec<String> = snap.mods.iter().filter(|m| m.pending_rebuild).map(|m| m.folder.clone()).collect();
     ini.set("mods", "pending_rebuild", &pending_list.join(","));
     write_atomic(&ini_path, &ini.to_text())?;
@@ -1143,6 +1513,94 @@ pub fn save_state(game_dir: &Path, exefs: &ExefsTargetInfo, input: SaveModsState
     Ok(snap)
 }
 
+/// Cleanly deletes a mod folder and removes all stale references from `nxrt.ini`,
+/// `.mod_choices.json`, `.cheats_enabled.tsv`, and `.mod_layers.tsv`.
+pub fn delete_mod(
+    game_dir: &Path,
+    exefs: &ExefsTargetInfo,
+    vanilla_romfs: Option<&Path>,
+    folder: &str,
+    game_running: bool,
+) -> Result<DeleteModResult, String> {
+    if game_running {
+        return Err("Close the game before deleting a mod.".into());
+    }
+    let name = folder.trim();
+    if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\', ':']) || name == ".." {
+        return Err(format!("Invalid mod folder name: '{name}'"));
+    }
+    let mods_dir = game_dir.join("mods");
+    let target = mods_dir.join(name);
+    if !target.is_dir() {
+        return Err(format!("Mod folder '{name}' does not exist."));
+    }
+
+    let before = compute_snapshot(game_dir, exefs, vanilla_romfs, game_running);
+    let had_code_mods = before
+        .mods
+        .iter()
+        .find(|m| m.folder == name)
+        .map_or(false, |m| m.caps.code_patches > 0 || m.cheats.iter().any(|c| c.kind == "code" && c.enabled));
+
+    fs::remove_dir_all(&target).map_err(|e| format!("cannot delete {}: {e}", target.display()))?;
+
+    let ini = fs::read_to_string(game_dir.join(GAME_INI)).map(|t| Ini::parse(&t)).unwrap_or_else(|_| Ini::empty());
+    let order: Vec<String> = split_csv(&ini.get("mods", "order").unwrap_or_default())
+        .into_iter()
+        .filter(|x| x != name)
+        .collect();
+    let disabled: Vec<String> = split_csv(&ini.get("mods", "disabled").unwrap_or_default())
+        .into_iter()
+        .filter(|x| x != name)
+        .collect();
+    let mut choices = read_choices_file(&mods_dir);
+    choices.remove(name);
+    let cheats_enabled: HashMap<String, Vec<String>> = read_cheats_enabled_tsv(&mods_dir)
+        .into_iter()
+        .filter(|(k, _)| k != name)
+        .map(|(k, set)| {
+            let mut v: Vec<String> = set.into_iter().collect();
+            v.sort();
+            (k, v)
+        })
+        .collect();
+
+    let snapshot = save_state(
+        game_dir,
+        exefs,
+        vanilla_romfs,
+        SaveModsStateInput { order, disabled, choices, cheats_enabled },
+        game_running,
+    )?;
+
+    Ok(DeleteModResult { deleted: name.to_string(), had_code_mods, snapshot })
+}
+
+/// Reads the latest launch log (`work/logs/play-*.log`, `nxrt.log`, or `fefw.log`) and filters mod & cheat lines.
+pub fn read_last_mod_log(game_dir: &Path) -> Result<ModLogView, String> {
+    let log_path = find_latest_log_path(game_dir)
+        .ok_or_else(|| "No game launch log found yet. Start the game once first.".to_string())?;
+
+    let text = fs::read_to_string(&log_path).map_err(|e| format!("cannot read {}: {e}", log_path.display()))?;
+    let mut matched = Vec::new();
+    let mut total_matched = 0usize;
+    for line in text.lines() {
+        let low = line.to_ascii_lowercase();
+        if low.contains("[mods]") || low.contains("[cheats]") || low.contains("mods:") || low.contains("cheats:") {
+            total_matched += 1;
+            if matched.len() < 500 {
+                matched.push(line.to_string());
+            }
+        }
+    }
+    Ok(ModLogView {
+        file: crate::dump::fwd(&log_path),
+        lines: matched,
+        total_matched,
+    })
+}
+
+#[cfg(test)]
 pub fn install_folder(mods_dir: &Path, src: &Path) -> Result<String, String> {
     if !src.is_dir() {
         return Err(format!("Selected path is not a folder: {}", src.display()));
@@ -1163,6 +1621,7 @@ pub fn install_folder(mods_dir: &Path, src: &Path) -> Result<String, String> {
     Ok(name)
 }
 
+#[cfg(test)]
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
     for entry in fs::read_dir(src).map_err(|e| format!("cannot read {}: {e}", src.display()))? {
@@ -1267,6 +1726,7 @@ mod tests {
         let snap = save_state(
             &game,
             &target,
+            None,
             SaveModsStateInput {
                 order: vec!["AlphaMod".into(), "BetaMod".into()],
                 disabled: vec![],
@@ -1315,6 +1775,69 @@ mod tests {
         assert_eq!(name, "NewMod");
         assert!(mods.join("NewMod").join("romfs").join("a.bin").is_file());
         assert!(install_folder(&mods, &src).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_mod_cleans_state_and_read_last_mod_log_filters_lines() {
+        let root = temp_root("del-log");
+        let exefs = root.join("exefs");
+        let _ = write_minimal_main_nso(&exefs, 0xBB, 0x8000);
+        let target = exefs_target_info(Some(&exefs), None);
+        let game = root.join("game");
+        let mods = game.join("mods");
+        fs::create_dir_all(mods.join("ModOne").join("romfs")).unwrap();
+        fs::write(mods.join("ModOne").join("romfs").join("x.bin"), b"1").unwrap();
+        fs::create_dir_all(mods.join("ModTwo").join("romfs")).unwrap();
+        fs::write(mods.join("ModTwo").join("romfs").join("y.bin"), b"2").unwrap();
+
+        let _ = save_state(
+            &game,
+            &target,
+            None,
+            SaveModsStateInput {
+                order: vec!["ModOne".into(), "ModTwo".into()],
+                disabled: vec!["ModOne".into()],
+                choices: HashMap::new(),
+                cheats_enabled: HashMap::from([("ModOne".into(), vec!["Inf HP".into()])]),
+            },
+            false,
+        )
+        .unwrap();
+
+        // Deleting while game is running is blocked
+        assert!(delete_mod(&game, &target, None, "ModOne", true).is_err());
+
+        let res = delete_mod(&game, &target, None, "ModOne", false).unwrap();
+        assert_eq!(res.deleted, "ModOne");
+        assert!(!mods.join("ModOne").exists());
+        assert_eq!(res.snapshot.mods.len(), 1);
+        let ini = fs::read_to_string(game.join(GAME_INI)).unwrap();
+        assert!(!ini.contains("ModOne"));
+        let cheats_tsv = fs::read_to_string(mods.join(CHEATS_FILE)).unwrap();
+        assert!(!cheats_tsv.contains("ModOne"));
+
+        // Log filtering picks latest play-*.log and returns [mods] / [cheats] lines
+        let logs = game.join("work").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("play-100.log"),
+            "[info] boot ok\n[mods] mods: ModTwo: 1 file(s), 1 replaced, 0 added\n[cheats] loaded 2 active runtime cheat(s)\n[gfx] swapchain ready\n",
+        )
+        .unwrap();
+        let view = read_last_mod_log(&game).unwrap();
+        assert_eq!(view.total_matched, 2);
+        assert_eq!(view.lines.len(), 2);
+
+        // Snapshot picks up green traffic light from log & classifies categories
+        let snap_after = compute_snapshot(&game, &target, None, false);
+        let m2 = snap_after.mods.iter().find(|m| m.folder == "ModTwo").unwrap();
+        assert_eq!(m2.health, "green");
+        assert_eq!(m2.health_reason, "active");
+        assert_eq!(m2.runtime_status.files, 1);
+        assert_eq!(m2.runtime_status.replaced, 1);
+        assert!(!m2.categories.is_empty());
+
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -11,7 +11,7 @@
 [![Platform: Windows 11 x64](https://img.shields.io/badge/Platform-Windows%2011%20x64-0078D6?style=flat-square)](#build-from-source)
 [![Graphics: Vulkan 1.3](https://img.shields.io/badge/Graphics-Vulkan%201.3-AC162C?style=flat-square)](docs/COMPATIBILITY.md)
 
-**English** · [中文](#中文) · [Releases](https://github.com/weile10000/xc2-ns2-recomp/releases) · [Changelog](CHANGELOG.md) · [Compatibility](docs/COMPATIBILITY.md) · [Issues](https://github.com/weile10000/xc2-ns2-recomp/issues)
+**English** · [中文](#中文) · [Releases](https://github.com/weile10000/xc2-ns2-recomp/releases) · [Changelog](CHANGELOG.md) · [Compatibility](docs/COMPATIBILITY.md) · [Mods](docs/MODS.md) · [Issues](https://github.com/weile10000/xc2-ns2-recomp/issues)
 
 </div>
 
@@ -159,7 +159,7 @@ Requirements: **Native Windows 11 x64** *(primary target covered by release test
 [![运行平台: Windows x64](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6?style=flat-square)](#从源码构建)
 [![图形接口: Vulkan 1.3](https://img.shields.io/badge/Graphics-Vulkan%201.3-AC162C?style=flat-square)](docs/COMPATIBILITY.md)
 
-[English](#english) · **中文** · [发布页面 (Releases)](https://github.com/weile10000/xc2-ns2-recomp/releases) · [更新日志](CHANGELOG.md) · [兼容性说明](docs/COMPATIBILITY.md) · [问题反馈 (Issues)](https://github.com/weile10000/xc2-ns2-recomp/issues)
+[English](#english) · **中文** · [发布页面 (Releases)](https://github.com/weile10000/xc2-ns2-recomp/releases) · [更新日志](CHANGELOG.md) · [兼容性说明](docs/COMPATIBILITY.md) · [模组指南](docs/MODS.md#中文) · [问题反馈 (Issues)](https://github.com/weile10000/xc2-ns2-recomp/issues)
 
 </div>
 

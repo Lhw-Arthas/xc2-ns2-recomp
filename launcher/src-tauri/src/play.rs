@@ -285,7 +285,7 @@ fn package_command(dir: &Path, exe: &Path) -> Command {
     c
 }
 
-pub fn start(app: &AppHandle, p: &crate::setup::Paths, launcher_dir: &Path, minimize: bool, runner_setting: &str) -> Result<(), String> {
+pub fn start(app: &AppHandle, p: &crate::setup::Paths, launcher_dir: &Path, minimize: bool, runner_setting: &str, safe_mode: bool) -> Result<(), String> {
     if app.state::<PlayState>().0.lock().unwrap().state == "running" {
         return Err("The game is already running.".into());
     }
@@ -322,6 +322,10 @@ pub fn start(app: &AppHandle, p: &crate::setup::Paths, launcher_dir: &Path, mini
             None => package_command(&dir, &exe),
         };
         crate::setup::host_env(&mut cmd);
+        if safe_mode {
+            // Non-existent path overrides [fs] mods so both fs_romfs.cpp and cheats.cpp skip all mods/cheats without modifying nxrt.ini.
+            cmd.env("NXRT_FS_MODS", "__safe_mode_no_mods__");
+        }
         cmd.envs(assign.iter().filter_map(|w| w.split_once('=')));
         // Steam's Proton (and umu-run) run in a container that does not see a dump outside the home folder, /mnt and /media (#142)
         if !cfg!(windows) && std::env::var_os("STEAM_COMPAT_MOUNTS").is_none() && !assign.iter().any(|w| w.starts_with("STEAM_COMPAT_MOUNTS=")) {
@@ -547,7 +551,19 @@ fn fatal_message(text: &str) -> String {
 pub fn open_with_shell(path: &Path) -> Result<(), String> {
     let mut c = Command::new(if cfg!(windows) { "explorer.exe" } else { "xdg-open" });
     crate::setup::host_env(&mut c);
-    c.arg(path).spawn().map(|_| ()).map_err(|e| format!("Could not open {}: {}", path.display(), e))
+    #[cfg(windows)]
+    {
+        // explorer.exe rejects forward slashes (from dump::fwd / launcher.json) and \\?\ prefixes,
+        // silently falling back to opening Documents. Always pass a clean backslash Windows path.
+        let clean = path.to_string_lossy().replace('/', "\\");
+        let clean = clean.strip_prefix(r"\\?\").unwrap_or(&clean);
+        c.arg(clean);
+    }
+    #[cfg(not(windows))]
+    {
+        c.arg(path);
+    }
+    c.spawn().map(|_| ()).map_err(|e| format!("Could not open {}: {}", path.display(), e))
 }
 
 #[cfg(test)]

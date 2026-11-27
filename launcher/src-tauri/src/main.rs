@@ -3,11 +3,13 @@
 //! repository's own lift and build scripts on this PC, writes fefw.ini in a run folder and starts the game. It ships no game files.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod arh;
 mod cpu;
 mod dump;
 mod fsr;
 mod ini;
 mod locale;
+mod mod_import;
 mod mods;
 mod nup;
 mod play;
@@ -487,7 +489,7 @@ fn cancel_setup(state: State<Arc<setup::Shared>>) {
 }
 
 #[tauri::command]
-fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> {
+fn play(app: AppHandle, state: State<Arc<setup::Shared>>, safe_mode: Option<bool>) -> Result<(), String> {
     if state.progress.lock().unwrap().state == "running" {
         return Err("Setup is running. Wait for it or pause it first.".into());
     }
@@ -497,7 +499,7 @@ fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> 
         return Err("Setup is not finished: open Setup and press Set up.".into());
     }
     settings::ensure_play_paths(&p.game_dir, &p)?;
-    play::start(&app, &p, &exe_dir(), cfg.minimize_on_play, &cfg.runner)
+    play::start(&app, &p, &exe_dir(), cfg.minimize_on_play, &cfg.runner, safe_mode.unwrap_or(false))
 }
 
 /// Linux: whether Steam is installed and the shortcut to fefw.exe exists.
@@ -583,27 +585,33 @@ fn open_mods_dir(app: AppHandle) -> Result<(), String> {
     play::open_with_shell(&dir)
 }
 
-fn mods_context(app: &AppHandle, state: &State<play::PlayState>) -> Result<(PathBuf, mods::ExefsTargetInfo, bool), String> {
+fn mods_context(app: &AppHandle, state: &State<play::PlayState>) -> Result<(PathBuf, mods::ExefsTargetInfo, Option<PathBuf>, bool), String> {
     let cfg = load_config(app);
     let repo = need_repo(&cfg)?;
     let game_dir = game_dir_of(&cfg, &repo);
     let plain = if package_tools().is_some() { game_dir.join("exefs") } else { repo.join("game").join("dump").join("exefs") };
     let exefs_dir = if plain.join("main").is_file() { Some(plain) } else { paths(&cfg).ok().map(|p| p.exefs) };
     let target = mods::exefs_target_info(exefs_dir.as_deref(), Some(&repo));
+    let romfs_cand = game_dir.join("game").join("romfs-301");
+    let vanilla_romfs = if romfs_cand.is_dir() {
+        Some(romfs_cand)
+    } else {
+        paths(&cfg).ok().map(|p| p.romfs).filter(|p| p.is_dir())
+    };
     let running = state.0.lock().map(|s| s.state == "running").unwrap_or(false);
-    Ok((game_dir, target, running))
+    Ok((game_dir, target, vanilla_romfs, running))
 }
 
 #[tauri::command]
 fn list_mods(app: AppHandle, state: State<play::PlayState>) -> Result<mods::ModsSnapshot, String> {
-    let (game_dir, target, running) = mods_context(&app, &state)?;
-    Ok(mods::compute_snapshot(&game_dir, &target, running))
+    let (game_dir, target, vanilla_romfs, running) = mods_context(&app, &state)?;
+    Ok(mods::compute_snapshot(&game_dir, &target, vanilla_romfs.as_deref(), running))
 }
 
 #[tauri::command]
 fn save_mods_state(app: AppHandle, state: State<play::PlayState>, input: mods::SaveModsStateInput) -> Result<mods::ModsSnapshot, String> {
-    let (game_dir, target, running) = mods_context(&app, &state)?;
-    mods::save_state(&game_dir, &target, input, running)
+    let (game_dir, target, vanilla_romfs, running) = mods_context(&app, &state)?;
+    mods::save_state(&game_dir, &target, vanilla_romfs.as_deref(), input, running)
 }
 
 #[tauri::command]
@@ -620,10 +628,53 @@ fn open_mod_folder(app: AppHandle, name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn pick_mod_file(app: AppHandle, title: String) -> Option<String> {
+    app.dialog()
+        .file()
+        .set_title(title)
+        .add_filter("XC2 Mods & Cheats", &["zip", "7z", "txt", "json", "ips", "pchtxt", "bdat", "wismt"])
+        .blocking_pick_file()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| dump::fwd(&p))
+}
+
+#[tauri::command]
+fn import_mod(app: AppHandle, state: State<play::PlayState>, source_path: String) -> Result<mods::ImportModResult, String> {
+    let (game_dir, target, vanilla_romfs, running) = mods_context(&app, &state)?;
+    let arh = arh::cached_arh_index(vanilla_romfs.as_deref());
+    let summary = mod_import::import_mod_source(
+        &game_dir.join("mods"),
+        Path::new(source_path.trim()),
+        &target,
+        vanilla_romfs.as_deref(),
+        arh.as_deref(),
+    )?;
+    let snapshot = mods::compute_snapshot(&game_dir, &target, vanilla_romfs.as_deref(), running);
+    Ok(mods::ImportModResult {
+        folder: summary.folder,
+        warnings: summary.warnings,
+        has_exefs: summary.has_exefs,
+        snapshot,
+    })
+}
+
+#[tauri::command]
 fn install_mod_folder(app: AppHandle, state: State<play::PlayState>, source_path: String) -> Result<mods::ModsSnapshot, String> {
-    let (game_dir, target, running) = mods_context(&app, &state)?;
-    mods::install_folder(&game_dir.join("mods"), Path::new(source_path.trim()))?;
-    Ok(mods::compute_snapshot(&game_dir, &target, running))
+    let res = import_mod(app, state, source_path)?;
+    Ok(res.snapshot)
+}
+
+#[tauri::command]
+fn delete_mod(app: AppHandle, state: State<play::PlayState>, name: String) -> Result<mods::DeleteModResult, String> {
+    let (game_dir, target, vanilla_romfs, running) = mods_context(&app, &state)?;
+    mods::delete_mod(&game_dir, &target, vanilla_romfs.as_deref(), &name, running)
+}
+
+#[tauri::command]
+fn read_mod_log(app: AppHandle) -> Result<mods::ModLogView, String> {
+    let cfg = load_config(&app);
+    let game_dir = game_dir_of(&cfg, &need_repo(&cfg)?);
+    mods::read_last_mod_log(&game_dir)
 }
 
 #[tauri::command]
@@ -920,7 +971,11 @@ fn main() {
             list_mods,
             save_mods_state,
             open_mod_folder,
+            pick_mod_file,
+            import_mod,
             install_mod_folder,
+            delete_mod,
+            read_mod_log,
             open_setup_log,
             start_report,
             open_reports_dir,
