@@ -21,4 +21,7 @@ bool enabled();
 // Per-frame HUD draw callback registered with nxrt::play::set_hud_callback().
 void draw(const nxrt::gfx::HudCanvas& c);
 
+// Searchable Landmark / NPC destination picker callbacks registered with nxrt::play::set_picker() (F4 hotkey).
+nxrt::gfx::PickerCallbacks make_picker_callbacks();
+
 }  // namespace xc2::nav

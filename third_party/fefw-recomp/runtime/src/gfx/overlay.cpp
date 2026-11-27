@@ -279,6 +279,17 @@ struct Overlay::Impl {
     std::mutex hud_mu;
     std::function<void(const HudCanvas&)> hud_cb;
     std::atomic<bool> has_hud_cb{false};
+    std::mutex picker_mu;
+    PickerCallbacks picker_cb;
+    std::atomic<bool> picker_open{false};
+    std::atomic<bool> want_picker_close{false};
+    bool picker_restore_relative = false;
+    char picker_filter[128] = {};
+    int picker_tab = 0;  // 0=All, 1=Landmarks, 2=NPCs
+    std::vector<PickerItem> picker_items;
+    bool picker_has_pin = false;
+    std::string picker_pin_name;
+    double picker_last_refresh_s = -1e9;
     std::atomic<bool> want_hide{false};   // request_hide: applied at the start of the next draw (the menu runs with mu held)
 
     // The pad for the menu (set_menu_pad, on the thread that polls the pads)
@@ -1042,7 +1053,7 @@ void Overlay::Impl::draw_keyboard(double now_s) {
 }
 
 bool Overlay::keyboard_open() const { return impl_->kb_poll(); }
-bool Overlay::blocks_game() const { return impl_->visible || impl_->kb_poll(); }
+bool Overlay::blocks_game() const { return impl_->visible || impl_->picker_open.load(std::memory_order_relaxed) || impl_->kb_poll(); }
 void Overlay::set_keyboard_abxy(bool by_label) { impl_->kb_by_label.store(by_label, std::memory_order_relaxed); }
 
 uint64_t Overlay::set_keyboard_pad(uint64_t buttons, int lx, int ly) {
@@ -1137,7 +1148,12 @@ bool Overlay::handle_event(const input::Event& e) {
     }
     const bool kb = s.kb_poll();
     if (kb && (e.type == EventType::KeyDown || e.type == EventType::KeyUp || e.type == EventType::Text)) return s.kb_key_event(e);
-    if (!s.visible && !kb) return false;
+    const bool p_open = s.picker_open.load(std::memory_order_relaxed);
+    if (p_open && e.type == EventType::KeyDown && e.u.key.scancode == SDL_SCANCODE_ESCAPE) {
+        toggle_picker();
+        return true;
+    }
+    if (!s.visible && !p_open && !kb) return false;
     std::lock_guard<std::mutex> lk(s.mu);
     ImGuiContext* prev = ImGui::GetCurrentContext();
     ImGui::SetCurrentContext(s.imgui);
@@ -1179,6 +1195,7 @@ bool Overlay::handle_event(const input::Event& e) {
     ImGui::SetCurrentContext(prev);
     // the on-screen keyboard takes the whole mouse while it is up
     if (kb) consumed = e.type == EventType::MouseMotion || e.type == EventType::MouseButtonDown || e.type == EventType::MouseButtonUp || e.type == EventType::MouseWheel;
+    if (p_open) consumed = true;
     return consumed;
 }
 
@@ -1778,6 +1795,8 @@ void Overlay::Impl::draw_note(const FrameInfo& f) {
 void Overlay::draw(const FrameInfo& f) {
     Impl& s = *impl_;
     if (s.want_hide.exchange(false)) set_visible(false);   // the menu asked to close during the last frame (mu is not held here)
+    if (s.want_picker_close.exchange(false) && s.picker_open.load(std::memory_order_relaxed)) toggle_picker();
+    const bool p_open = s.picker_open.load(std::memory_order_relaxed);
     const bool counter_on = s.counter_show.load(std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
     const double now_s = std::chrono::duration<double>(now.time_since_epoch()).count();
@@ -1785,7 +1804,7 @@ void Overlay::draw(const FrameInfo& f) {
     const bool ptr_on = s.ptr_show.load(std::memory_order_relaxed) && (s.ptr_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
     const bool kb_on = s.kb_poll();
     const bool hud_on = s.has_hud_cb.load(std::memory_order_relaxed);
-    if (!s.visible && !counter_on && !note_on && !ptr_on && !kb_on && !hud_on) {
+    if (!s.visible && !p_open && !counter_on && !note_on && !ptr_on && !kb_on && !hud_on) {
         s.last_frame = now;
         s.counter_was_on = false;
         return;
@@ -1813,7 +1832,7 @@ void Overlay::draw(const FrameInfo& f) {
     }
     // a screenshot leaves the counter out unless asked for; with the menu hidden there is then nothing to draw
     const bool show_counter = counter_on && (s.counter_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
-    if (!s.visible && !show_counter && !note_on && !ptr_on && !kb_on && !hud_on) {
+    if (!s.visible && !p_open && !show_counter && !note_on && !ptr_on && !kb_on && !hud_on) {
         s.last_frame = now;
         return;
     }
@@ -1833,6 +1852,81 @@ void Overlay::draw(const FrameInfo& f) {
     ImGui::NewFrame();
     if (s.visible && !kb_on) s.build_ui();    // the keyboard is modal: the menu comes back once it is answered
     if (kb_on) s.draw_keyboard(now_s);
+    if (p_open && !kb_on) {
+        PickerCallbacks pcb;
+        { std::lock_guard<std::mutex> plk(s.picker_mu); pcb = s.picker_cb; }
+        if (pcb.query && (now_s - s.picker_last_refresh_s > 0.35 || s.picker_items.empty())) {
+            s.picker_items.clear();
+            pcb.query(s.picker_items, s.picker_has_pin, s.picker_pin_name);
+            s.picker_last_refresh_s = now_s;
+        }
+        const float W = static_cast<float>(f.extent.width);
+        const float H = static_cast<float>(f.extent.height);
+        const float win_w = std::clamp(W * 0.38f, 440.f, 720.f);
+        const float win_h = std::clamp(H * 0.62f, 420.f, 760.f);
+        ImGui::SetNextWindowPos(ImVec2((W - win_w) * 0.5f, (H - win_h) * 0.5f), ImGuiCond_Appearing);
+        ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_Appearing);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.08f, 0.13f, 0.92f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.28f, 0.76f, 0.96f, 0.72f));
+        bool open_flag = true;
+        if (ImGui::Begin("3D 导航目标选择 (F4 / Esc 关闭)", &open_flag, ImGuiWindowFlags_NoCollapse)) {
+            if (s.picker_has_pin) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.68f, 1.0f, 1.0f));
+                ImGui::Text("当前自定义导航：%s", s.picker_pin_name.c_str());
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+                if (ImGui::SmallButton("恢复自动追踪任务")) {
+                    if (pcb.clear) pcb.clear();
+                    s.picker_has_pin = false;
+                    s.picker_pin_name.clear();
+                    s.want_picker_close.store(true);
+                }
+                ImGui::Separator();
+            }
+            ImGui::SetNextItemWidth(-1.f);
+            ImGui::InputTextWithHint("##nav_filter", "输入关键词搜索地标 / 传送点 / NPC...", s.picker_filter, sizeof s.picker_filter);
+            if (ImGui::RadioButton("全部", s.picker_tab == 0)) s.picker_tab = 0;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("地标 / 传送点", s.picker_tab == 1)) s.picker_tab = 1;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("NPC", s.picker_tab == 2)) s.picker_tab = 2;
+            ImGui::Separator();
+
+            std::string flt = s.picker_filter;
+            for (char& ch : flt) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (ImGui::BeginChild("##nav_list", ImVec2(0, 0), false)) {
+                int shown = 0;
+                for (const auto& it : s.picker_items) {
+                    if (s.picker_tab == 1 && it.group != 0) continue;
+                    if (s.picker_tab == 2 && it.group != 1) continue;
+                    if (!flt.empty()) {
+                        std::string nl = it.name;
+                        for (char& ch : nl) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        if (nl.find(flt) == std::string::npos) continue;
+                    }
+                    ++shown;
+                    ImGui::PushID(static_cast<int>(it.id & 0x7FFFFFFFu));
+                    const char* badge = (it.group == 0) ? "[地标] " : "[NPC]  ";
+                    const std::string row_label = std::string(badge) + it.name;
+                    if (ImGui::Selectable(row_label.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        if (pcb.select) pcb.select(it.id);
+                        s.want_picker_close.store(true);
+                    }
+                    if (!it.detail.empty()) {
+                        const float dw = ImGui::CalcTextSize(it.detail.c_str()).x;
+                        ImGui::SameLine(std::max(10.f, ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - dw - 8.f));
+                        ImGui::TextDisabled("%s", it.detail.c_str());
+                    }
+                    ImGui::PopID();
+                }
+                if (shown == 0) ImGui::TextDisabled("当前地图没有匹配的地标或 NPC");
+            }
+            ImGui::EndChild();
+        }
+        ImGui::End();
+        ImGui::PopStyleColor(2);
+        if (!open_flag) s.want_picker_close.store(true);
+    }
     s.ribbon_sink.active = false;
     s.ribbon_sink.verts.clear();
     if (hud_on && !kb_on) {
@@ -1912,6 +2006,36 @@ void Overlay::set_hud_callback(std::function<void(const HudCanvas&)> fn) {
     std::lock_guard<std::mutex> lk(impl_->hud_mu);
     impl_->hud_cb = std::move(fn);
     impl_->has_hud_cb.store(static_cast<bool>(impl_->hud_cb), std::memory_order_relaxed);
+}
+
+void Overlay::set_picker(PickerCallbacks cb) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->picker_mu);
+    impl_->picker_cb = std::move(cb);
+}
+
+void Overlay::toggle_picker() {
+    if (!impl_) return;
+    Impl& s = *impl_;
+    const bool now_open = !s.picker_open.load(std::memory_order_relaxed);
+    s.picker_open.store(now_open, std::memory_order_relaxed);
+    if (now_open) {
+        s.picker_last_refresh_s = -1e9;
+        s.picker_restore_relative = platform::has_window() && platform::relative_mouse();
+        if (s.picker_restore_relative) platform::set_relative_mouse(false);
+        if (platform::has_window()) platform::set_text_input(true);
+    } else {
+        if (platform::has_window()) platform::set_text_input(false);
+        if (s.picker_restore_relative && platform::has_window()) platform::set_relative_mouse(true);
+        s.picker_restore_relative = false;
+        std::lock_guard<std::mutex> lk(s.mu);
+        clear_imgui_input(s.imgui);
+    }
+    NXLOG_I(kTag, "nav picker %s", now_open ? "shown" : "hidden");
+}
+
+bool Overlay::picker_open() const {
+    return impl_ && impl_->picker_open.load(std::memory_order_relaxed);
 }
 
 }  // namespace nxrt::gfx

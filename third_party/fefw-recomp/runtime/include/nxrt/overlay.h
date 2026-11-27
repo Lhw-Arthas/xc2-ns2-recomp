@@ -60,6 +60,21 @@ struct HudCanvas {
     void set_ribbon_3d(const Ribbon3DVertex* verts, uint32_t count, const Ribbon3DParams& params) const;
 };
 
+// Lightweight game-agnostic searchable destination picker window (toggled by caller, e.g. F4).
+struct PickerItem {
+    uint64_t id = 0;
+    uint8_t group = 0;     // 0 = Landmark / Skip-Travel, 1 = NPC
+    float dist = 0.f;
+    std::string name;
+    std::string detail;
+};
+
+struct PickerCallbacks {
+    std::function<void(std::vector<PickerItem>& out_items, bool& out_has_pin, std::string& out_pin_name)> query;
+    std::function<void(uint64_t id)> select;
+    std::function<void()> clear;
+};
+
 class Overlay {
 public:
     struct Context {
@@ -135,6 +150,11 @@ public:
     // Optional per-frame foreground HUD callback (runs on the presenting thread inside the ImGui frame, even when the F1 menu is hidden).
     // Pass an empty std::function to clear. Thread-safe.
     void set_hud_callback(std::function<void(const HudCanvas&)> fn);
+
+    // Optional searchable destination picker window (toggled independently of F1, e.g. F4).
+    void set_picker(PickerCallbacks cb);
+    void toggle_picker();
+    bool picker_open() const;
 
     // The Renderer overlay hook: builds and draws the menu on top of the frame (no-op while hidden, unless the counter is on).
     void draw(const FrameInfo& f);

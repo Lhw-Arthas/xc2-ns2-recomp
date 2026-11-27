@@ -524,6 +524,10 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
         const bool f3 = down(VK_F3) || tapped(VK_F3);
         if (f3 && !f3_was_down) xc2::nav::toggle();
         f3_was_down = f3;
+        static bool f4_was_down = false;
+        const bool f4 = down(VK_F4) || tapped(VK_F4);
+        if (f4 && !f4_was_down) nxrt::play::toggle_picker();
+        f4_was_down = f4;
         if (shot_raw) {
             if (f12_left > 0 && shot_raw_have) {
                 write_raw_frame();     // the buffer filled at the end of the previous frame
@@ -2833,6 +2837,7 @@ int main(int argc, char **argv) {
         if (!headless) {
             xc2::nav::init(kMainBase);
             nxrt::play::set_hud_callback(&xc2::nav::draw);
+            nxrt::play::set_picker(xc2::nav::make_picker_callbacks());
         }
     }
     // Input: the hid service reads this source every 5 ms. It is live (keyboard + first gamepad, see LiveInput above)

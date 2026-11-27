@@ -54,6 +54,8 @@ struct StartOptions {
 bool start(const StartOptions& opt);        // after nxrt::init, the renderer and the NVN back end; installs the hid input source and the hooks
 void stop();                                // saves changed settings, removes the hooks and the input source
 void set_hud_callback(std::function<void(const gfx::HudCanvas&)> fn);   // optional foreground HUD drawn over the game frame
+void set_picker(gfx::PickerCallbacks cb);                                // optional searchable destination picker window (e.g. F4)
+void toggle_picker();                                                    // toggle destination picker window
 bool overlay_blocks_game();                 // true while the F1 overlay (or on-screen keyboard) wants keyboard/mouse/pad input
 
 // The binding engine's contribution at `now_ns`: Switch buttons plus stick deflection in -1..1. Play mode installs its

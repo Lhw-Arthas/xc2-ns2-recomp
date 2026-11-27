@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "nxrt/config.h"
@@ -36,7 +38,10 @@ constexpr uint64_t kDataBdatSingleton     = 0x0f2d290; // ptr -> +0x10 + idx*8 d
 constexpr uint32_t kBdatIdxFldMapList     = 93u;       // [93]  (0x05d) FLD_maplist ("resource" -> "ma05a", etc.)
 constexpr uint32_t kBdatIdxFldLandmarkMsg = 443u;      // [443] (0x1bb) fld_landmark (active language landmark names)
 constexpr uint32_t kBdatIdxFldMapInfoMsg  = 444u;      // [444] (0x1bc) fld_mapinfo  (active language map/Titan names)
+constexpr uint32_t kBdatIdxFldNpcNameMsg  = 445u;      // [445] (0x1bd) fld_npcname  (active language NPC names)
 constexpr uint32_t kFourCcLdmk            = 0x4b4d444cu; // 'LDMK' (TGmkList<GmkLandmark>)
+constexpr uint32_t kFourCcNpc             = 0x0043504eu; // 'NPC\0' (TGmkList<GmkNpc>, stride 0x70)
+constexpr uint32_t kFourCcRnpc            = 0x43504e52u; // 'RNPC'  (TGmkList<GmkRoutedNpc>, stride 0xA0)
 
 // 3.0.1 AFieldLocator subclass vtables (relative to main_base).
 constexpr uint64_t kVtBatEnemyId         = 0xe28dd8;   // FixedVector<Vec3> arr=+0x830, cnt=+0x930
@@ -83,6 +88,28 @@ std::atomic<int> g_mode{2};   // 2 = Beacons + 3D Ground Ribbon, 1 = Beacons Onl
 std::atomic<bool> g_debug{false};
 std::atomic<int64_t> g_toast_until_ms{0};
 std::atomic<int64_t> g_reveal_start_ms{0};
+
+struct CustomPinState {
+    std::mutex mu;
+    bool active = false;
+    uint32_t map_id = 0;
+    Vec3 pos{};
+    std::string name;
+    uint8_t group = 0;
+    // Cached entries from latest picker query (indexed by PickerItem::id)
+    struct Entry {
+        Vec3 pos;
+        std::string name;
+        uint8_t group = 0;
+        uint32_t map_id = 0;
+    };
+    std::vector<Entry> entries;
+};
+
+CustomPinState& custom_pin() {
+    static CustomPinState s;
+    return s;
+}
 
 int64_t now_ms() {
     using namespace std::chrono;
@@ -625,6 +652,103 @@ void collect_landmarks(uint64_t mb, std::vector<LandmarkInfo>& out) {
     }
 }
 
+struct NpcInfo {
+    Vec3 pos;
+    std::string name;
+};
+
+void collect_npcs(uint64_t mb, std::vector<NpcInfo>& out) {
+    uint64_t gmk_mgr = 0;
+    if (!safe_read(mb + off301::kGmkManagerSingleton, gmk_mgr) || !gmk_mgr) return;
+
+    uint64_t bdat_mgr = 0, npc_msg_tbl = 0;
+    if (!safe_read(mb + off301::kDataBdatSingleton, bdat_mgr) || !bdat_mgr) return;
+    safe_read(bdat_mgr + 0x10ull + static_cast<uint64_t>(off301::kBdatIdxFldNpcNameMsg) * 8ull, npc_msg_tbl);
+    if (!npc_msg_tbl) return;
+
+    static uint64_t s_npc_list_tbl = 0;
+    static bool s_npc_list_probed = false;
+    if (!s_npc_list_probed) {
+        s_npc_list_probed = true;
+        s_npc_list_tbl = bdat_find_table_by_name(mb, "FLD_NpcList");
+    }
+
+    uint64_t sets_ptr = 0, sets_cnt = 0;
+    if (!safe_read(gmk_mgr + 0xF358ull, sets_ptr) || !safe_read(gmk_mgr + 0xF360ull, sets_cnt)) return;
+    if (!sets_ptr || sets_cnt == 0 || sets_cnt > 16ull) return;
+
+    auto resolve_npc_name = [&](uint64_t pop_tbl, uint32_t bdat_id, char* buf, size_t n) -> bool {
+        buf[0] = '\0';
+        if (!pop_tbl || bdat_id == 0) return false;
+        // 1. Direct Name/MSGID on pop table, or NpcID -> FLD_NpcList.Name -> fld_npcname[445]
+        uint32_t npc_id = 0;
+        const char* id_cols[] = {"NpcID", "NPCID", "npc_id", "NpcId", "ID"};
+        for (const char* col : id_cols) {
+            if (bdat_read_uint(pop_tbl, bdat_id, col, npc_id) && npc_id > 0) break;
+        }
+        if (npc_id > 0 && s_npc_list_tbl) {
+            uint32_t msg_id = 0;
+            const char* nm_cols[] = {"Name", "name", "MSGID", "NameID"};
+            for (const char* col : nm_cols) {
+                if (bdat_read_uint(s_npc_list_tbl, npc_id, col, msg_id) && msg_id > 0) {
+                    if (bdat_read_string(npc_msg_tbl, msg_id, "name", buf, n)) return true;
+                }
+            }
+        }
+        // Fallback: try direct MSGID/Name on pop table
+        uint32_t direct_msg = 0;
+        if ((bdat_read_uint(pop_tbl, bdat_id, "MSGID", direct_msg) ||
+             bdat_read_uint(pop_tbl, bdat_id, "Name", direct_msg)) && direct_msg > 0) {
+            if (bdat_read_string(npc_msg_tbl, direct_msg, "name", buf, n)) return true;
+        }
+        return false;
+    };
+
+    for (uint64_t si = 0; si < sets_cnt; ++si) {
+        uint64_t gmk_set = 0;
+        if (!safe_read(sets_ptr + si * 8ull, gmk_set) || !gmk_set) continue;
+        for (uint32_t li = 0; li < 64u; ++li) {
+            uint64_t glist = 0;
+            if (!safe_read(gmk_set + 0x1B8ull + static_cast<uint64_t>(li) * 8ull, glist) || !glist) continue;
+            uint64_t fcc_ptr = 0;
+            uint32_t fcc = 0;
+            if (!safe_read(glist + 0x1A0ull, fcc_ptr) || !fcc_ptr || !safe_read(fcc_ptr, fcc)) continue;
+            uint64_t stride = 0;
+            if (fcc == off301::kFourCcNpc) stride = 0x70ull;
+            else if (fcc == off301::kFourCcRnpc) stride = 0xA0ull;
+            else continue;
+
+            uint64_t pop_bdat_fp = 0, inst_ptr = 0, inst_cnt = 0;
+            safe_read(glist + 0x1B8ull, pop_bdat_fp);
+            if (!safe_read(glist + 0x1F0ull, inst_ptr) || !safe_read(glist + 0x1F8ull, inst_cnt)) continue;
+            if (!inst_ptr || inst_cnt == 0 || inst_cnt > 256ull) continue;
+
+            for (uint64_t k = 0; k < inst_cnt; ++k) {
+                const uint64_t npc = inst_ptr + k * stride;
+                uint64_t tf_ptr = 0;
+                uint32_t bdat_id = 0;
+                Vec3 pos{};
+                if (!safe_read(npc + 0x10ull, tf_ptr) || !tf_ptr ||
+                    !safe_read(tf_ptr + 0x00ull, pos) || !is_finite3(pos)) continue;
+                if (std::fabs(pos.x) + std::fabs(pos.y) + std::fabs(pos.z) < 0.1f) continue;
+                safe_read(npc + 0x38ull, bdat_id);
+                char nm[96] = {};
+                if (!resolve_npc_name(pop_bdat_fp, bdat_id, nm, sizeof nm)) continue;
+                // Deduplicate identical NPCs within 3m
+                bool dup = false;
+                for (const auto& ex : out) {
+                    if (ex.name == nm) {
+                        const float dx = ex.pos.x - pos.x, dy = ex.pos.y - pos.y, dz = ex.pos.z - pos.z;
+                        if (dx * dx + dy * dy + dz * dz < 9.0f) { dup = true; break; }
+                    }
+                }
+                if (!dup) out.push_back({pos, nm});
+                if (out.size() >= 192u) return;
+            }
+        }
+    }
+}
+
 struct Projected {
     float sx = 0.f;
     float sy = 0.f;
@@ -909,15 +1033,15 @@ void submit_ground_ribbon(const nxrt::gfx::HudCanvas& c, const float vp[16],
 }
 
 void draw_cross_map_banner(const nxrt::gfx::HudCanvas& c, float scale, float vis_alpha,
-                           const char* map_name, const char* lm_name, bool is_main) {
+                           const char* prefix, const char* map_name, const char* lm_name, uint32_t accent_rgb) {
     if (vis_alpha <= 0.02f || (!map_name[0] && !lm_name[0])) return;
-    char msg[224];
+    char msg[240];
     if (map_name[0] && lm_name[0]) {
-        std::snprintf(msg, sizeof msg, ">> 跨图传送指引  %s · %s", map_name, lm_name);
+        std::snprintf(msg, sizeof msg, "%s%s · %s", prefix, map_name, lm_name);
     } else if (lm_name[0]) {
-        std::snprintf(msg, sizeof msg, ">> 跨图传送指引  %s", lm_name);
+        std::snprintf(msg, sizeof msg, "%s%s", prefix, lm_name);
     } else {
-        std::snprintf(msg, sizeof msg, ">> 跨图传送指引  %s", map_name);
+        std::snprintf(msg, sizeof msg, "%s%s", prefix, map_name);
     }
     const float sz = 14.5f * scale;
     float tw = 0.f, th = 0.f;
@@ -931,13 +1055,12 @@ void draw_cross_map_banner(const nxrt::gfx::HudCanvas& c, float scale, float vis
     const uint32_t ln_a = static_cast<uint32_t>(vis_alpha * 210.f) & 0xFFu;
     const uint32_t tx_a = static_cast<uint32_t>(vis_alpha * 245.f) & 0xFFu;
     const uint32_t sh_a = static_cast<uint32_t>(vis_alpha * 200.f) & 0xFFu;
-    const uint32_t accent = is_main ? 0xFFD54F00u : 0x4FC3F700u;
 
     // Frameless angled-cut dark strip with thin top accent line (matches XC2 HUD aesthetic)
     const float cut = 7.f * scale;
     c.quad_filled(x0 + cut, y0, x0 + bw, y0, x0 + bw - cut, y0 + bh, x0, y0 + bh, 0x07111B00u | bg_a);
-    c.line(x0 + cut, y0, x0 + bw, y0, accent | ln_a, 1.5f * scale);
-    c.text_outlined(x0 + pad_x, y0 + pad_y, sz, (is_main ? 0xFFF8E100u : 0xE1F5FE00u) | tx_a, 0x00000000u | sh_a, msg);
+    c.line(x0 + cut, y0, x0 + bw, y0, (accent_rgb & 0xFFFFFF00u) | ln_a, 1.5f * scale);
+    c.text_outlined(x0 + pad_x, y0 + pad_y, sz, 0xF5FAFF00u | tx_a, 0x00000000u | sh_a, msg);
 }
 
 }  // namespace
@@ -1017,11 +1140,41 @@ void draw(const nxrt::gfx::HudCanvas& c) {
     Vec3 player{};
     if (!read_player_pos(mb, cam_tgt, player)) return;
 
-    // 3. Collect active tracked quest locators on the current map (cat 0 = Main Story, cat 1 = Active Sub/Blade Quest).
+    // 3. Check if player has an active Custom Pin (from F4 picker) on this map; otherwise read active quests (cat 0/1).
     std::vector<NavMarker> markers;
     markers.reserve(16);
     OffMapTarget offmap;
-    collect_locators(mb, map_id, markers, offmap);
+    bool using_custom_pin = false;
+    std::string custom_pin_name;
+    {
+        std::lock_guard<std::mutex> lk(custom_pin().mu);
+        if (custom_pin().active) {
+            if (custom_pin().map_id != map_id) {
+                custom_pin().active = false;  // auto-clear on map change
+            } else {
+                const float dx = custom_pin().pos.x - player.x;
+                const float dy = custom_pin().pos.y - player.y;
+                const float dz = custom_pin().pos.z - player.z;
+                const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (d < 4.5f) {
+                    custom_pin().active = false;  // auto-clear on arrival
+                } else {
+                    NavMarker nm;
+                    nm.pos = custom_pin().pos;
+                    nm.kind = MarkerKind::Pin;
+                    nm.cat = 9;
+                    nm.dist = d;
+                    nm.dy = dy;
+                    markers.push_back(nm);
+                    using_custom_pin = true;
+                    custom_pin_name = custom_pin().name;
+                }
+            }
+        }
+    }
+    if (!using_custom_pin) {
+        collect_locators(mb, map_id, markers, offmap);
+    }
 
     for (auto& m : markers) {
         const float dx = m.pos.x - player.x;
@@ -1088,10 +1241,14 @@ void draw(const nxrt::gfx::HudCanvas& c) {
         }
     }
 
-    // 4c. Cross-map nearest skip-travel recommendation when active tracked quest is on another Titan/Map.
+    // 4c. Cross-map nearest skip-travel recommendation OR active Custom Pin top strip.
     char cross_map_name[96] = {};
     char cross_lm_name[96] = {};
-    if (markers.empty() && offmap.valid && s_vis_alpha > 0.02f) {
+    if (using_custom_pin && s_vis_alpha > 0.02f) {
+        char pin_hdr[192];
+        std::snprintf(pin_hdr, sizeof pin_hdr, "%s  (F4 切换 / 取消)", custom_pin_name.c_str());
+        draw_cross_map_banner(c, scale, s_vis_alpha, ">> 自定义导航  ", pin_hdr, "", 0xCE93D800u);
+    } else if (markers.empty() && offmap.valid && s_vis_alpha > 0.02f) {
         resolve_cross_map_hint(mb, offmap, cross_map_name, sizeof cross_map_name, cross_lm_name, sizeof cross_lm_name);
         static uint32_t s_logged_offmap = 0;
         if (s_logged_offmap != offmap.map_id) {
@@ -1100,7 +1257,8 @@ void draw(const nxrt::gfx::HudCanvas& c) {
                     offmap.map_id, offmap.cat, offmap.has_pos ? 1 : 0,
                     offmap.pos.x, offmap.pos.y, offmap.pos.z, cross_map_name, cross_lm_name);
         }
-        draw_cross_map_banner(c, scale, s_vis_alpha, cross_map_name, cross_lm_name, offmap.cat == 0);
+        draw_cross_map_banner(c, scale, s_vis_alpha, ">> 跨图传送指引  ", cross_map_name, cross_lm_name,
+                              offmap.cat == 0 ? 0xFFD54F00u : 0x4FC3F700u);
     }
 
     // 5. Project and draw markers (draw secondary markers first so primary sits on top).
@@ -1164,6 +1322,94 @@ void draw(const nxrt::gfx::HudCanvas& c) {
         c.rect_filled(x0 - 6.f, y0 - 3.f, x0 + tw + 6.f, y0 + th + 3.f, 0x000000B8u, 4.f);
         c.text(x0, y0, sz, 0xA5D6A7FFu, dbg);
     }
+}
+
+nxrt::gfx::PickerCallbacks make_picker_callbacks() {
+    nxrt::gfx::PickerCallbacks cb;
+    cb.query = [](std::vector<nxrt::gfx::PickerItem>& out_items, bool& out_has_pin, std::string& out_pin_name) {
+        out_items.clear();
+        const uint64_t mb = g_main_base.load(std::memory_order_relaxed);
+        if (!mb) return;
+        uint32_t map_id = 0;
+        if (!read_current_map_id(mb, map_id)) return;
+        Vec3 cam_tgt{}, player{};
+        safe_read(mb + off301::kGfInfoCamTgt, cam_tgt);
+        read_player_pos(mb, cam_tgt, player);
+
+        std::vector<LandmarkInfo> lms;
+        lms.reserve(64);
+        collect_landmarks(mb, lms);
+
+        std::vector<NpcInfo> npcs;
+        npcs.reserve(128);
+        collect_npcs(mb, npcs);
+
+        std::vector<CustomPinState::Entry> new_entries;
+        new_entries.reserve(lms.size() + npcs.size());
+
+        auto push_item = [&](const Vec3& pos, const std::string& name, uint8_t group) {
+            const float dx = pos.x - player.x, dy = pos.y - player.y, dz = pos.z - player.z;
+            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const int idy = static_cast<int>(std::lround(dy));
+            char det[48];
+            if (std::abs(idy) >= 3) {
+                std::snprintf(det, sizeof det, "%dm  %s%dm", static_cast<int>(std::lround(dist)), idy > 0 ? "▲+" : "▼", idy);
+            } else {
+                std::snprintf(det, sizeof det, "%dm", static_cast<int>(std::lround(dist)));
+            }
+            const uint64_t idx = new_entries.size();
+            new_entries.push_back({pos, name, group, map_id});
+            nxrt::gfx::PickerItem it;
+            it.id = idx;
+            it.group = group;
+            it.dist = dist;
+            it.name = name;
+            it.detail = det;
+            out_items.push_back(std::move(it));
+        };
+
+        for (const auto& lm : lms) {
+            char nm[96] = {};
+            if (read_landmark_localized_name(mb, lm, nm, sizeof nm)) {
+                push_item(lm.pos, nm, 0);
+            }
+        }
+        for (const auto& npc : npcs) {
+            push_item(npc.pos, npc.name, 1);
+        }
+
+        std::sort(out_items.begin(), out_items.end(), [](const nxrt::gfx::PickerItem& a, const nxrt::gfx::PickerItem& b) {
+            if (a.group != b.group) return a.group < b.group;
+            return a.dist < b.dist;
+        });
+
+        std::lock_guard<std::mutex> lk(custom_pin().mu);
+        custom_pin().entries = std::move(new_entries);
+        out_has_pin = custom_pin().active && custom_pin().map_id == map_id;
+        out_pin_name = out_has_pin ? custom_pin().name : std::string();
+    };
+
+    cb.select = [](uint64_t id) {
+        std::lock_guard<std::mutex> lk(custom_pin().mu);
+        if (id >= custom_pin().entries.size()) return;
+        const auto& e = custom_pin().entries[id];
+        custom_pin().active = true;
+        custom_pin().map_id = e.map_id;
+        custom_pin().pos = e.pos;
+        custom_pin().name = e.name;
+        custom_pin().group = e.group;
+        if (g_mode.load(std::memory_order_relaxed) == 0) g_mode.store(2, std::memory_order_relaxed);
+        g_reveal_start_ms.store(now_ms(), std::memory_order_relaxed);
+        NXLOG_I(kTag, "custom pin set: '%s' (%.1f, %.1f, %.1f)", e.name.c_str(), e.pos.x, e.pos.y, e.pos.z);
+    };
+
+    cb.clear = []() {
+        std::lock_guard<std::mutex> lk(custom_pin().mu);
+        custom_pin().active = false;
+        custom_pin().name.clear();
+        NXLOG_I(kTag, "custom pin cleared (auto quest tracking restored)");
+    };
+    return cb;
 }
 
 }  // namespace xc2::nav
