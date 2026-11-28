@@ -19,7 +19,8 @@ struct PathResult {
     std::vector<NavVec3> points;  // 3D world-space walkable path from player -> primary objective
     float path_len = 0.f;         // total walkable length in meters
     bool loaded = false;          // true once the map's NavMesh is ready
-    bool reachable = false;       // true if A* found a connected walkable path
+    bool reachable = false;       // true if A* found a walkable path (full or best-effort partial)
+    bool partial = false;         // true if goal is on a disconnected island and path leads to closest reachable edge
     size_t poly_count = 0;
 };
 
@@ -51,5 +52,8 @@ bool mesh_get_map_landmarks(const std::string& map_res, std::vector<LvbLandmark>
 // Cached 3-level cross-map Skip-Travel helpers (reads /bdat/common_gmk.bdat + /gmk/<res>_{landmark,npc}.lvb on demand).
 bool mesh_get_offmap_landmarks(const std::string& map_res, std::vector<OffMapLandmark>& out);
 bool mesh_find_offmap_npc_pos(const std::string& map_res, uint32_t npc_id, NavVec3& out_pos);
+
+// Read an indexed file (e.g. "/menu/image/face.wilay") from the player's own bf2.arh/bf2.ard (decompresses xbc1 if needed).
+bool read_archive_file(const std::string& lower_path, std::vector<uint8_t>& out);
 
 }  // namespace xc2::nav

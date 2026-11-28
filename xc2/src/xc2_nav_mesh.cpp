@@ -191,7 +191,9 @@ bool load_arh_index(const std::filesystem::path& romfs_dir, ArhIndex& out) {
         const bool is_nav = (full.find(".winvhe") != std::string::npos || full.find(".winvda") != std::string::npos);
         const bool is_lvb = (full.find("_landmark.lvb") != std::string::npos || full.find("_npc.lvb") != std::string::npos);
         const bool is_gmk = (full == "/bdat/common_gmk.bdat");
-        if (!is_nav && !is_lvb && !is_gmk) continue;
+        const bool is_face = (full == "/menu/image/face.wilay" || full == "/menu/image/dlc3_btl_face.wilay" ||
+                              full == "/menu/image/btl_face.wilay");
+        if (!is_nav && !is_lvb && !is_gmk && !is_face) continue;
 
         const uint8_t* ep = ents + static_cast<size_t>(entry_idx) * 24;
         ArhEntry ae;
@@ -263,46 +265,66 @@ struct MapNavMesh {
     std::string map_res;
     std::vector<PolyNode> polys;
     std::vector<PolyEdge> edges;
+    std::vector<uint32_t> comp_id;    // connected-component root id per polygon
+    std::vector<uint32_t> comp_size;  // size of each polygon's connected component
     std::unordered_map<CellKey, std::vector<uint32_t>, CellKeyHash> grid;  // 8m x 8m XZ spatial hash
     static constexpr float kCellSize = 8.0f;
 
-    int32_t find_nearest(NavVec3 p) const {
+    int32_t find_nearest(NavVec3 p, uint32_t min_comp_size = 16u, uint32_t prefer_comp = UINT32_MAX) const {
         if (polys.empty()) return -1;
         const int32_t gx = static_cast<int32_t>(std::floor(p.x / kCellSize));
         const int32_t gz = static_cast<int32_t>(std::floor(p.z / kCellSize));
-        int32_t best = -1;
-        float best_d2 = 1e30f;
 
-        // Expand ring search in 8m cells (0..6 -> up to 48m radius) for O(1) lookup.
-        for (int rad = 0; rad <= 6; ++rad) {
-            for (int dx = -rad; dx <= rad; ++dx) {
-                for (int dz = -rad; dz <= rad; ++dz) {
-                    if (rad > 0 && std::abs(dx) != rad && std::abs(dz) != rad) continue;
-                    auto it = grid.find({gx + dx, gz + dz});
-                    if (it == grid.end()) continue;
-                    for (uint32_t pid : it->second) {
-                        const NavVec3& c = polys[pid].center;
-                        const float ddx = c.x - p.x;
-                        const float ddy = (c.y - p.y) * 2.2f;  // bias toward matching floor elevation
-                        const float ddz = c.z - p.z;
-                        const float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
-                        if (d2 < best_d2) {
-                            best_d2 = d2;
-                            best = static_cast<int32_t>(pid);
+        auto search_ring = [&](uint32_t req_comp, uint32_t req_min_sz, int max_rad, float max_d2) -> int32_t {
+            int32_t best = -1;
+            float best_d2 = max_d2;
+            for (int rad = 0; rad <= max_rad; ++rad) {
+                for (int dx = -rad; dx <= rad; ++dx) {
+                    for (int dz = -rad; dz <= rad; ++dz) {
+                        if (rad > 0 && std::abs(dx) != rad && std::abs(dz) != rad) continue;
+                        auto it = grid.find({gx + dx, gz + dz});
+                        if (it == grid.end()) continue;
+                        for (uint32_t pid : it->second) {
+                            if (req_comp != UINT32_MAX && comp_id[pid] != req_comp) continue;
+                            if (req_min_sz > 0 && comp_size[pid] < req_min_sz) continue;
+                            const NavVec3& c = polys[pid].center;
+                            const float ddx = c.x - p.x;
+                            const float ddy = (c.y - p.y) * 2.2f;  // bias toward matching floor elevation
+                            const float ddz = c.z - p.z;
+                            const float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                            if (d2 < best_d2) {
+                                best_d2 = d2;
+                                best = static_cast<int32_t>(pid);
+                            }
                         }
                     }
                 }
+                if (best >= 0 && best_d2 < (rad + 1) * (rad + 1) * kCellSize * kCellSize) break;
             }
-            if (best >= 0 && best_d2 < (rad + 1) * (rad + 1) * kCellSize * kCellSize) break;
+            return best;
+        };
+
+        // 1. If a preferred component is given (e.g. player's island), snap to it when within 24m.
+        if (prefer_comp != UINT32_MAX && !comp_id.empty()) {
+            const int32_t pref = search_ring(prefer_comp, 0u, 3, 24.0f * 24.0f);
+            if (pref >= 0) return pref;
         }
-        // Fallback linear scan if player/target is far outside NavMesh bounds
-        if (best < 0) {
-            for (size_t i = 0; i < polys.size(); ++i) {
-                const NavVec3& c = polys[i].center;
-                const float ddx = c.x - p.x, ddy = (c.y - p.y) * 2.2f, ddz = c.z - p.z;
-                const float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
-                if (d2 < best_d2) { best_d2 = d2; best = static_cast<int32_t>(i); }
-            }
+        // 2. Avoid snapping onto tiny isolated 1..15 poly rocks/ledges when walkable terrain is nearby.
+        if (min_comp_size > 1u && !comp_size.empty()) {
+            const int32_t main_hit = search_ring(UINT32_MAX, min_comp_size, 6, 1e30f);
+            if (main_hit >= 0) return main_hit;
+        }
+        // 3. Standard unrestricted ring search.
+        int32_t best = search_ring(UINT32_MAX, 0u, 6, 1e30f);
+        if (best >= 0) return best;
+
+        // 4. Fallback linear scan if player/target is far outside NavMesh bounds.
+        float best_d2 = 1e30f;
+        for (size_t i = 0; i < polys.size(); ++i) {
+            const NavVec3& c = polys[i].center;
+            const float ddx = c.x - p.x, ddy = (c.y - p.y) * 2.2f, ddz = c.z - p.z;
+            const float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+            if (d2 < best_d2) { best_d2 = d2; best = static_cast<int32_t>(i); }
         }
         return best;
     }
@@ -447,11 +469,41 @@ bool build_map_navmesh(const ArhIndex& arh, const std::string& map_res, MapNavMe
         }
     }
 
-    // 3. Build compact CSR adjacency list
-    std::vector<std::vector<PolyEdge>> adj(out.polys.size());
+    // 3. Build adjacency list + Union-Find components + boundary-edge proximity stitching across small tile/bridge seams
+    const size_t N = out.polys.size();
+    std::vector<uint32_t> uf(N);
+    for (size_t i = 0; i < N; ++i) uf[i] = static_cast<uint32_t>(i);
+    auto uf_find = [&](uint32_t x) -> uint32_t {
+        while (uf[x] != x) {
+            uf[x] = uf[uf[x]];
+            x = uf[x];
+        }
+        return x;
+    };
+    auto uf_union = [&](uint32_t a, uint32_t b) {
+        const uint32_t ra = uf_find(a);
+        const uint32_t rb = uf_find(b);
+        if (ra != rb) uf[ra] = rb;
+    };
+
+    std::vector<std::vector<PolyEdge>> adj(N);
     size_t shared_edges = 0;
+    struct OpenEdge {
+        uint32_t pid;
+        NavVec3 mid;
+    };
+    std::unordered_map<CellKey, std::vector<OpenEdge>, CellKeyHash> open_grid;
+    constexpr float kStitchCell = 2.5f;
+
     for (const auto& kv : edge_map) {
         const auto& refs = kv.second;
+        if (refs.size() == 1) {
+            const NavVec3& m = refs[0].mid;
+            const int32_t gx = static_cast<int32_t>(std::floor(m.x / kStitchCell));
+            const int32_t gz = static_cast<int32_t>(std::floor(m.z / kStitchCell));
+            open_grid[{gx, gz}].push_back({refs[0].poly_id, m});
+            continue;
+        }
         if (refs.size() < 2 || refs.size() > 6) continue;
         ++shared_edges;
         for (size_t i = 0; i < refs.size(); ++i) {
@@ -466,12 +518,69 @@ bool build_map_navmesh(const ArhIndex& arh, const std::string& map_res, MapNavMe
                                           (ca.z - cb.z) * (ca.z - cb.z));
                 adj[a].push_back({b, w, refs[i].mid});
                 adj[b].push_back({a, w, refs[i].mid});
+                uf_union(a, b);
             }
         }
     }
 
-    out.edges.reserve(shared_edges * 2);
-    for (size_t i = 0; i < out.polys.size(); ++i) {
+    // Stitch open boundary edges from distinct components within 2.5m XZ and 2.8m Y (bridges, stairs, tile T-junctions).
+    size_t stitched_edges = 0;
+    constexpr float kMaxStitchXZ2 = 2.5f * 2.5f;
+    constexpr float kMaxStitchY   = 2.8f;
+    for (const auto& kv : open_grid) {
+        const CellKey ck = kv.first;
+        const auto& cell_edges = kv.second;
+        for (int dx = 0; dx <= 1; ++dx) {
+            for (int dz = (dx == 0 ? 0 : -1); dz <= 1; ++dz) {
+                auto nit = (dx == 0 && dz == 0) ? open_grid.find(ck) : open_grid.find({ck.cx + dx, ck.cz + dz});
+                if (nit == open_grid.end()) continue;
+                const auto& nbr_edges = nit->second;
+                for (const auto& ea : cell_edges) {
+                    const uint32_t ra = uf_find(ea.pid);
+                    for (const auto& eb : nbr_edges) {
+                        if (ea.pid == eb.pid) continue;
+                        if (uf_find(eb.pid) == ra) continue;
+                        const float ddy = std::fabs(ea.mid.y - eb.mid.y);
+                        if (ddy > kMaxStitchY) continue;
+                        const float ddx = ea.mid.x - eb.mid.x;
+                        const float ddz = ea.mid.z - eb.mid.z;
+                        if (ddx * ddx + ddz * ddz > kMaxStitchXZ2) continue;
+                        const NavVec3& ca = out.polys[ea.pid].center;
+                        const NavVec3& cb = out.polys[eb.pid].center;
+                        const float w = std::sqrt((ca.x - cb.x) * (ca.x - cb.x) +
+                                                  (ca.y - cb.y) * (ca.y - cb.y) +
+                                                  (ca.z - cb.z) * (ca.z - cb.z)) + 2.0f;
+                        const NavVec3 portal{(ea.mid.x + eb.mid.x) * 0.5f,
+                                             (ea.mid.y + eb.mid.y) * 0.5f,
+                                             (ea.mid.z + eb.mid.z) * 0.5f};
+                        adj[ea.pid].push_back({eb.pid, w, portal});
+                        adj[eb.pid].push_back({ea.pid, w, portal});
+                        uf_union(ea.pid, eb.pid);
+                        ++stitched_edges;
+                        break;  // one bridge per open edge is enough to merge components cleanly
+                    }
+                }
+            }
+        }
+    }
+
+    // Finalize connected-component IDs & sizes so find_nearest() avoids tiny isolated decorative rocks/ledges.
+    out.comp_id.resize(N);
+    std::vector<uint32_t> root_cnt(N, 0u);
+    for (size_t i = 0; i < N; ++i) {
+        const uint32_t r = uf_find(static_cast<uint32_t>(i));
+        out.comp_id[i] = r;
+        ++root_cnt[r];
+    }
+    out.comp_size.resize(N);
+    size_t num_comps = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (root_cnt[i] > 0) ++num_comps;
+        out.comp_size[i] = root_cnt[out.comp_id[i]];
+    }
+
+    out.edges.reserve((shared_edges + stitched_edges) * 2);
+    for (size_t i = 0; i < N; ++i) {
         out.polys[i].edge_start = static_cast<uint32_t>(out.edges.size());
         out.polys[i].edge_count = static_cast<uint16_t>(std::min<size_t>(adj[i].size(), 65535u));
         for (size_t k = 0; k < out.polys[i].edge_count; ++k) {
@@ -480,8 +589,8 @@ bool build_map_navmesh(const ArhIndex& arh, const std::string& map_res, MapNavMe
     }
 
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    NXLOG_I(kTag, "loaded %s: %u tiles, %zu polys, %zu shared edges in %.1f ms",
-            map_res.c_str(), tiles_ok, out.polys.size(), shared_edges, ms);
+    NXLOG_I(kTag, "loaded %s: %u tiles, %zu polys, %zu shared + %zu stitched edges (%zu comps) in %.1f ms",
+            map_res.c_str(), tiles_ok, N, shared_edges, stitched_edges, num_comps, ms);
     return !out.polys.empty();
 }
 
@@ -551,29 +660,50 @@ void smooth_path(std::vector<NavVec3>& pts) {
     pts.swap(out);
 }
 
+void emit_resampled_line(NavVec3 a, NavVec3 b, float max_len, std::vector<NavVec3>& out_pts, float& out_len) {
+    out_pts.clear();
+    const float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    const float full_d = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (full_d < 0.5f) {
+        out_len = 0.f;
+        return;
+    }
+    const float d = std::min(full_d, max_len);
+    const float ratio = d / full_d;
+    const int steps = std::clamp(static_cast<int>(std::ceil(d / 1.5f)), 2, 32);
+    out_pts.reserve(static_cast<size_t>(steps) + 1);
+    for (int i = 0; i <= steps; ++i) {
+        const float t = (static_cast<float>(i) / static_cast<float>(steps)) * ratio;
+        out_pts.push_back({a.x + dx * t, a.y + dy * t, a.z + dz * t});
+    }
+    out_len = d;
+}
+
 bool solve_astar(const MapNavMesh& mesh, NavVec3 start_p, NavVec3 goal_p,
-                 std::vector<NavVec3>& out_pts, float& out_len) {
+                 std::vector<NavVec3>& out_pts, float& out_len, bool& out_partial) {
     out_pts.clear();
     out_len = 0.f;
-    const int32_t s_id = mesh.find_nearest(start_p);
-    const int32_t g_id = mesh.find_nearest(goal_p);
-    if (s_id < 0 || g_id < 0) return false;
+    out_partial = false;
+    const int32_t s_id = mesh.find_nearest(start_p, 16u);
+    if (s_id < 0) return false;
+    const uint32_t s_comp = mesh.comp_id.empty() ? UINT32_MAX : mesh.comp_id[static_cast<size_t>(s_id)];
+    const int32_t g_id = mesh.find_nearest(goal_p, 16u, s_comp);
+    if (g_id < 0) return false;
+
+    const NavVec3 s_ground{start_p.x, mesh.polys[s_id].center.y, start_p.z};
+    const NavVec3 g_ground{goal_p.x, mesh.polys[g_id].center.y, goal_p.z};
     if (s_id == g_id) {
-        out_pts.push_back(start_p);
-        out_pts.push_back(goal_p);
-        out_len = std::sqrt((goal_p.x - start_p.x) * (goal_p.x - start_p.x) +
-                            (goal_p.y - start_p.y) * (goal_p.y - start_p.y) +
-                            (goal_p.z - start_p.z) * (goal_p.z - start_p.z));
-        return true;
+        emit_resampled_line(s_ground, g_ground, 80.0f, out_pts, out_len);
+        return out_pts.size() >= 2;
     }
 
     const size_t N = mesh.polys.size();
-    const NavVec3 gc = mesh.polys[g_id].center;
     auto heur = [&](uint32_t pid) -> float {
         const NavVec3& c = mesh.polys[pid].center;
-        return std::sqrt((c.x - gc.x) * (c.x - gc.x) +
-                         (c.y - gc.y) * (c.y - gc.y) +
-                         (c.z - gc.z) * (c.z - gc.z));
+        const float dx = c.x - goal_p.x;
+        const float dy = c.y - goal_p.y;
+        const float dz = c.z - goal_p.z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
     };
 
     struct QItem {
@@ -588,15 +718,24 @@ bool solve_astar(const MapNavMesh& mesh, NavVec3 start_p, NavVec3 goal_p,
     std::vector<NavVec3> parent_mid(N);
     std::priority_queue<QItem, std::vector<QItem>, std::greater<QItem>> pq;
 
+    const float start_h = heur(static_cast<uint32_t>(s_id));
     gscore[s_id] = 0.f;
-    pq.push({heur(static_cast<uint32_t>(s_id)), 0.f, static_cast<uint32_t>(s_id)});
+    pq.push({start_h, 0.f, static_cast<uint32_t>(s_id)});
 
     bool found = false;
+    int32_t best_id = s_id;
+    float best_h = start_h;
+    const uint32_t max_expand = std::clamp<uint32_t>(static_cast<uint32_t>(N), 80000u, 160000u);
     uint32_t expanded = 0;
-    while (!pq.empty() && expanded < 40000u) {
+    while (!pq.empty() && expanded < max_expand) {
         const QItem cur = pq.top();
         pq.pop();
         if (cur.g > gscore[cur.id]) continue;
+        const float ch = heur(cur.id);
+        if (ch < best_h) {
+            best_h = ch;
+            best_id = static_cast<int32_t>(cur.id);
+        }
         if (static_cast<int32_t>(cur.id) == g_id) {
             found = true;
             break;
@@ -615,13 +754,22 @@ bool solve_astar(const MapNavMesh& mesh, NavVec3 start_p, NavVec3 goal_p,
         }
     }
 
-    if (!found) return false;
+    int32_t end_id = found ? g_id : best_id;
+    if (!found) {
+        out_partial = true;
+        // If player is already standing at the closest edge of their island (e.g. facing a ladder/cliff/vine),
+        // emit a short directional ground guide toward the objective so the 3D ribbon never silently disappears.
+        if (end_id == s_id || end_id < 0) {
+            NavVec3 dir_target = goal_p;
+            dir_target.y = s_ground.y + std::clamp(goal_p.y - s_ground.y, -4.0f, 4.0f);
+            emit_resampled_line(s_ground, dir_target, 28.0f, out_pts, out_len);
+            return out_pts.size() >= 2;
+        }
+    }
 
-    // Snap start/goal Y onto the walkable NavMesh floor so the guide line never floats up to cam_tgt.
-    const NavVec3 s_ground{start_p.x, mesh.polys[s_id].center.y, start_p.z};
-    const NavVec3 g_ground{goal_p.x, mesh.polys[g_id].center.y, goal_p.z};
-    out_pts.push_back(g_ground);
-    int32_t cur = g_id;
+    // Snap start/end Y onto the walkable NavMesh floor so the guide line never floats up to cam_tgt.
+    out_pts.push_back(found ? g_ground : mesh.polys[end_id].center);
+    int32_t cur = end_id;
     while (cur != s_id && cur >= 0) {
         out_pts.push_back(parent_mid[cur]);
         cur = parent[cur];
@@ -638,7 +786,7 @@ bool solve_astar(const MapNavMesh& mesh, NavVec3 start_p, NavVec3 goal_p,
         total += std::sqrt(dx * dx + dy * dy + dz * dz);
     }
     out_len = total;
-    return true;
+    return out_pts.size() >= 2;
 }
 
 // ---- Background worker singleton ----
@@ -725,7 +873,19 @@ void worker_loop() {
         pr.map_res = map_res;
         pr.loaded = true;
         pr.poly_count = mesh.polys.size();
-        pr.reachable = solve_astar(mesh, start_p, goal_p, pr.points, pr.path_len);
+        pr.reachable = solve_astar(mesh, start_p, goal_p, pr.points, pr.path_len, pr.partial);
+
+        static std::string s_last_logged_map;
+        static int s_last_logged_state = -1;
+        const int cur_state = !pr.reachable ? 0 : (pr.partial ? 1 : 2);
+        if (s_last_logged_map != map_res || s_last_logged_state != cur_state) {
+            s_last_logged_map = map_res;
+            s_last_logged_state = cur_state;
+            NXLOG_I(kTag, "path %s: %s (len=%.1fm, pts=%zu)",
+                    map_res.c_str(),
+                    cur_state == 2 ? "full" : (cur_state == 1 ? "partial-best-effort" : "none"),
+                    pr.path_len, pr.points.size());
+        }
 
         std::lock_guard<std::mutex> lk(ws().mu);
         ws().result = std::move(pr);
@@ -1113,6 +1273,18 @@ bool mesh_find_offmap_npc_pos(const std::string& map_res, uint32_t npc_id, NavVe
         }
     }
     return false;
+}
+
+bool read_archive_file(const std::string& lower_path, std::vector<uint8_t>& out) {
+    out.clear();
+    if (lower_path.empty()) return false;
+    std::lock_guard<std::mutex> lk(ws().mu);
+    if (!ws().lvb_arh.loaded && !ws().romfs_dir.empty()) {
+        load_arh_index(ws().romfs_dir, ws().lvb_arh);
+    }
+    auto ait = ws().lvb_arh.by_path.find(lower_path);
+    if (ait == ws().lvb_arh.by_path.end()) return false;
+    return read_ard_entry(ws().lvb_arh.ard_path, ait->second, out);
 }
 
 }  // namespace xc2::nav

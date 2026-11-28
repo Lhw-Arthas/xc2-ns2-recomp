@@ -123,10 +123,10 @@ void init(uint64_t main_base) {
     r.enabled.store(nxrt::config_get_bool("xc2", "voice_subtitles", true), std::memory_order_relaxed);
     r.debug.store(nxrt::config_get_bool("xc2", "voice_debug", false), std::memory_order_relaxed);
 
-    const std::string density_str = nxrt::config_get_str("xc2", "voice_density", "balanced");
-    VoiceDensity density = VoiceDensity::Balanced;
-    if (density_str == "minimal")   density = VoiceDensity::Minimal;
-    else if (density_str == "full") density = VoiceDensity::Full;
+    const std::string density_str = nxrt::config_get_str("xc2", "voice_density", "full");
+    VoiceDensity density = VoiceDensity::Full;
+    if (density_str == "minimal")        density = VoiceDensity::Minimal;
+    else if (density_str == "balanced")  density = VoiceDensity::Balanced;
 
     r.db.clear();
     // Search next to executable first, then current working directory
@@ -206,6 +206,10 @@ void cycle_density() {
 
 bool enabled() {
     return rt().enabled.load(std::memory_order_relaxed);
+}
+
+bool debug_enabled() {
+    return rt().debug.load(std::memory_order_relaxed);
 }
 
 void trigger_mock(int scenario) {

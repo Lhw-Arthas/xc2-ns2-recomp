@@ -508,7 +508,7 @@ bool read_map_resource_name(uint64_t mb, uint32_t map_id, char* out, size_t out_
 uint64_t bdat_find_table_by_name(uint64_t mb, const char* target_name) {
     uint64_t bdat_mgr = 0;
     if (!safe_read(mb + off301::kDataBdatSingleton, bdat_mgr) || !bdat_mgr) return 0;
-    for (uint32_t i = 0; i < 600u; ++i) {
+    for (uint32_t i = 0; i < 1024u; ++i) {
         uint64_t tbl = 0;
         if (!safe_read(bdat_mgr + 0x10ull + static_cast<uint64_t>(i) * 8ull, tbl) || !tbl) continue;
         uint32_t magic = 0;
@@ -723,6 +723,51 @@ struct NpcInfo {
     std::string name;
 };
 
+constexpr uint32_t kRibbonSkyBlue = 0x56C8FAFFu;  // launcher sky-blue unified 3D guide ribbon
+
+bool has_utf8_kana(const char* s) {
+    if (!s) return false;
+    const auto* p = reinterpret_cast<const unsigned char*>(s);
+    while (*p) {
+        // UTF-8 Hiragana (U+3040..U+309F: E3 81 80..E3 82 9F) & Katakana (U+30A0..U+30FF: E3 82 A0..E3 83 BF)
+        if (p[0] == 0xE3 && (p[1] == 0x81 || p[1] == 0x82 || p[1] == 0x83) && p[2] >= 0x80) {
+            if (!(p[1] == 0x81 && p[2] < 0x80)) return true;
+        }
+        ++p;
+    }
+    return false;
+}
+
+bool is_debug_or_placeholder_npc_name(const char* s, bool ui_is_japanese) {
+    if (!s || !s[0]) return true;
+    if (std::strcmp(s, "？？？") == 0 || std::strcmp(s, "???") == 0) return true;
+    // Skip internal quest/dev tags like "NQ1017_...", "（仮）", "（テスト..."
+    if (s[0] == 'N' && s[1] == 'Q' && s[2] >= '0' && s[2] <= '9') return true;
+    if (std::strstr(s, "（仮）") || std::strstr(s, "(仮)") || std::strstr(s, "テスト")) return true;
+    if (!ui_is_japanese && has_utf8_kana(s)) return true;
+    return false;
+}
+
+bool detect_ui_is_japanese(uint64_t mb) {
+    static int s_cached = -1;
+    if (s_cached >= 0) return s_cached == 1;
+    uint64_t bdat_mgr = 0, map_msg_tbl = 0;
+    if (!safe_read(mb + off301::kDataBdatSingleton, bdat_mgr) || !bdat_mgr) return false;
+    if (!safe_read(bdat_mgr + 0x10ull + static_cast<uint64_t>(off301::kBdatIdxFldMapInfoMsg) * 8ull, map_msg_tbl) || !map_msg_tbl) {
+        return false;
+    }
+    int kana_hits = 0, total = 0;
+    for (uint32_t id = 1; id <= 30 && total < 8; ++id) {
+        char buf[64] = {};
+        if (bdat_read_string(map_msg_tbl, id, "name", buf, sizeof buf)) {
+            ++total;
+            if (has_utf8_kana(buf)) ++kana_hits;
+        }
+    }
+    if (total > 0) s_cached = (kana_hits * 2 >= total) ? 1 : 0;
+    return s_cached == 1;
+}
+
 void collect_npcs(uint64_t mb, std::vector<NpcInfo>& out) {
     uint64_t gmk_mgr = 0;
     if (!safe_read(mb + off301::kGmkManagerSingleton, gmk_mgr) || !gmk_mgr) return;
@@ -736,43 +781,39 @@ void collect_npcs(uint64_t mb, std::vector<NpcInfo>& out) {
     static bool s_npc_list_probed = false;
     if (!s_npc_list_probed) {
         s_npc_list_probed = true;
-        s_npc_list_tbl = bdat_find_table_by_name(mb, "FLD_NpcList");
+        s_npc_list_tbl = bdat_find_table_by_name(mb, "RSC_NpcList");
+        if (!s_npc_list_tbl) s_npc_list_tbl = bdat_find_table_by_name(mb, "FLD_NpcList");
     }
+    const bool ui_is_jp = detect_ui_is_japanese(mb);
 
-    uint64_t sets_ptr = 0, sets_cnt = 0;
-    if (!safe_read(gmk_mgr + 0xF358ull, sets_ptr) || !safe_read(gmk_mgr + 0xF360ull, sets_cnt)) return;
-    if (!sets_ptr || sets_cnt == 0 || sets_cnt > 16ull) return;
+    uint64_t set_begin = 0, set_end = 0;
+    if (!safe_read(gmk_mgr + 0xF358ull, set_begin) || !safe_read(gmk_mgr + 0xF360ull, set_end)) return;
+    if (!set_begin || set_end <= set_begin) return;
+    const size_t set_n = std::min<size_t>(static_cast<size_t>((set_end - set_begin) / 8ull), 64u);
 
     auto resolve_npc_name = [&](uint64_t pop_tbl, uint32_t bdat_id, char* buf, size_t n) -> bool {
         buf[0] = '\0';
-        if (!pop_tbl || bdat_id == 0) return false;
-        // 1. Direct Name/MSGID on pop table, or NpcID -> FLD_NpcList.Name -> fld_npcname[445]
+        if (!pop_tbl || bdat_id == 0 || !s_npc_list_tbl) return false;
+        // Skip non-talkable background/dummy crowd NPCs if Talkable column is present and 0.
+        uint32_t talkable = 1;
+        if (bdat_read_uint(pop_tbl, bdat_id, "Talkable", talkable) && talkable == 0) return false;
+        // NpcID in map's FLD_NpcPop -> RSC_NpcList.Name -> fld_npcname[445]
+        // (Do NOT fall back to RSC_NpcList.MSGID here: MSGID indexes fld_npcjobname, not fld_npcname.)
         uint32_t npc_id = 0;
         const char* id_cols[] = {"NpcID", "NPCID", "npc_id", "NpcId", "ID"};
         for (const char* col : id_cols) {
             if (bdat_read_uint(pop_tbl, bdat_id, col, npc_id) && npc_id > 0) break;
         }
-        if (npc_id > 0 && s_npc_list_tbl) {
-            uint32_t msg_id = 0;
-            const char* nm_cols[] = {"Name", "name", "MSGID", "NameID"};
-            for (const char* col : nm_cols) {
-                if (bdat_read_uint(s_npc_list_tbl, npc_id, col, msg_id) && msg_id > 0) {
-                    if (bdat_read_string(npc_msg_tbl, msg_id, "name", buf, n)) return true;
-                }
-            }
-        }
-        // Fallback: try direct MSGID/Name on pop table
-        uint32_t direct_msg = 0;
-        if ((bdat_read_uint(pop_tbl, bdat_id, "MSGID", direct_msg) ||
-             bdat_read_uint(pop_tbl, bdat_id, "Name", direct_msg)) && direct_msg > 0) {
-            if (bdat_read_string(npc_msg_tbl, direct_msg, "name", buf, n)) return true;
-        }
-        return false;
+        if (npc_id == 0) return false;
+        uint32_t name_id = 0;
+        if (!bdat_read_uint(s_npc_list_tbl, npc_id, "Name", name_id) || name_id == 0) return false;
+        if (!bdat_read_string(npc_msg_tbl, name_id, "name", buf, n)) return false;
+        return !is_debug_or_placeholder_npc_name(buf, ui_is_jp);
     };
 
-    for (uint64_t si = 0; si < sets_cnt; ++si) {
+    for (size_t si = 0; si < set_n; ++si) {
         uint64_t gmk_set = 0;
-        if (!safe_read(sets_ptr + si * 8ull, gmk_set) || !gmk_set) continue;
+        if (!safe_read(set_begin + si * 8ull, gmk_set) || !gmk_set) continue;
         for (uint32_t li = 0; li < 64u; ++li) {
             uint64_t glist = 0;
             if (!safe_read(gmk_set + 0x1B8ull + static_cast<uint64_t>(li) * 8ull, glist) || !glist) continue;
@@ -784,13 +825,14 @@ void collect_npcs(uint64_t mb, std::vector<NpcInfo>& out) {
             else if (fcc == off301::kFourCcRnpc) stride = 0xA0ull;
             else continue;
 
-            uint64_t pop_bdat_fp = 0, inst_ptr = 0, inst_cnt = 0;
+            uint64_t pop_bdat_fp = 0, inst_begin = 0, inst_end = 0;
             safe_read(glist + 0x1B8ull, pop_bdat_fp);
-            if (!safe_read(glist + 0x1F0ull, inst_ptr) || !safe_read(glist + 0x1F8ull, inst_cnt)) continue;
-            if (!inst_ptr || inst_cnt == 0 || inst_cnt > 256ull) continue;
+            if (!safe_read(glist + 0x1F0ull, inst_begin) || !safe_read(glist + 0x1F8ull, inst_end)) continue;
+            if (!inst_begin || inst_end <= inst_begin) continue;
+            const size_t inst_n = std::min<size_t>(static_cast<size_t>((inst_end - inst_begin) / stride), 512u);
 
-            for (uint64_t k = 0; k < inst_cnt; ++k) {
-                const uint64_t npc = inst_ptr + k * stride;
+            for (size_t k = 0; k < inst_n; ++k) {
+                const uint64_t npc = inst_begin + k * stride;
                 uint64_t tf_ptr = 0;
                 uint32_t bdat_id = 0;
                 Vec3 pos{};
@@ -813,6 +855,8 @@ void collect_npcs(uint64_t mb, std::vector<NpcInfo>& out) {
             }
         }
     }
+    NXLOG_I(kTag, "F4 collect_npcs: found %zu NPCs (rsc_npc=0x%llx)",
+            out.size(), static_cast<unsigned long long>(s_npc_list_tbl));
 }
 
 struct Projected {
@@ -1016,18 +1060,31 @@ void draw_toast(const nxrt::gfx::HudCanvas& c, float scale) {
     const int64_t until = g_toast_until_ms.load(std::memory_order_relaxed);
     if (until <= 0 || now_ms() > until) return;
     const int mode = g_mode.load(std::memory_order_relaxed);
-    const char* msg = (mode == 2) ? "3D 任务指引：信标 + 地面引导线 (F3)"
-                    : (mode == 1) ? "3D 任务指引：仅 3D 信标 (F3)"
-                                  : "3D 任务指引：已关闭 (F3)";
-    const float sz = 16.f * scale;
+    const char* msg = (mode == 2) ? "3D 导航：信标 + 地面引导带   [F3 / ZL+L3]"
+                    : (mode == 1) ? "3D 导航：仅 3D 信标   [F3 / ZL+L3]"
+                                  : "3D 导航：已关闭   [F3 / ZL+L3]";
+    const float sz = 16.0f * scale;
     float tw = 0.f, th = 0.f;
     c.measure_text(sz, msg, &tw, &th);
-    const float pad_x = 12.f * scale, pad_y = 6.f * scale;
-    const float x0 = (static_cast<float>(c.width) - tw) * 0.5f - pad_x;
-    const float y0 = 56.f * scale;
-    c.rect_filled(x0, y0, x0 + tw + 2.f * pad_x, y0 + th + 2.f * pad_y, 0x0B1018D8u, 6.f * scale);
-    c.rect(x0, y0, x0 + tw + 2.f * pad_x, y0 + th + 2.f * pad_y, mode > 0 ? 0x4FC3F7CCu : 0x90A4AEAAu, 6.f * scale, 1.f);
-    c.text_outlined(x0 + pad_x, y0 + pad_y, sz, mode > 0 ? 0xE1F5FEFFu : 0xCFD8DCFFu, 0x000000CCu, msg);
+    const float icon_w = 20.f * scale;
+    const float pad_x = 16.f * scale, pad_y = 7.f * scale;
+    const float bw = icon_w + tw + 2.f * pad_x;
+    const float bh = th + 2.f * pad_y;
+    const float x0 = (static_cast<float>(c.width) - bw) * 0.5f;
+    const float y0 = 50.f * scale;
+    const float cut = 8.f * scale;
+    const uint32_t accent = mode > 0 ? 0x56C8FAEEu : 0x78909CAAu;
+    c.quad_filled(x0 + cut, y0, x0 + bw, y0, x0 + bw - cut, y0 + bh, x0, y0 + bh, 0x07121EE4u);
+    c.line(x0 + cut, y0, x0 + bw, y0, accent, 1.8f * scale);
+    c.line(x0, y0 + bh, x0 + bw - cut, y0 + bh, (accent & 0xFFFFFF00u) | 0x66u, 1.0f);
+    // Core-Crystal diamond emblem
+    const float dx = x0 + pad_x + 5.5f * scale;
+    const float dy = y0 + bh * 0.5f;
+    const float r = 5.5f * scale;
+    c.quad_filled(dx, dy - r, dx + r, dy, dx, dy + r, dx - r, dy, accent);
+    const float ir = r * 0.45f;
+    c.quad_filled(dx, dy - ir, dx + ir, dy, dx, dy + ir, dx - ir, dy, 0xE6F7FFFFu);
+    c.text_outlined(x0 + pad_x + icon_w, y0 + pad_y, sz, mode > 0 ? 0xEBF7FFFFu : 0xB0BEC5FFu, 0x000000CCu, msg);
 }
 
 // Build a true 3D horizontal ground conveyor-belt ribbon (triangle strip) and submit it to the native Vulkan pass.
@@ -1099,36 +1156,76 @@ void submit_ground_ribbon(const nxrt::gfx::HudCanvas& c, const float vp[16],
 }
 
 void draw_cross_map_banner(const nxrt::gfx::HudCanvas& c, float scale, float vis_alpha,
-                           const char* prefix, const char* map_name, const char* sub_name, const char* lm_name, uint32_t accent_rgb) {
+                           const char* tag_label, const char* map_name, const char* sub_name, const char* lm_name,
+                           const char* key_hint, uint32_t accent_rgb) {
     if (vis_alpha <= 0.02f || (!map_name[0] && !sub_name[0] && !lm_name[0])) return;
-    char msg[320];
+    char body[320];
     if (map_name[0] && sub_name[0] && lm_name[0]) {
-        std::snprintf(msg, sizeof msg, "%s%s > %s > %s", prefix, map_name, sub_name, lm_name);
+        std::snprintf(body, sizeof body, "%s  ›  %s  ›  %s", map_name, sub_name, lm_name);
     } else if (map_name[0] && lm_name[0]) {
-        std::snprintf(msg, sizeof msg, "%s%s > %s", prefix, map_name, lm_name);
+        std::snprintf(body, sizeof body, "%s  ›  %s", map_name, lm_name);
     } else if (lm_name[0]) {
-        std::snprintf(msg, sizeof msg, "%s%s", prefix, lm_name);
+        std::snprintf(body, sizeof body, "%s", lm_name);
     } else {
-        std::snprintf(msg, sizeof msg, "%s%s", prefix, map_name);
+        std::snprintf(body, sizeof body, "%s", map_name);
     }
-    const float sz = 14.5f * scale;
-    float tw = 0.f, th = 0.f;
-    c.measure_text(sz, msg, &tw, &th);
-    const float pad_x = 14.f * scale, pad_y = 5.5f * scale;
-    const float bw = tw + 2.f * pad_x;
-    const float bh = th + 2.f * pad_y;
-    const float x0 = (static_cast<float>(c.width) - bw) * 0.5f;
-    const float y0 = 92.f * scale;  // neatly below XC2's top compass bar
-    const uint32_t bg_a = static_cast<uint32_t>(vis_alpha * 175.f) & 0xFFu;
-    const uint32_t ln_a = static_cast<uint32_t>(vis_alpha * 210.f) & 0xFFu;
-    const uint32_t tx_a = static_cast<uint32_t>(vis_alpha * 245.f) & 0xFFu;
-    const uint32_t sh_a = static_cast<uint32_t>(vis_alpha * 200.f) & 0xFFu;
+    const float tag_sz = 14.5f * scale;
+    const float body_sz = 17.0f * scale;
+    const float hint_sz = 13.5f * scale;
+    float tag_w = 0.f, tag_h = 0.f, body_w = 0.f, body_h = 0.f, hint_w = 0.f, hint_h = 0.f;
+    c.measure_text(tag_sz, tag_label, &tag_w, &tag_h);
+    c.measure_text(body_sz, body, &body_w, &body_h);
+    const bool has_hint = (key_hint && key_hint[0]);
+    if (has_hint) c.measure_text(hint_sz, key_hint, &hint_w, &hint_h);
 
-    // Frameless angled-cut dark strip with thin top accent line (matches XC2 HUD aesthetic)
-    const float cut = 7.f * scale;
-    c.quad_filled(x0 + cut, y0, x0 + bw, y0, x0 + bw - cut, y0 + bh, x0, y0 + bh, 0x07111B00u | bg_a);
-    c.line(x0 + cut, y0, x0 + bw, y0, (accent_rgb & 0xFFFFFF00u) | ln_a, 1.5f * scale);
-    c.text_outlined(x0 + pad_x, y0 + pad_y, sz, 0xF5FAFF00u | tx_a, 0x00000000u | sh_a, msg);
+    const float pad_x = 18.f * scale;
+    const float pad_y = 7.5f * scale;
+    const float dia_w = 19.f * scale;
+    const float gap = 12.f * scale;
+    const float bw = pad_x + dia_w + tag_w + gap + body_w + (has_hint ? (gap + hint_w + 12.f * scale) : 0.f) + pad_x;
+    const float bh = std::max(body_h, tag_h) + 2.f * pad_y;
+    const float x0 = (static_cast<float>(c.width) - bw) * 0.5f;
+    const float y0 = 92.f * scale;  // integrated directly below XC2's native top compass strip
+
+    const uint32_t bg_a   = static_cast<uint32_t>(vis_alpha * 205.f) & 0xFFu;
+    const uint32_t ln_a   = static_cast<uint32_t>(vis_alpha * 232.f) & 0xFFu;
+    const uint32_t sub_a  = static_cast<uint32_t>(vis_alpha * 120.f) & 0xFFu;
+    const uint32_t tx_a   = static_cast<uint32_t>(vis_alpha * 250.f) & 0xFFu;
+    const uint32_t sh_a   = static_cast<uint32_t>(vis_alpha * 210.f) & 0xFFu;
+    const uint32_t tag_bg = static_cast<uint32_t>(vis_alpha * 54.f) & 0xFFu;
+
+    // XC2 native chamfered obsidian-navy top bar with sky-blue Aether hairline accents
+    const float cut = 9.f * scale;
+    c.quad_filled(x0 + cut, y0, x0 + bw, y0, x0 + bw - cut, y0 + bh, x0, y0 + bh, 0x06111D00u | bg_a);
+    c.line(x0 + cut, y0, x0 + bw, y0, (accent_rgb & 0xFFFFFF00u) | ln_a, 1.8f * scale);
+    c.line(x0, y0 + bh, x0 + bw - cut, y0 + bh, (accent_rgb & 0xFFFFFF00u) | sub_a, 1.1f);
+
+    // Core-Crystal diamond emblem on the left
+    const float cx = x0 + pad_x + 5.5f * scale;
+    const float cy = y0 + bh * 0.5f;
+    const float r = 5.8f * scale;
+    c.quad_filled(cx, cy - r, cx + r, cy, cx, cy + r, cx - r, cy, (accent_rgb & 0xFFFFFF00u) | ln_a);
+    const float ir = r * 0.44f;
+    c.quad_filled(cx, cy - ir, cx + ir, cy, cx, cy + ir, cx - ir, cy, 0xEBF8FF00u | tx_a);
+
+    // Tag pill + divider
+    float cur_x = x0 + pad_x + dia_w;
+    c.text_outlined(cur_x, y0 + (bh - tag_h) * 0.5f, tag_sz, (accent_rgb & 0xFFFFFF00u) | tx_a, 0x00000000u | sh_a, tag_label);
+    cur_x += tag_w + gap * 0.5f;
+    c.line(cur_x, y0 + 6.f * scale, cur_x, y0 + bh - 6.f * scale, (accent_rgb & 0xFFFFFF00u) | sub_a, 1.1f);
+    cur_x += gap * 0.5f;
+
+    // Main destination text
+    c.text_outlined(cur_x, y0 + (bh - body_h) * 0.5f, body_sz, 0xF2FAFF00u | tx_a, 0x00000000u | sh_a, body);
+
+    // Subtle right-side keyboard + gamepad badge
+    if (has_hint) {
+        cur_x += body_w + gap;
+        const float hx0 = cur_x - 5.f * scale;
+        const float hy0 = y0 + (bh - hint_h) * 0.5f - 2.5f * scale;
+        c.rect_filled(hx0, hy0, hx0 + hint_w + 10.f * scale, hy0 + hint_h + 5.f * scale, (accent_rgb & 0xFFFFFF00u) | tag_bg, 3.5f * scale);
+        c.text_outlined(cur_x, y0 + (bh - hint_h) * 0.5f, hint_sz, 0xD4F0FF00u | tx_a, 0x00000000u | sh_a, key_hint);
+    }
 }
 
 }  // namespace
@@ -1305,26 +1402,40 @@ void draw(const nxrt::gfx::HudCanvas& c) {
                             {markers[0].pos.x, markers[0].pos.y, markers[0].pos.z},
                             nav_path);
         if (nav_path.reachable && nav_path.map_res == map_res && nav_path.points.size() >= 2) {
-            submit_ground_ribbon(c, vp, nav_path.points, kind_color(markers[0].kind), s_vis_alpha);
+            submit_ground_ribbon(c, vp, nav_path.points, kRibbonSkyBlue, s_vis_alpha);
         }
     }
 
-    // 4c. Cross-map 3-level Skip-Travel recommendation OR active Custom Pin top strip.
+    // 4c. Cross-map 3-level Skip-Travel recommendation, active Custom Pin, or 12s map-entry self-discovery hint.
+    static uint32_t s_hint_map_id = 0;
+    static int64_t s_hint_start_ms = 0;
+    if (map_id != s_hint_map_id) {
+        s_hint_map_id = map_id;
+        s_hint_start_ms = cur_ms;
+    }
+    constexpr const char* kNavKeyHint = "F3 / ZL+L3 切换  ·  F4 / ZL+R3 选点";
     char cross_map_name[96] = {};
     char cross_sub_name[96] = {};
     char cross_lm_name[96] = {};
     if (using_custom_pin && s_vis_alpha > 0.02f) {
-        char pin_hdr[192];
-        std::snprintf(pin_hdr, sizeof pin_hdr, "%s  (F4 切换 / 取消)", custom_pin_name.c_str());
-        draw_cross_map_banner(c, scale, s_vis_alpha, ">> 自定义导航  ", pin_hdr, "", "", 0xCE93D800u);
+        draw_cross_map_banner(c, scale, s_vis_alpha, "自定义导航",
+                              custom_pin_name.c_str(), "", "", kNavKeyHint, 0x56C8FA00u);
     } else if (markers.empty() && offmap.valid && s_vis_alpha > 0.02f) {
         resolve_cross_map_hint(mb, offmap,
                                cross_map_name, sizeof cross_map_name,
                                cross_sub_name, sizeof cross_sub_name,
                                cross_lm_name, sizeof cross_lm_name);
-        draw_cross_map_banner(c, scale, s_vis_alpha, ">> 跨图传送指引  ",
+        draw_cross_map_banner(c, scale, s_vis_alpha, "跨图传送",
                               cross_map_name, cross_sub_name, cross_lm_name,
-                              offmap.cat == 0 ? 0xFFD54F00u : 0x4FC3F700u);
+                              kNavKeyHint, 0x56C8FA00u);
+    } else if (s_vis_alpha > 0.02f && s_hint_start_ms > 0) {
+        const float elapsed_s = static_cast<float>(cur_ms - s_hint_start_ms) * 0.001f;
+        if (elapsed_s < 12.0f) {
+            const float fade = (elapsed_s <= 10.0f) ? 1.0f : std::clamp((12.0f - elapsed_s) * 0.5f, 0.f, 1.f);
+            const char* status_txt = (mode >= 2) ? "已开启信标与地面引导带" : "仅显示 3D 信标";
+            draw_cross_map_banner(c, scale, s_vis_alpha * fade, "3D 导航",
+                                  status_txt, "", "", kNavKeyHint, 0x56C8FA00u);
+        }
     }
 
     // 5. Project and draw markers (draw secondary markers first so primary sits on top).
@@ -1364,7 +1475,8 @@ void draw(const nxrt::gfx::HudCanvas& c) {
         if (!markers.empty()) {
             char pinfo[64] = {};
             if (nav_path.reachable && nav_path.map_res == map_res) {
-                std::snprintf(pinfo, sizeof pinfo, " | path=%.0fm(%zu)", nav_path.path_len, nav_path.points.size());
+                std::snprintf(pinfo, sizeof pinfo, " | path=%.0fm(%zu%s)",
+                              nav_path.path_len, nav_path.points.size(), nav_path.partial ? "~" : "");
             } else if (map_res[0]) {
                 std::snprintf(pinfo, sizeof pinfo, " | mesh=%s(%s)", map_res, nav_path.loaded ? "unreach" : "loading");
             }

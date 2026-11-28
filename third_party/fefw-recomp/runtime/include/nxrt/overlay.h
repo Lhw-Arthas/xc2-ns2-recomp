@@ -61,6 +61,12 @@ struct HudCanvas {
     void text(float x, float y, float size, uint32_t rgba, const char* str) const;
     void text_outlined(float x, float y, float size, uint32_t rgba, uint32_t outline_rgba, const char* str) const;
     void measure_text(float size, const char* str, float* out_w, float* out_h) const;
+    void image(uint64_t tex_id, float x0, float y0, float x1, float y1,
+               float u0 = 0.f, float v0 = 0.f, float u1 = 1.f, float v1 = 1.f,
+               uint32_t tint_rgba = 0xFFFFFFFFu) const;
+    void image_rounded(uint64_t tex_id, float x0, float y0, float x1, float y1,
+                       float u0, float v0, float u1, float v1,
+                       float rounding, uint32_t tint_rgba = 0xFFFFFFFFu) const;
     void set_ribbon_3d(const Ribbon3DVertex* verts, uint32_t count, const Ribbon3DParams& params) const;
 };
 
@@ -154,6 +160,10 @@ public:
     // Optional per-frame foreground HUD callback (runs on the presenting thread inside the ImGui frame, even when the F1 menu is hidden).
     // Pass an empty std::function to clear. Thread-safe.
     void set_hud_callback(std::function<void(const HudCanvas&)> fn);
+
+    // Upload a linear BC3 (DXT5) texture for foreground HudCanvas::image / image_rounded (owned until Overlay shutdown).
+    // Returns an opaque non-zero ImTextureID handle, or 0 on failure.
+    uint64_t create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes);
 
     // Optional searchable destination picker window (toggled independently of F1, e.g. F4).
     void set_picker(PickerCallbacks cb);

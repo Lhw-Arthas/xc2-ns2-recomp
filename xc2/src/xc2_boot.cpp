@@ -537,18 +537,20 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
             else                     xc2::voice::toggle();
         }
         f5_was_down = f5;
-        static bool f6_was_down = false;
-        const bool f6 = down(VK_F6) || tapped(VK_F6);
-        if (f6 && !f6_was_down) xc2::voice::trigger_mock(0);
-        f6_was_down = f6;
-        static bool f7_was_down = false;
-        const bool f7 = down(VK_F7) || tapped(VK_F7);
-        if (f7 && !f7_was_down) xc2::voice::trigger_mock(1);
-        f7_was_down = f7;
-        static bool f8_was_down = false;
-        const bool f8 = down(VK_F8) || tapped(VK_F8);
-        if (f8 && !f8_was_down) xc2::voice::toggle_mock_combat_mode();
-        f8_was_down = f8;
+        if (xc2::voice::debug_enabled()) {
+            static bool f6_was_down = false;
+            const bool f6 = down(VK_F6) || tapped(VK_F6);
+            if (f6 && !f6_was_down) xc2::voice::trigger_mock(0);
+            f6_was_down = f6;
+            static bool f7_was_down = false;
+            const bool f7 = down(VK_F7) || tapped(VK_F7);
+            if (f7 && !f7_was_down) xc2::voice::trigger_mock(1);
+            f7_was_down = f7;
+            static bool f8_was_down = false;
+            const bool f8 = down(VK_F8) || tapped(VK_F8);
+            if (f8 && !f8_was_down) xc2::voice::toggle_mock_combat_mode();
+            f8_was_down = f8;
+        }
         if (shot_raw) {
             if (f12_left > 0 && shot_raw_have) {
                 write_raw_frame();     // the buffer filled at the end of the previous frame
@@ -756,7 +758,27 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
     }
     const uint64_t b_all = kb | pb;
     const int sx = kx ? kx : px, sy = ky ? ky : py, rx = klx ? klx : prx, ry = kly ? kly : pry;
-    const uint64_t menu_mask = nxrt::play::note_external_pad(b_all, sx, sy, rx, ry);
+    // Gamepad chords for 3D Navigation (conflict-free with XC2 field controls and Minus+Plus F1 menu):
+    //   ZL + L3 = toggle 3D nav mode (F3)
+    //   ZL + R3 = open/close 3D nav destination picker (F4)
+    static uint64_t nav_pad_prev = 0;
+    static uint64_t nav_pad_mask = 0;
+    {
+        const uint64_t chord_f3 = btn(kBtnZL) | btn(kBtnStickL);
+        const uint64_t chord_f4 = btn(kBtnZL) | btn(kBtnStickR);
+        const uint64_t fresh_pb = pb & ~nav_pad_prev;
+        if (!menu_blocked && (pb & chord_f3) == chord_f3 && (fresh_pb & chord_f3)) {
+            xc2::nav::toggle();
+            nav_pad_mask |= chord_f3;
+        }
+        if ((pb & chord_f4) == chord_f4 && (fresh_pb & chord_f4)) {
+            nxrt::play::toggle_picker();
+            nav_pad_mask |= chord_f4;
+        }
+        nav_pad_mask &= pb;
+        nav_pad_prev = pb;
+    }
+    const uint64_t menu_mask = nxrt::play::note_external_pad(b_all, sx, sy, rx, ry) | nav_pad_mask;
     if (menu_blocked) return;
     const uint64_t b = b_all & ~menu_mask;
     if (!b && !sx && !sy && !rx && !ry) return;

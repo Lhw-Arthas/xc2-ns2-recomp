@@ -16,6 +16,7 @@ void toggle();
 void toggle_log();
 void cycle_density();
 bool enabled();
+bool debug_enabled();
 
 // Phase 1 mock verification helpers (F6 / F7 / F8 when voice_debug or Ctrl+key is used).
 // scenario: 0 = P0 Post-Battle Banter, 1 = P1 Combat Break + Driver/Blade Merge, 2 = P1 Aggro/Heal cycle.

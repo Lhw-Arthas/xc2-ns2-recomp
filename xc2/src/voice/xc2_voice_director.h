@@ -40,10 +40,10 @@ public:
     void clear_active();
 
 private:
-    static constexpr size_t kMaxCombatCards    = 2;
-    static constexpr size_t kMaxExplorationQ   = 4;
+    static constexpr size_t kMaxCombatCards    = 3;
+    static constexpr size_t kMaxExplorationQ   = 6;
     static constexpr size_t kMaxHistory        = 30;
-    static constexpr float  kSemanticDedupSec  = 1.2f;
+    static constexpr float  kSemanticDedupSec  = 0.8f;
     static constexpr float  kAmbientP2CdSec    = 1.2f;
     static constexpr float  kPartnerMergeSec   = 2.0f;
     static constexpr float  kExitFadeSec       = 0.15f;
@@ -55,7 +55,7 @@ private:
     void record_history(uint64_t ts_ms, const SpeakerInfo* sp, SemanticTag tag, const std::string& text);
 
     const VoiceDatabase* db_ = nullptr;
-    VoiceDensity density_ = VoiceDensity::Balanced;
+    VoiceDensity density_ = VoiceDensity::Full;
     bool debug_log_missing_ = false;
 
     std::mutex queue_mu_;
@@ -65,7 +65,7 @@ private:
     uint32_t next_uid_ = 1;
     std::array<double, 16> last_tag_time_{};
     std::unordered_map<uint32_t, double> last_sp_tag_time_;
-    double last_p2_time_ = -100.0;
+    std::unordered_map<uint16_t, double> last_sp_p2_time_;
 
     UIVisibilityMode last_non_hidden_mode_ = UIVisibilityMode::Exploration;
     DirectorRenderState state_;

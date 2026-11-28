@@ -112,34 +112,31 @@ void VoiceDirector::process_event(const VoiceTriggerEvent& ev, const GameStateSn
         return;
     }
 
-    // 3. Semantic deduplication:
-    //    - SpecialReady / LowHPHelp / AggroWarning / HealPotion dedup per (speaker, tag) so Driver+Blade
-    //      partner merges and multi-party callouts never swallow each other within 1.2s.
-    //    - Break/Topple/Launch/Smash still dedup globally across party within 1.2s.
+    // 3. Per-speaker semantic deduplication (0.8s) so the same character never double-triggers,
+    //    while teammate call-and-response (e.g. Driver Break -> Blade follow-up) is never swallowed.
     if (cue->tag != SemanticTag::None && cue->tag != SemanticTag::Banter) {
-        if (cue->tag == SemanticTag::SpecialReady || cue->tag == SemanticTag::LowHPHelp ||
-            cue->tag == SemanticTag::AggroWarning || cue->tag == SemanticTag::HealPotion) {
-            const uint32_t key = (static_cast<uint32_t>(sp_id) << 8) | static_cast<uint32_t>(cue->tag);
-            auto it = last_sp_tag_time_.find(key);
-            if (it != last_sp_tag_time_.end() && (clock_sec_ - it->second) < kSemanticDedupSec) {
-                return;
+        const uint32_t key = (static_cast<uint32_t>(sp_id) << 8) | static_cast<uint32_t>(cue->tag);
+        auto it = last_sp_tag_time_.find(key);
+        if (it != last_sp_tag_time_.end() && (clock_sec_ - it->second) < kSemanticDedupSec) {
+            if (debug_log_missing_) {
+                NXLOG_I(kTag, "[DropDedup] event='%s' sp=%u tag=%u", ev.event_name, sp_id, static_cast<unsigned>(cue->tag));
             }
-            last_sp_tag_time_[key] = clock_sec_;
-        } else {
-            const size_t ti = static_cast<size_t>(cue->tag);
-            if (ti < last_tag_time_.size()) {
-                if (last_tag_time_[ti] > 0.0 && (clock_sec_ - last_tag_time_[ti]) < kSemanticDedupSec) {
-                    return;
-                }
-                last_tag_time_[ti] = clock_sec_;
-            }
+            return;
         }
+        last_sp_tag_time_[key] = clock_sec_;
     }
 
-    // 4. Global P2 ambient combat pacing (1.2s)
+    // 4. Per-speaker P2 ambient combat pacing (1.2s) so battle-start/encouragement back-and-forth
+    //    between different teammates (e.g. Rex -> Nia) is never swallowed.
     if (cue->priority == VoicePriority::P2_AmbientCombat) {
-        if ((clock_sec_ - last_p2_time_) < kAmbientP2CdSec) return;
-        last_p2_time_ = clock_sec_;
+        auto it = last_sp_p2_time_.find(sp_id);
+        if (it != last_sp_p2_time_.end() && (clock_sec_ - it->second) < kAmbientP2CdSec) {
+            if (debug_log_missing_) {
+                NXLOG_I(kTag, "[DropP2Cd] event='%s' sp=%u", ev.event_name, sp_id);
+            }
+            return;
+        }
+        last_sp_p2_time_[sp_id] = clock_sec_;
     }
 
     const float dur_hint = (ev.duration_sec > 0.f) ? ev.duration_sec : cue->duration_sec;
@@ -161,10 +158,11 @@ void VoiceDirector::process_event(const VoiceTriggerEvent& ev, const GameStateSn
 }
 
 void VoiceDirector::enqueue_combat(const CueEntry& cue, const SpeakerInfo* sp, float dur_hint, const GameStateSnapshot& gs) {
-    const std::string text = !cue.text_compact.empty()
-                                 ? cue.text_compact
-                                 : truncate_utf8(cue.text_full, 22);
-    const float target_dur = std::max(dur_hint, 1.8f);
+    // Always display the character's actual spoken line (text_full) rather than the generic tactical summary
+    // (text_compact); semantic tactical tags (必杀就绪 / 破防 / 倒地 / 危机) are already shown as header badges.
+    const std::string& raw_text = !cue.text_full.empty() ? cue.text_full : cue.text_compact;
+    const std::string text = truncate_utf8(raw_text, 28);
+    const float target_dur = std::max(dur_hint, 2.2f);
 
     // Check Driver + Blade partner merge within 2.0s
     if (sp && sp->partner_id != 0) {

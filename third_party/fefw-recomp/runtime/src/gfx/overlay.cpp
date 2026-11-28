@@ -299,6 +299,21 @@ void HudCanvas::measure_text(float size, const char* str, float* out_w, float* o
     if (out_w) *out_w = sz.x;
     if (out_h) *out_h = sz.y;
 }
+void HudCanvas::image(uint64_t tex_id, float x0, float y0, float x1, float y1,
+                      float u0, float v0, float u1, float v1, uint32_t tint_rgba) const {
+    if (!draw_list || !tex_id) return;
+    static_cast<ImDrawList*>(draw_list)->AddImage(
+        static_cast<ImTextureID>(tex_id), ImVec2(x0, y0), ImVec2(x1, y1),
+        ImVec2(u0, v0), ImVec2(u1, v1), rgba_to_imu32(tint_rgba));
+}
+void HudCanvas::image_rounded(uint64_t tex_id, float x0, float y0, float x1, float y1,
+                              float u0, float v0, float u1, float v1,
+                              float rounding, uint32_t tint_rgba) const {
+    if (!draw_list || !tex_id) return;
+    static_cast<ImDrawList*>(draw_list)->AddImageRounded(
+        static_cast<ImTextureID>(tex_id), ImVec2(x0, y0), ImVec2(x1, y1),
+        ImVec2(u0, v0), ImVec2(u1, v1), rgba_to_imu32(tint_rgba), rounding);
+}
 
 namespace {
 struct RibbonSink {
@@ -335,10 +350,19 @@ struct Overlay::Impl {
     std::mutex hud_mu;
     std::function<void(const HudCanvas&)> hud_cb;
     std::atomic<bool> has_hud_cb{false};
+    struct HudTex {
+        gfx::Image img;
+        VkDescriptorSet ds = VK_NULL_HANDLE;
+    };
+    std::mutex hud_tex_mu;
+    VkSampler hud_tex_sampler = VK_NULL_HANDLE;
+    std::vector<HudTex> hud_textures;
     std::mutex picker_mu;
     PickerCallbacks picker_cb;
     std::atomic<bool> picker_open{false};
     std::atomic<bool> want_picker_close{false};
+    std::atomic<bool> want_picker_clear{false};
+    std::atomic<int> picker_tab_delta{0};
     bool picker_restore_relative = false;
     char picker_filter[128] = {};
     int picker_tab = 0;  // 0=All, 1=Landmarks, 2=NPCs
@@ -781,6 +805,18 @@ Overlay::~Overlay() {
     if (!impl_) return;
     impl_->shutdown_perf_hud();
     if (impl_->ctx.device) impl_->ctx.device->wait_idle();
+    {
+        std::lock_guard<std::mutex> tlk(impl_->hud_tex_mu);
+        for (auto& ht : impl_->hud_textures) {
+            if (ht.ds && impl_->backend_ready) ImGui_ImplVulkan_RemoveTexture(ht.ds);
+            if (ht.img && impl_->ctx.device) impl_->ctx.device->destroy_image(ht.img);
+        }
+        impl_->hud_textures.clear();
+        if (impl_->hud_tex_sampler && impl_->ctx.device) {
+            vkDestroySampler(impl_->ctx.device->device(), impl_->hud_tex_sampler, nullptr);
+            impl_->hud_tex_sampler = VK_NULL_HANDLE;
+        }
+    }
     impl_->nav_ribbon.shutdown();
     impl_->composite.shutdown();
     if (impl_->backend_ready) ImGui_ImplVulkan_Shutdown();
@@ -1167,7 +1203,22 @@ uint64_t Overlay::set_menu_pad(uint64_t b, int lx, int ly) {
     if (dir((s.menu_stick & right) != 0, lx, true)) stick |= right;
     const uint64_t eff = b | stick, eff_prev = s.menu_prev | s.menu_stick;
     s.menu_stick = stick;
-    if (s.visible) {
+    const bool p_open = s.picker_open.load(std::memory_order_relaxed);
+    if (p_open && !s.visible) {
+        // Picker gamepad controls: B closes, L/R cycles tabs, X clears custom pin, D-pad/L-stick/A drive ImGui list.
+        const uint64_t fresh_unmasked = fresh & ~s.menu_mask;
+        if (fresh_unmasked & hid::btn(hid::kBtnB)) {
+            s.want_picker_close.store(true, std::memory_order_relaxed);
+            s.menu_mask |= b;
+        } else if (fresh_unmasked & hid::btn(hid::kBtnL)) {
+            s.picker_tab_delta.fetch_sub(1, std::memory_order_relaxed);
+        } else if (fresh_unmasked & hid::btn(hid::kBtnR)) {
+            s.picker_tab_delta.fetch_add(1, std::memory_order_relaxed);
+        } else if (fresh_unmasked & hid::btn(hid::kBtnX)) {
+            s.want_picker_clear.store(true, std::memory_order_relaxed);
+        }
+    }
+    if (s.visible || p_open) {
         // ImGui's gamepad keys, by the Switch button's meaning: A activates, B goes back (the game's own convention, after the player's
         // mapping); L / R and ZL / ZR are the shoulders (the menu switches its tabs with them). X, Y, + and - are not given to ImGui (Y would
         // be its windowing mode).
@@ -1192,7 +1243,7 @@ uint64_t Overlay::set_menu_pad(uint64_t b, int lx, int ly) {
     }
     s.menu_mask &= b;                // a button leaves the mask once released
     s.menu_prev = b;
-    return s.visible ? ~0ull : s.menu_mask;
+    return (s.visible || p_open) ? ~0ull : s.menu_mask;
 }
 
 bool Overlay::handle_event(const input::Event& e) {
@@ -1911,6 +1962,14 @@ void Overlay::draw(const FrameInfo& f) {
     if (p_open && !kb_on) {
         PickerCallbacks pcb;
         { std::lock_guard<std::mutex> plk(s.picker_mu); pcb = s.picker_cb; }
+        const int td = s.picker_tab_delta.exchange(0, std::memory_order_relaxed);
+        if (td != 0) s.picker_tab = ((s.picker_tab + td) % 3 + 3) % 3;
+        if (s.want_picker_clear.exchange(false, std::memory_order_relaxed) && s.picker_has_pin) {
+            if (pcb.clear) pcb.clear();
+            s.picker_has_pin = false;
+            s.picker_pin_name.clear();
+            s.want_picker_close.store(true);
+        }
         if (pcb.query && (now_s - s.picker_last_refresh_s > 0.35 || s.picker_items.empty())) {
             s.picker_items.clear();
             pcb.query(s.picker_items, s.picker_has_pin, s.picker_pin_name);
@@ -1918,20 +1977,26 @@ void Overlay::draw(const FrameInfo& f) {
         }
         const float W = static_cast<float>(f.extent.width);
         const float H = static_cast<float>(f.extent.height);
-        const float win_w = std::clamp(W * 0.38f, 440.f, 720.f);
-        const float win_h = std::clamp(H * 0.62f, 420.f, 760.f);
+        const float win_w = std::clamp(W * 0.38f, 460.f, 720.f);
+        const float win_h = std::clamp(H * 0.62f, 440.f, 760.f);
         ImGui::SetNextWindowPos(ImVec2((W - win_w) * 0.5f, (H - win_h) * 0.5f), ImGuiCond_Appearing);
         ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_Appearing);
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.08f, 0.13f, 0.92f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.28f, 0.76f, 0.96f, 0.72f));
+        // XC2 native obsidian-navy glass + launcher sky-blue (#56C8FA) accent styling
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.025f, 0.065f, 0.115f, 0.93f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.337f, 0.784f, 0.980f, 0.78f));
+        ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.045f, 0.115f, 0.190f, 0.96f));
+        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.055f, 0.155f, 0.255f, 0.98f));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.18f, 0.55f, 0.80f, 0.42f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.337f, 0.784f, 0.980f, 0.35f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.337f, 0.784f, 0.980f, 0.55f));
         bool open_flag = true;
-        if (ImGui::Begin("3D 导航目标选择 (F4 / Esc 关闭)", &open_flag, ImGuiWindowFlags_NoCollapse)) {
+        if (ImGui::Begin("3D 导航目标选择  [F4 / ZL+R3]", &open_flag, ImGuiWindowFlags_NoCollapse)) {
             if (s.picker_has_pin) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.68f, 1.0f, 1.0f));
-                ImGui::Text("当前自定义导航：%s", s.picker_pin_name.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.88f, 1.0f, 1.0f));
+                ImGui::Text("◆ 当前自定义导航：%s", s.picker_pin_name.c_str());
                 ImGui::PopStyleColor();
                 ImGui::SameLine();
-                if (ImGui::SmallButton("恢复自动追踪任务")) {
+                if (ImGui::SmallButton("[X] 恢复自动追踪任务")) {
                     if (pcb.clear) pcb.clear();
                     s.picker_has_pin = false;
                     s.picker_pin_name.clear();
@@ -1941,16 +2006,31 @@ void Overlay::draw(const FrameInfo& f) {
             }
             ImGui::SetNextItemWidth(-1.f);
             ImGui::InputTextWithHint("##nav_filter", "输入关键词搜索地标 / 传送点 / NPC...", s.picker_filter, sizeof s.picker_filter);
-            if (ImGui::RadioButton("全部", s.picker_tab == 0)) s.picker_tab = 0;
+            auto tab_btn = [&](const char* label, int idx) {
+                const bool sel = (s.picker_tab == idx);
+                if (sel) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.62f, 0.88f, 0.85f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.337f, 0.784f, 0.980f, 0.95f));
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.08f, 0.16f, 0.24f, 0.75f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.14f, 0.28f, 0.42f, 0.85f));
+                }
+                if (ImGui::Button(label)) s.picker_tab = idx;
+                ImGui::PopStyleColor(2);
+            };
+            tab_btn("全部", 0);
             ImGui::SameLine();
-            if (ImGui::RadioButton("地标 / 传送点", s.picker_tab == 1)) s.picker_tab = 1;
+            tab_btn("地标 / 传送点", 1);
             ImGui::SameLine();
-            if (ImGui::RadioButton("NPC", s.picker_tab == 2)) s.picker_tab = 2;
+            tab_btn("NPC", 2);
+            ImGui::SameLine();
+            ImGui::TextDisabled("  [L / R 切换]");
             ImGui::Separator();
 
             std::string flt = s.picker_filter;
             for (char& ch : flt) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            if (ImGui::BeginChild("##nav_list", ImVec2(0, 0), false)) {
+            const float footer_h = ImGui::GetFrameHeightWithSpacing() + 4.f;
+            if (ImGui::BeginChild("##nav_list", ImVec2(0, -footer_h), false)) {
                 int shown = 0;
                 for (const auto& it : s.picker_items) {
                     if (s.picker_tab == 1 && it.group != 0) continue;
@@ -1962,7 +2042,7 @@ void Overlay::draw(const FrameInfo& f) {
                     }
                     ++shown;
                     ImGui::PushID(static_cast<int>(it.id & 0x7FFFFFFFu));
-                    const char* badge = (it.group == 0) ? "[地标] " : "[NPC]  ";
+                    const char* badge = (it.group == 0) ? "◆ " : "● ";
                     const std::string row_label = std::string(badge) + it.name;
                     if (ImGui::Selectable(row_label.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
                         if (pcb.select) pcb.select(it.id);
@@ -1978,9 +2058,11 @@ void Overlay::draw(const FrameInfo& f) {
                 if (shown == 0) ImGui::TextDisabled("当前地图没有匹配的地标或 NPC");
             }
             ImGui::EndChild();
+            ImGui::Separator();
+            ImGui::TextDisabled("[A/Enter] 导航   [L/R] 切换分类   [X] 清除自定义   [B/Esc/ZL+R3] 关闭");
         }
         ImGui::End();
-        ImGui::PopStyleColor(2);
+        ImGui::PopStyleColor(7);
         if (!open_flag) s.want_picker_close.store(true);
     }
     s.ribbon_sink.active = false;
@@ -2092,6 +2174,89 @@ void Overlay::toggle_picker() {
 
 bool Overlay::picker_open() const {
     return impl_ && impl_->picker_open.load(std::memory_order_relaxed);
+}
+
+uint64_t Overlay::create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes) {
+    if (!impl_ || !impl_->backend_ready || !impl_->ctx.device || !bc3_linear || w < 4 || h < 4) return 0;
+    const size_t expected = static_cast<size_t>((w + 3u) / 4u) * static_cast<size_t>((h + 3u) / 4u) * 16ull;
+    if (bytes < expected) return 0;
+
+    Impl& s = *impl_;
+    Device& dev = *s.ctx.device;
+    std::lock_guard<std::mutex> tlk(s.hud_tex_mu);
+
+    if (!s.hud_tex_sampler) {
+        VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = VK_FILTER_LINEAR;
+        sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 0.0f;
+        if (vkCreateSampler(dev.device(), &sci, nullptr, &s.hud_tex_sampler) != VK_SUCCESS) {
+            return 0;
+        }
+    }
+
+    gfx::ImageDesc id;
+    id.format = VK_FORMAT_BC3_UNORM_BLOCK;
+    id.width = w;
+    id.height = h;
+    id.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    id.name = "hud_bc3_atlas";
+    gfx::Image img;
+    if (dev.create_image(id, &img) != VK_SUCCESS) return 0;
+
+    gfx::Buffer staging;
+    if (dev.create_buffer(expected, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gfx::MemoryUse::Upload, &staging, "hud_bc3_stage") != VK_SUCCESS) {
+        dev.destroy_image(img);
+        return 0;
+    }
+    if (!staging.mapped) {
+        dev.destroy_buffer(staging);
+        dev.destroy_image(img);
+        return 0;
+    }
+    std::memcpy(staging.mapped, bc3_linear, expected);
+    dev.flush_buffer(staging);
+
+    dev.submit_once([&](VkCommandBuffer cb) {
+        VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1;
+        di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cb, &di);
+
+        VkBufferImageCopy reg = {};
+        reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        reg.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cb, staging.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+
+        b.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier2(cb, &di);
+    });
+    dev.destroy_buffer(staging);
+
+    VkDescriptorSet ds = ImGui_ImplVulkan_AddTexture(s.hud_tex_sampler, img.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (!ds) {
+        dev.destroy_image(img);
+        return 0;
+    }
+    s.hud_textures.push_back({img, ds});
+    NXLOG_I(kTag, "uploaded HUD BC3 texture %ux%u (%zu KiB)", w, h, expected / 1024u);
+    return reinterpret_cast<uint64_t>(ds);
 }
 
 }  // namespace nxrt::gfx

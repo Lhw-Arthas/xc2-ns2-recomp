@@ -4,9 +4,176 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <vector>
+
+#include "nxrt/log.h"
+#include "nxrt/play.h"
+#include "../xc2_nav_mesh.h"
 
 namespace xc2::voice {
 namespace {
+
+constexpr const char* kTag = "voice.ui";
+
+// ---- Runtime XC2 Character Portrait Atlas (loaded lazily from player's own bf2.arh) ----
+// Zero copyrighted assets in repo: decodes Tegra Block Linear BC3 directly from /menu/image/face.wilay
+// (base game Drivers + Blades) and /menu/image/dlc3_btl_face.wilay (Torna DLC 9 playable heroes).
+struct PortraitUV {
+    uint64_t tex_id = 0;
+    float u0 = 0.f, v0 = 0.f, u1 = 0.f, v1 = 0.f;
+};
+
+struct PortraitAtlas {
+    bool tried = false;
+    uint64_t face_tex = 0;        // /menu/image/face.wilay (2048x6656, 8x26 cells of 256x256)
+    uint32_t face_cols = 8;
+    uint32_t face_rows = 26;
+    uint64_t torna_tex = 0;       // /menu/image/dlc3_btl_face.wilay (2048x512, 8x2 cells of 256x256)
+    uint32_t torna_cols = 8;
+    uint32_t torna_rows = 2;
+
+    static uint32_t rd32(const uint8_t* p) {
+        uint32_t v = 0;
+        std::memcpy(&v, p, 4);
+        return v;
+    }
+
+    static bool untile_and_upload_wilay(const char* path, uint64_t& out_tex, uint32_t& out_cols, uint32_t& out_rows) {
+        std::vector<uint8_t> raw;
+        if (!xc2::nav::read_archive_file(path, raw) || raw.size() < 0x1040) return false;
+        // Locate trailing LBIM footer (40 bytes at end of file)
+        if (std::memcmp(raw.data() + raw.size() - 4, "LBIM", 4) != 0) return false;
+        const uint8_t* lb = raw.data() + raw.size() - 0x28;
+        const uint32_t img_sz = rd32(lb + 0x00);
+        const uint32_t w      = rd32(lb + 0x08);
+        const uint32_t h      = rd32(lb + 0x0C);
+        const uint32_t fmt    = rd32(lb + 0x18);
+        if (fmt != 68u || w < 256u || h < 256u || (w & 3u) || (h & 3u)) return false;
+        if (0x1000ull + img_sz > raw.size()) return false;
+
+        const uint32_t bw = w / 4u;
+        const uint32_t bh = h / 4u;
+        const size_t lin_bytes = static_cast<size_t>(bw) * static_cast<size_t>(bh) * 16ull;
+        if (img_sz < lin_bytes) return false;
+
+        const uint32_t gobs_x = (bw * 16u + 63u) / 64u;
+        uint32_t bh_gobs = 16u;
+        while (bh_gobs > 1u && (bh_gobs / 2u) * 8u >= bh) bh_gobs /= 2u;
+        const uint32_t gob_h = 8u * bh_gobs;
+        const size_t block_bytes = 512ull * bh_gobs;
+
+        const uint8_t* src = raw.data() + 0x1000;
+        std::vector<uint8_t> lin(lin_bytes, 0);
+        for (uint32_t y = 0; y < bh; ++y) {
+            const uint32_t by = y / gob_h;
+            const uint32_t gy = (y % gob_h) / 8u;
+            const uint32_t ly = y & 7u;
+            for (uint32_t bx = 0; bx < bw; ++bx) {
+                const uint32_t x_byte = bx * 16u;
+                const uint32_t gx = x_byte / 64u;
+                const uint32_t lx = x_byte & 63u;
+                const uint32_t gob_off =
+                    ((lx & 0x20u) >> 5) * 256u +
+                    ((ly & 0x06u) >> 1) * 64u +
+                    ((lx & 0x10u) >> 4) * 32u +
+                    (ly & 1u) * 16u +
+                    (lx & 0x0Fu);
+                const size_t src_off = (static_cast<size_t>(by) * gobs_x + gx) * block_bytes +
+                                       static_cast<size_t>(gy) * 512ull + gob_off;
+                if (src_off + 16ull <= img_sz) {
+                    std::memcpy(lin.data() + (static_cast<size_t>(y) * bw + bx) * 16ull, src + src_off, 16);
+                }
+            }
+        }
+
+        out_tex = nxrt::play::create_hud_texture_bc3(w, h, lin.data(), lin.size());
+        if (!out_tex) return false;
+        out_cols = w / 256u;
+        out_rows = h / 256u;
+        NXLOG_I(kTag, "loaded portrait atlas %s (%ux%u, %ux%u cells)", path, w, h, out_cols, out_rows);
+        return true;
+    }
+
+    void ensure_loaded() {
+        if (tried) return;
+        tried = true;
+        untile_and_upload_wilay("/menu/image/face.wilay", face_tex, face_cols, face_rows);
+        untile_and_upload_wilay("/menu/image/dlc3_btl_face.wilay", torna_tex, torna_cols, torna_rows);
+    }
+
+    bool lookup(uint16_t speaker_id, PortraitUV& out) {
+        ensure_loaded();
+        // Torna: The Golden Country (701..709) -> dlc3_btl_face.wilay (8x2 grid)
+        if (speaker_id >= 701 && speaker_id <= 709 && torna_tex && torna_cols > 0 && torna_rows > 0) {
+            const uint32_t idx = static_cast<uint32_t>(speaker_id - 701);
+            const uint32_t col = idx % torna_cols;
+            const uint32_t row = idx / torna_cols;
+            // Slight 3% inset avoids bleeding from adjacent cells under linear filtering
+            const float pad_u = 0.03f / static_cast<float>(torna_cols);
+            const float pad_v = 0.03f / static_cast<float>(torna_rows);
+            out.tex_id = torna_tex;
+            out.u0 = static_cast<float>(col) / static_cast<float>(torna_cols) + pad_u;
+            out.v0 = static_cast<float>(row) / static_cast<float>(torna_rows) + pad_v;
+            out.u1 = static_cast<float>(col + 1) / static_cast<float>(torna_cols) - pad_u;
+            out.v1 = static_cast<float>(row + 1) / static_cast<float>(torna_rows) - pad_v;
+            return true;
+        }
+        // Base game Drivers & Story/Rare Blades -> face.wilay (8x26 grid)
+        if (!face_tex || face_cols == 0 || face_rows == 0) return false;
+        int cell = -1;
+        switch (speaker_id) {
+            // Drivers (Row 1)
+            case 1:  cell = 8;  break;  // 莱克斯 Rex
+            case 2:  cell = 9;  break;  // 尼娅 Nia
+            case 3:  cell = 11; break;  // 虎 Tora
+            case 4:  cell = 13; break;  // 范达姆 Vandham
+            case 5:  cell = 12; break;  // 梅勒芙 Morag
+            case 6:  cell = 10; break;  // 齐格 Zeke
+            case 7:  cell = 14; break;  // 真 Jin
+            case 8:  cell = 15; break;  // 灭 Malos
+            // Story Blades (Row 0 & Row 3)
+            case 11: cell = 0;  break;  // 焰 Pyra
+            case 12: cell = 1;  break;  // 光 Mythra
+            case 13: cell = 2;  break;  // 灵魂之声 Pneuma
+            case 14: cell = 4;  break;  // 白虎 Dromarch
+            case 15: cell = 5;  break;  // 花JS Poppi α
+            case 16: cell = 6;  break;  // 花JK Poppi QT
+            case 17: cell = 7;  break;  // 花JD Poppi QTπ
+            case 18: cell = 26; break;  // 朱雀 Roc
+            case 19: cell = 25; break;  // 迦具土 Brighid
+            case 20: cell = 24; break;  // 彩歌 Pandoria
+            case 21: cell = 3;  break;  // 尼娅 (异刃)
+            // Torna Org & Verified Rare Blades (Row 2 & 3)
+            case 23: cell = 17; break;  // 义经 Akhos
+            case 31: cell = 27; break;  // 绵津见 Aegaeon
+            case 32: cell = 16; break;  // 红莲 Godfrey
+            case 33: cell = 21; break;  // 力男 Gorg
+            case 35: cell = 18; break;  // 雄黄 Wulfric
+            case 37: cell = 22; break;  // 韦驮天 Boreas
+            case 39: cell = 23; break;  // 重音 Kasandra
+            case 49: cell = 20; break;  // 结 Electra
+            default: break;
+        }
+        if (cell < 0) return false;
+        const uint32_t col = static_cast<uint32_t>(cell) % face_cols;
+        const uint32_t row = static_cast<uint32_t>(cell) / face_cols;
+        if (row >= face_rows) return false;
+        const float pad_u = 0.03f / static_cast<float>(face_cols);
+        const float pad_v = 0.03f / static_cast<float>(face_rows);
+        out.tex_id = face_tex;
+        out.u0 = static_cast<float>(col) / static_cast<float>(face_cols) + pad_u;
+        out.v0 = static_cast<float>(row) / static_cast<float>(face_rows) + pad_v;
+        out.u1 = static_cast<float>(col + 1) / static_cast<float>(face_cols) - pad_u;
+        out.v1 = static_cast<float>(row + 1) / static_cast<float>(face_rows) - pad_v;
+        return true;
+    }
+};
+
+PortraitAtlas& portraits() {
+    static PortraitAtlas s;
+    return s;
+}
 
 const char* tag_label(SemanticTag t) {
     switch (t) {
@@ -32,28 +199,36 @@ uint32_t tag_badge_color(SemanticTag t) {
         case SemanticTag::AggroWarning:
         case SemanticTag::LowHPHelp:    return 0xEF4444FFu;  // Warning Red
         case SemanticTag::HealPotion:   return 0x10B981FFu;  // Mint Green
-        default:                        return 0x38BDF8FFu;
+        default:                        return 0x56C8FAFFu;  // Sky Blue
     }
 }
 
-}  // namespace
+// Draw an authentic XC2 circular portrait medallion using the player's own in-game face atlas,
+// falling back to a stylized Core-Crystal diamond monogram for speakers without a portrait cell.
+void draw_portrait_medallion(const nxrt::gfx::HudCanvas& c, float cx, float cy, float radius,
+                             uint16_t speaker_id, uint32_t fill_rgba, uint32_t ring_rgba,
+                             const std::string& glyph, float alpha) {
+    PortraitUV uv;
+    if (portraits().lookup(speaker_id, uv)) {
+        // Outer dark drop shadow + obsidian backing plate
+        c.circle_filled(cx, cy, radius + 3.0f, with_alpha(0x040A12D8u, alpha), 32);
+        c.circle_filled(cx, cy, radius, with_alpha(0x0A1624F0u, alpha), 32);
+        // Real in-game portrait cropped cleanly into the circular frame
+        const float img_r = radius - 1.5f;
+        c.image_rounded(uv.tex_id, cx - img_r, cy - img_r, cx + img_r, cy + img_r,
+                        uv.u0, uv.v0, uv.u1, uv.v1, img_r, with_alpha(0xFFFFFFFFu, alpha));
+        // Double-layer XC2 Aether ring (crisp colored outer rim + subtle white inner bevel)
+        c.circle(cx, cy, radius + 0.8f, with_alpha(ring_rgba, alpha * 0.95f), std::max(1.8f, radius * 0.085f), 32);
+        c.circle(cx, cy, radius - 1.4f, with_alpha(0xE6F7FF58u, alpha), 1.0f, 32);
+        // Tiny Core-Crystal diamond tick at top of ring (signature XC2 motif)
+        const float dr = std::max(2.6f, radius * 0.14f);
+        const float dy = cy - radius - 0.8f;
+        c.quad_filled(cx, dy - dr, cx + dr, dy, cx, dy + dr, cx - dr, dy, with_alpha(ring_rgba, alpha));
+        return;
+    }
 
-VoiceRenderer::SafeRect VoiceRenderer::compute_safe_rect(uint32_t vp_w, uint32_t vp_h) {
-    SafeRect sr;
-    const float fw = static_cast<float>(vp_w);
-    const float fh = static_cast<float>(vp_h);
-    sr.h = fh;
-    sr.w = std::min(fw, fh * (16.0f / 9.0f));
-    sr.x = (fw - sr.w) * 0.5f;
-    sr.y = 0.0f;
-    sr.scale = std::max(0.5f, sr.h / 1080.0f);
-    return sr;
-}
-
-void VoiceRenderer::draw_diamond_avatar(const nxrt::gfx::HudCanvas& c, float cx, float cy,
-                                        float half_diag, uint32_t fill_rgba, uint32_t border_rgba,
-                                        const std::string& glyph, float alpha) {
-    // 45-degree rotated Core Crystal diamond frame
+    // Fallback: Core-Crystal 45° diamond monogram for generic/unmapped Blades
+    const float half_diag = radius * 1.02f;
     const float outer[8] = {
         cx,             cy - half_diag,
         cx + half_diag, cy,
@@ -67,56 +242,82 @@ void VoiceRenderer::draw_diamond_avatar(const nxrt::gfx::HudCanvas& c, float cx,
         cx,           cy + inner_r,
         cx - inner_r, cy,
     };
-
-    // Dark backing plate + colored core fill + Core Crystal facet highlight + crisp bevel border
-    c.convex_poly_filled(outer, 4, with_alpha(0x0B121EE8u, alpha));
-    c.convex_poly_filled(inner, 4, with_alpha(fill_rgba, alpha * 0.90f));
-    // Upper-left Core Crystal specular facet for authentic XC2 crystal depth
+    c.convex_poly_filled(outer, 4, with_alpha(0x07111EE8u, alpha));
+    c.convex_poly_filled(inner, 4, with_alpha(fill_rgba, alpha * 0.88f));
     c.triangle_filled(cx, cy - inner_r, cx + inner_r * 0.55f, cy - inner_r * 0.15f,
                       cx - inner_r * 0.85f, cy, with_alpha(0xFFFFFF44u, alpha));
-    c.polyline(outer, 4, with_alpha(border_rgba, alpha), true, std::max(1.2f, half_diag * 0.09f));
+    c.polyline(outer, 4, with_alpha(ring_rgba, alpha), true, std::max(1.5f, half_diag * 0.085f));
     c.polyline(inner, 4, with_alpha(0xFFFFFF48u, alpha), true, 1.0f);
 
     if (!glyph.empty()) {
-        const float font_sz = std::max(11.0f, half_diag * 1.05f);
+        const float font_sz = std::max(13.0f, half_diag * 0.96f);
         float tw = 0.f, th = 0.f;
         c.measure_text(font_sz, glyph.c_str(), &tw, &th);
         c.text_outlined(cx - tw * 0.5f, cy - th * 0.5f, font_sz,
                         with_alpha(0xFFFFFFFFu, alpha),
-                        with_alpha(0x000000D0u, alpha),
+                        with_alpha(0x000000D8u, alpha),
                         glyph.c_str());
     }
+}
+
+}  // namespace
+
+VoiceRenderer::SafeRect VoiceRenderer::compute_safe_rect(uint32_t vp_w, uint32_t vp_h) {
+    SafeRect sr;
+    const float fw = static_cast<float>(vp_w);
+    const float fh = static_cast<float>(vp_h);
+    sr.h = fh;
+    sr.w = std::min(fw, fh * (16.0f / 9.0f));
+    sr.x = (fw - sr.w) * 0.5f;
+    sr.y = 0.0f;
+    sr.scale = std::max(0.55f, sr.h / 1080.0f);
+    return sr;
+}
+
+void VoiceRenderer::draw_diamond_avatar(const nxrt::gfx::HudCanvas& c, float cx, float cy,
+                                        float half_diag, uint32_t fill_rgba, uint32_t border_rgba,
+                                        const std::string& glyph, float alpha) {
+    draw_portrait_medallion(c, cx, cy, half_diag, 0, fill_rgba, border_rgba, glyph, alpha);
 }
 
 void VoiceRenderer::render_combat_strip(const nxrt::gfx::HudCanvas& c, const SafeRect& sr,
                                         const DirectorRenderState& st) const {
     if (st.combat_cards.empty()) return;
 
+    // Larger, high-legibility left-side XC2 tactical comms cards anchored below party HP HUD
     const float base_x   = sr.x + sr.w * 0.022f;
-    const float base_y   = sr.y + sr.h * 0.41f;
-    const float card_w   = sr.w * 0.235f;
-    const float row_h    = sr.h * 0.048f;
-    const float gap      = sr.h * 0.010f;
-    const float chamfer  = 8.0f * sr.scale;
-    const float border_w = std::max(1.2f, 1.5f * sr.scale);
+    const float base_y   = sr.y + sr.h * 0.39f;
+    const float min_w    = sr.w * 0.285f;
+    const float max_w    = sr.w * 0.425f;
+    const float row_h    = sr.h * 0.068f;  // ~73px @ 1080p (up from 52px)
+    const float gap      = sr.h * 0.014f;
+    const float chamfer  = 11.0f * sr.scale;
+    const float border_w = std::max(1.5f, 1.8f * sr.scale);
 
-    // Layout active (non-exiting) cards from newest (slot 0) upward/downward cleanly
-    // Spec: stationary slots starting at base_y, older card sits in upper slot (slot 0), newer in lower slot (slot 1)
-    // or newest pushes older up by 1 slot. We stack from top (older) to bottom (newer).
-    int active_idx = 0;
     float cur_y = base_y;
     for (const auto& card : st.combat_cards) {
         const float a = card.alpha * st.global_alpha;
         if (a <= 0.005f) continue;
 
         const bool merged = (card.partner_speaker_id != 0 && !card.text_line2.empty());
-        const float card_h = merged ? (row_h * 1.48f) : row_h;
+        const float card_h = merged ? (row_h * 1.44f) : row_h;
         const float y0 = cur_y + card.y_offset * (row_h + gap);
         const float y1 = y0 + card_h;
-        const float x0 = base_x;
-        const float x1 = base_x + card_w;
 
-        // 45-degree chamfered top-left and bottom-right 6-vertex polygon
+        const float name_sz = std::max(14.0f, 17.5f * sr.scale);
+        const float body_sz = std::max(16.0f, 21.0f * sr.scale);
+
+        // Dynamically size card width to fit text cleanly without truncation
+        float l1_w = 0.f, l1_h = 0.f, l2_w = 0.f, l2_h = 0.f;
+        c.measure_text(body_sz, card.text_line1.c_str(), &l1_w, &l1_h);
+        if (merged) c.measure_text(body_sz * 0.94f, card.text_line2.c_str(), &l2_w, &l2_h);
+        const float text_left_pad = (merged ? 92.0f : 78.0f) * sr.scale;
+        const float card_w = std::clamp(text_left_pad + std::max(l1_w, l2_w) + 56.0f * sr.scale, min_w, max_w);
+
+        const float x0 = base_x + 12.0f * sr.scale;  // room for overlapping portrait medallion
+        const float x1 = x0 + card_w;
+
+        // 45-degree chamfered XC2 obsidian-navy glass plate
         const float poly[12] = {
             x0 + chamfer, y0,
             x1,           y0,
@@ -125,181 +326,226 @@ void VoiceRenderer::render_combat_strip(const nxrt::gfx::HudCanvas& c, const Saf
             x0,           y1,
             x0,           y0 + chamfer,
         };
+        // Smooth two-zone horizontal gradient: rich dark obsidian on left, airy fade-out on right
+        const float x_mid = x0 + card_w * 0.68f;
+        c.convex_poly_hgrad(poly, 6, x0, x1, with_alpha(0x06101CEBu, a), with_alpha(0x06101C00u, a));
+        // Subtle inner top specular sheen
+        c.rect_filled_hgrad(x0 + chamfer, y0 + border_w, x_mid, y0 + border_w + 1.5f * sr.scale,
+                            with_alpha(0xBFE3F728u, a), with_alpha(0xBFE3F700u, a));
 
-        // Horizontal linear gradient: rgba(12,18,28,0.86) -> rgba(12,18,28,0.0)
-        const uint32_t bg_left  = with_alpha(0x0C121CDBu, a);
-        const uint32_t bg_right = with_alpha(0x0C121C00u, a);
-        c.convex_poly_hgrad(poly, 6, x0, x1, bg_left, bg_right);
-
-        // Dynamic border color
-        uint32_t stroke_col = 0x38BDF8A6u;  // Ether Cyan @ 65%
+        // Dynamic Aether border color (Launcher Sky Blue default, Gold Affinity, or Warning Red)
+        uint32_t stroke_col = 0x56C8FAEEu;
         if (card.semantic_tag == SemanticTag::AggroWarning ||
             card.semantic_tag == SemanticTag::LowHPHelp) {
-            stroke_col = 0xEF4444F0u;       // Warning Red
+            stroke_col = 0xEF4444F5u;
         } else if (card.is_gold_affinity) {
-            stroke_col = 0xF5C542F0u;       // Gold Affinity
+            stroke_col = 0xF5C542F5u;
         }
-        // Left-side accent polyline (top-left chamfer + left edge + bottom-left corner, fading cleanly on right)
+
+        // Crisp left-side glowing accent bar + top-left chamfered rail
         const float accent_edge[8] = {
-            x0 + card_w * 0.55f, y0,
+            x0 + card_w * 0.62f, y0,
             x0 + chamfer,        y0,
             x0,                  y0 + chamfer,
             x0,                  y1,
         };
-        c.polyline(accent_edge, 4, with_alpha(stroke_col, a), false, border_w);
-        // Subtle bottom-left to bottom-right hairline
+        c.polyline(accent_edge, 4, with_alpha(stroke_col, a * 0.92f), false, border_w);
+        // Bottom fading Aether hairline
         c.rect_filled_hgrad(x0, y1 - border_w, x1 - chamfer, y1,
-                            with_alpha(stroke_col, a * 0.75f),
+                            with_alpha(stroke_col, a * 0.78f),
                             with_alpha(stroke_col, 0.f));
+        // Subtle inner vertical speaker-color accent strip right behind portrait
+        c.rect_filled(x0 + 2.0f * sr.scale, y0 + chamfer + 2.0f * sr.scale,
+                      x0 + 5.5f * sr.scale, y1 - 4.0f * sr.scale,
+                      with_alpha(card.primary_color_rgba, a * 0.85f), 1.5f * sr.scale);
 
-        // Left Core Crystal 45° diamond avatar
-        const float diag = 16.0f * sr.scale;  // 32px full span
-        const float av_cx = x0 + 24.0f * sr.scale;
-        const float av_cy = (y0 + y1) * 0.5f - (merged ? 3.0f * sr.scale : 0.f);
-        draw_diamond_avatar(c, av_cx, av_cy, diag, card.primary_color_rgba, stroke_col,
-                            card.primary_glyph, a);
+        // Oversized circular in-game character portrait slightly overlapping the left/top edge (XC2 party HUD style)
+        const float av_r  = 29.0f * sr.scale;  // 58px diameter @ 1080p
+        const float av_cx = x0 + 26.0f * sr.scale;
+        const float av_cy = (y0 + y1) * 0.5f - (merged ? 6.0f * sr.scale : 2.0f * sr.scale);
+        draw_portrait_medallion(c, av_cx, av_cy, av_r, card.primary_speaker_id,
+                                card.primary_color_rgba, stroke_col, card.primary_glyph, a);
 
         if (merged) {
-            const float sub_diag = diag * 0.65f;
-            draw_diamond_avatar(c, av_cx + diag * 0.68f, av_cy + diag * 0.62f, sub_diag,
-                                card.partner_color_rgba, 0xF5C542EEu, card.partner_glyph, a);
+            const float sub_r = 18.0f * sr.scale;
+            draw_portrait_medallion(c, av_cx + av_r * 0.76f, av_cy + av_r * 0.64f, sub_r,
+                                    card.partner_speaker_id, card.partner_color_rgba,
+                                    0xF5C542F2u, card.partner_glyph, a);
         }
 
-        // Text column
-        const float tx = x0 + (merged ? 54.0f : 48.0f) * sr.scale;
-        const float name_sz = std::max(12.0f, 15.0f * sr.scale);
-        const float body_sz = std::max(13.0f, 17.5f * sr.scale);
-        const float header_y = y0 + 5.0f * sr.scale;
+        // Speaker header + semantic badge + crisp dialogue body
+        const float tx = x0 + text_left_pad;
+        const float header_y = y0 + 8.0f * sr.scale;
 
-        // Speaker name (+ partner name if merged)
         std::string header = card.primary_name;
         if (merged && !card.partner_name.empty()) {
-            header += " & " + card.partner_name;
+            header += "  &  " + card.partner_name;
         }
         c.text_outlined(tx, header_y, name_sz,
                         with_alpha(card.primary_color_rgba, a),
-                        with_alpha(0x000000D8u, a),
+                        with_alpha(0x000000E0u, a),
                         header.c_str());
 
-        // Optional semantic tag pill beside speaker name
         if (const char* tl = tag_label(card.semantic_tag)) {
             float nw = 0.f, nh = 0.f;
             c.measure_text(name_sz, header.c_str(), &nw, &nh);
-            const float px = tx + nw + 8.0f * sr.scale;
-            const float pill_sz = std::max(10.5f, 12.5f * sr.scale);
+            const float px = tx + nw + 10.0f * sr.scale;
+            const float pill_sz = std::max(12.0f, 13.5f * sr.scale);
             float pw = 0.f, ph = 0.f;
             c.measure_text(pill_sz, tl, &pw, &ph);
-            const float pad_x = 5.0f * sr.scale;
+            const float pad_x = 7.0f * sr.scale;
+            const float pad_y = 2.0f * sr.scale;
             const uint32_t bc = tag_badge_color(card.semantic_tag);
-            c.rect_filled(px, header_y + 1.0f * sr.scale, px + pw + pad_x * 2.f,
-                          header_y + ph + 2.0f * sr.scale, with_alpha(bc, a * 0.28f), 2.5f * sr.scale);
-            c.rect(px, header_y + 1.0f * sr.scale, px + pw + pad_x * 2.f,
-                   header_y + ph + 2.0f * sr.scale, with_alpha(bc, a * 0.85f), 2.5f * sr.scale, 1.0f);
-            c.text(px + pad_x, header_y + 1.5f * sr.scale, pill_sz, with_alpha(0xFFFFFFFFu, a), tl);
+            const float bx0 = px, by0 = header_y + (nh - ph) * 0.5f - pad_y;
+            const float bx1 = px + pw + pad_x * 2.f, by1 = by0 + ph + pad_y * 2.f;
+            const float bcut = 4.0f * sr.scale;
+            c.quad_filled(bx0 + bcut, by0, bx1, by0, bx1 - bcut, by1, bx0, by1, with_alpha(bc, a * 0.34f));
+            c.line(bx0 + bcut, by0, bx1, by0, with_alpha(bc, a * 0.92f), 1.2f * sr.scale);
+            c.text_outlined(bx0 + pad_x, by0 + pad_y, pill_sz, with_alpha(0xFFFFFFFFu, a), with_alpha(0x000000C8u, a), tl);
         }
 
+        // Subtle divider hairline between speaker name and dialogue text
+        const float sep_y = header_y + name_sz + 3.0f * sr.scale;
+        c.rect_filled_hgrad(tx, sep_y, x1 - 24.0f * sr.scale, sep_y + 1.0f,
+                            with_alpha(stroke_col, a * 0.38f), with_alpha(stroke_col, 0.f));
+
         // Line 1 text
-        const float l1_y = y0 + 23.0f * sr.scale;
+        const float l1_y = sep_y + 6.0f * sr.scale;
         c.text_outlined(tx, l1_y, body_sz,
                         with_alpha(0xF8FAFCFFu, a),
-                        with_alpha(0x000000E0u, a),
+                        with_alpha(0x000000E8u, a),
                         card.text_line1.c_str());
 
         // Line 2 text (Driver + Blade merged response)
         if (merged) {
-            const float l2_y = l1_y + 22.0f * sr.scale;
+            const float l2_y = l1_y + 27.0f * sr.scale;
             c.text_outlined(tx, l2_y, body_sz * 0.94f,
                             with_alpha(0xFDE68AFFu, a),
-                            with_alpha(0x000000E0u, a),
+                            with_alpha(0x000000E8u, a),
                             card.text_line2.c_str());
         }
 
         if (!card.exiting) {
             cur_y += card_h + gap;
-            ++active_idx;
         }
     }
-    (void)active_idx;
 }
 
 void VoiceRenderer::render_exploration_bar(const nxrt::gfx::HudCanvas& c, const SafeRect& sr,
                                            const DirectorRenderState& st) const {
     if (st.exploration_lines.empty()) return;
 
+    const auto& cur_line = st.exploration_lines.back();
+    const float cur_a = cur_line.alpha * st.global_alpha;
+    if (cur_a <= 0.005f) return;
+
     const float cx = sr.x + sr.w * 0.5f;
-    // Shift slightly upward if 3D nav skip-travel banner is occupying the bottom band
-    const float base_y = sr.y + sr.h * (st.nav_bottom_busy ? 0.78f : 0.84f);
-    const float name_sz = std::max(14.0f, 18.0f * sr.scale);
-    const float body_sz = std::max(16.0f, 22.0f * sr.scale);
+    // Native XC2 bottom dialogue band (lifts slightly if bottom nav hint is active)
+    const float box_h = 84.0f * sr.scale;
+    const float y0 = sr.y + sr.h * (st.nav_bottom_busy ? 0.74f : 0.80f);
+    const float y1 = y0 + box_h;
 
-    // Measure widest line to size the soft protective backdrop & pale gold rule
-    float max_w = sr.w * 0.34f;
-    for (const auto& l : st.exploration_lines) {
-        float bw = 0.f, bh = 0.f;
-        c.measure_text(body_sz, l.text_line1.c_str(), &bw, &bh);
-        if (bw + 80.f * sr.scale > max_w) max_w = bw + 80.f * sr.scale;
-    }
-    const float half_w = std::min(sr.w * 0.44f, max_w * 0.5f);
+    const float name_sz = std::max(15.5f, 19.5f * sr.scale);
+    const float body_sz = std::max(18.0f, 23.5f * sr.scale);
 
-    const float top_alpha = st.exploration_lines.back().alpha * st.global_alpha;
-    if (top_alpha <= 0.005f) return;
+    // Measure dialogue width so the XC2 dialogue plate hugs the text naturally
+    float bw = 0.f, bh = 0.f, nw = 0.f, nh = 0.f;
+    c.measure_text(body_sz, cur_line.text_line1.c_str(), &bw, &bh);
+    c.measure_text(name_sz, cur_line.primary_name.c_str(), &nw, &nh);
+    const float portrait_space = 96.0f * sr.scale;
+    const float content_w = std::max(bw, nw + 40.0f * sr.scale);
+    const float plate_w = std::clamp(portrait_space + content_w + 54.0f * sr.scale,
+                                     sr.w * 0.38f, sr.w * 0.60f);
+    const float x0 = cx - plate_w * 0.5f;
+    const float x1 = cx + plate_w * 0.5f;
+    const float wing_w = 48.0f * sr.scale;
+    const float chamfer = 12.0f * sr.scale;
 
-    // Soft center-weighted dark vignette mask (two opposing horizontal gradients)
-    const float vig_top = base_y - (st.exploration_lines.size() > 1 ? 54.0f : 26.0f) * sr.scale;
-    const float vig_bot = base_y + 42.0f * sr.scale;
-    c.rect_filled_hgrad(cx - half_w * 1.18f, vig_top, cx, vig_bot,
-                        with_alpha(0x060A1200u, top_alpha),
-                        with_alpha(0x060A1288u, top_alpha));
-    c.rect_filled_hgrad(cx, vig_top, cx + half_w * 1.18f, vig_bot,
-                        with_alpha(0x060A1288u, top_alpha),
-                        with_alpha(0x060A1200u, top_alpha));
+    // 1. Soft feathered side wings + central 45° chamfered XC2 obsidian-navy dialogue plate
+    c.rect_filled_hgrad(x0 - wing_w, y0, x0 + chamfer, y1,
+                        with_alpha(0x06101C00u, cur_a), with_alpha(0x06101CD8u, cur_a));
+    c.rect_filled_hgrad(x1 - chamfer, y0, x1 + wing_w, y1,
+                        with_alpha(0x06101CD8u, cur_a), with_alpha(0x06101C00u, cur_a));
+    const float plate[12] = {
+        x0 + chamfer, y0,
+        x1,           y0,
+        x1,           y1 - chamfer,
+        x1 - chamfer, y1,
+        x0,           y1,
+        x0,           y0 + chamfer,
+    };
+    c.convex_poly_filled(plate, 6, with_alpha(0x071220E2u, cur_a));
 
-    // 1px pale gold horizontal decorative rule (fading out on both ends)
-    const float rule_y = base_y - 4.0f * sr.scale;
-    const float rule_h = std::max(1.0f, 1.2f * sr.scale);
-    c.rect_filled_hgrad(cx - half_w, rule_y, cx, rule_y + rule_h,
-                        with_alpha(0xE8D28C00u, top_alpha),
-                        with_alpha(0xE8D28CC8u, top_alpha));
-    c.rect_filled_hgrad(cx, rule_y, cx + half_w, rule_y + rule_h,
-                        with_alpha(0xE8D28CC8u, top_alpha),
-                        with_alpha(0xE8D28C00u, top_alpha));
+    // 2. Twin XC2 Aether horizontal rails (sky-blue + warm pale gold shimmer fading at both wings)
+    const float rail_h = std::max(1.4f, 1.8f * sr.scale);
+    const uint32_t top_col = 0x56C8FAEEu;   // Sky Blue Aether
+    const uint32_t bot_col = 0xE8D28CCCu;   // XC2 Pale Gold
+    c.rect_filled_hgrad(x0 - wing_w * 0.8f, y0, cx, y0 + rail_h,
+                        with_alpha(top_col, 0.f), with_alpha(top_col, cur_a));
+    c.rect_filled_hgrad(cx, y0, x1 + wing_w * 0.8f, y0 + rail_h,
+                        with_alpha(top_col, cur_a), with_alpha(top_col, 0.f));
+    c.rect_filled_hgrad(x0 - wing_w * 0.7f, y1 - rail_h, cx, y1,
+                        with_alpha(bot_col, 0.f), with_alpha(bot_col, cur_a * 0.85f));
+    c.rect_filled_hgrad(cx, y1 - rail_h, x1 + wing_w * 0.7f, y1,
+                        with_alpha(bot_col, cur_a * 0.85f), with_alpha(bot_col, 0.f));
 
-    // Render previous line (floating slightly above at 0.60 alpha) and current line (centered bright)
-    const size_t n = st.exploration_lines.size();
-    for (size_t i = 0; i < n; ++i) {
-        const auto& line = st.exploration_lines[i];
-        const bool is_prev = (n == 2 && i == 0);
-        const float a = line.alpha * st.global_alpha * (is_prev ? 0.60f : 1.0f);
-        if (a <= 0.005f) continue;
+    // Tiny Core-Crystal diamond finials at the right edge of the dialogue plate
+    const float fx = x1 - 14.0f * sr.scale;
+    const float fy = (y0 + y1) * 0.5f;
+    const float fr = 4.2f * sr.scale;
+    c.quad_filled(fx, fy - fr, fx + fr, fy, fx, fy + fr, fx - fr, fy, with_alpha(0x56C8FAA8u, cur_a));
 
-        const float y_off = is_prev ? (-34.0f * sr.scale) : (4.0f * sr.scale);
-        const float cur_body_sz = is_prev ? (body_sz * 0.88f) : body_sz;
-        const float cur_name_sz = is_prev ? (name_sz * 0.88f) : name_sz;
+    // 3. Real in-game character portrait medallion on the left (breaking slightly above top rail!)
+    const float av_r  = 36.0f * sr.scale;  // 72px diameter @ 1080p
+    const float av_cx = x0 + 44.0f * sr.scale;
+    const float av_cy = y0 + box_h * 0.44f;
+    draw_portrait_medallion(c, av_cx, av_cy, av_r, cur_line.primary_speaker_id,
+                            cur_line.primary_color_rgba,
+                            cur_line.primary_color_rgba, cur_line.primary_glyph, cur_a);
 
-        if (!is_prev) {
-            // Current speaker name centered just above the gold rule
-            float nw = 0.f, nh = 0.f;
-            c.measure_text(cur_name_sz, line.primary_name.c_str(), &nw, &nh);
-            c.text_outlined(cx - nw * 0.5f, rule_y - nh - 4.0f * sr.scale, cur_name_sz,
-                            with_alpha(line.primary_color_rgba, a),
-                            with_alpha(0x000000E0u, a),
-                            line.primary_name.c_str());
+    // 4. Speaker nameplate + subtle speaker-color underline + crisp dialogue body
+    const float tx = x0 + portrait_space;
+    const float name_y = y0 + 11.0f * sr.scale;
+    c.text_outlined(tx, name_y, name_sz,
+                    with_alpha(cur_line.primary_color_rgba, cur_a),
+                    with_alpha(0x000000E4u, cur_a),
+                    cur_line.primary_name.c_str());
+    const float ul_y = name_y + nh + 3.0f * sr.scale;
+    c.rect_filled_hgrad(tx, ul_y, tx + std::max(nw + 36.0f * sr.scale, 130.0f * sr.scale), ul_y + 1.4f * sr.scale,
+                        with_alpha(cur_line.primary_color_rgba, cur_a * 0.85f),
+                        with_alpha(cur_line.primary_color_rgba, 0.f));
 
-            float bw = 0.f, bh = 0.f;
-            c.measure_text(cur_body_sz, line.text_line1.c_str(), &bw, &bh);
-            c.text_outlined(cx - bw * 0.5f, base_y + y_off, cur_body_sz,
-                            with_alpha(0xFFFFFFFFu, a),
-                            with_alpha(0x000000E8u, a),
-                            line.text_line1.c_str());
-        } else {
-            // Previous line: compact "Name: text" floating above
-            const std::string combined = line.primary_name + "：" + line.text_line1;
-            float bw = 0.f, bh = 0.f;
-            c.measure_text(cur_body_sz, combined.c_str(), &bw, &bh);
-            c.text_outlined(cx - bw * 0.5f, rule_y + y_off - bh * 0.5f, cur_body_sz,
-                            with_alpha(0xE2E8F0FFu, a),
-                            with_alpha(0x000000D0u, a),
-                            combined.c_str());
+    const float body_y = ul_y + 8.0f * sr.scale;
+    c.text_outlined(tx, body_y, body_sz,
+                    with_alpha(0xF8FAFCFFu, cur_a),
+                    with_alpha(0x000000ECu, cur_a),
+                    cur_line.text_line1.c_str());
+
+    // 5. Previous banter line (two-character post-battle exchange) floating cleanly above the top rail
+    if (st.exploration_lines.size() >= 2) {
+        const auto& prev = st.exploration_lines[0];
+        const float pa = prev.alpha * st.global_alpha * 0.68f;
+        if (pa > 0.01f) {
+            const float prev_sz = body_sz * 0.78f;
+            const std::string p_name = prev.primary_name + "：";
+            float pnw = 0.f, pnh = 0.f, pbw = 0.f, pbh = 0.f;
+            c.measure_text(prev_sz, p_name.c_str(), &pnw, &pnh);
+            c.measure_text(prev_sz, prev.text_line1.c_str(), &pbw, &pbh);
+            const float total_pw = pnw + pbw + 24.0f * sr.scale;
+            const float px0 = cx - total_pw * 0.5f;
+            const float py0 = y0 - pbh - 14.0f * sr.scale;
+            const float pcut = 6.0f * sr.scale;
+            c.quad_filled(px0 + pcut, py0 - 3.f * sr.scale,
+                          px0 + total_pw, py0 - 3.f * sr.scale,
+                          px0 + total_pw - pcut, py0 + pbh + 4.f * sr.scale,
+                          px0, py0 + pbh + 4.f * sr.scale,
+                          with_alpha(0x06101CB0u, pa));
+            c.text_outlined(px0 + 12.0f * sr.scale, py0, prev_sz,
+                            with_alpha(prev.primary_color_rgba, pa),
+                            with_alpha(0x000000D0u, pa), p_name.c_str());
+            c.text_outlined(px0 + 12.0f * sr.scale + pnw, py0, prev_sz,
+                            with_alpha(0xE2E8F0FFu, pa),
+                            with_alpha(0x000000D0u, pa), prev.text_line1.c_str());
         }
     }
 }
@@ -339,23 +585,23 @@ void VoiceRenderer::render_voice_log(const nxrt::gfx::HudCanvas& c,
         x0,           y1,
         x0,           y0 + chamfer,
     };
-    c.convex_poly_filled(poly, 6, 0x0A101AE0u);
-    c.polyline(poly, 6, 0x38BDF8C0u, true, std::max(1.2f, 1.5f * sr.scale));
+    c.convex_poly_filled(poly, 6, 0x071220E8u);
+    c.polyline(poly, 6, 0x56C8FAC8u, true, std::max(1.4f, 1.6f * sr.scale));
 
     // Header
-    const float hdr_sz = std::max(14.0f, 17.0f * sr.scale);
-    const float pad_x = 14.0f * sr.scale;
-    const float hdr_y = y0 + 10.0f * sr.scale;
+    const float hdr_sz = std::max(15.0f, 18.0f * sr.scale);
+    const float pad_x = 16.0f * sr.scale;
+    const float hdr_y = y0 + 12.0f * sr.scale;
     char hdr[64];
     std::snprintf(hdr, sizeof(hdr), "语音记录 Voice Log (%zu/30)  [Ctrl+F5 关闭]", history.size());
     c.text_outlined(x0 + pad_x, hdr_y, hdr_sz, 0xF5C542FFu, 0x000000E0u, hdr);
 
-    const float div_y = hdr_y + 24.0f * sr.scale;
-    c.rect_filled_hgrad(x0 + pad_x, div_y, x1 - pad_x, div_y + std::max(1.0f, 1.2f * sr.scale),
-                        0x38BDF8B0u, 0x38BDF810u);
+    const float div_y = hdr_y + 26.0f * sr.scale;
+    c.rect_filled_hgrad(x0 + pad_x, div_y, x1 - pad_x, div_y + std::max(1.2f, 1.4f * sr.scale),
+                        0x56C8FAB8u, 0x56C8FA10u);
 
-    const float row_sz = std::max(12.0f, 15.0f * sr.scale);
-    const float row_h = 24.0f * sr.scale;
+    const float row_sz = std::max(13.0f, 16.0f * sr.scale);
+    const float row_h = 26.0f * sr.scale;
     float cur_y = div_y + 10.0f * sr.scale;
 
     if (history.empty()) {
