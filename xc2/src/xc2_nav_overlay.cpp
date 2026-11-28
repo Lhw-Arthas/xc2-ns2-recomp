@@ -1066,7 +1066,7 @@ NavUILang nav_ui_lang() {
         }
         if (sys == "Japanese") return NavUILang::Ja;
         if (!sys.empty() && sys != "auto") return NavUILang::En;
-        const std::string ui = nxrt::config_get_str("gfx", "ui_language", "en");
+        const std::string ui = nxrt::config_get_str("hud", "voice_lang", "en");
         if (ui == "zh" || ui.rfind("zh_", 0) == 0 || ui.rfind("zh-", 0) == 0) return NavUILang::Zh;
         if (ui == "ja" || ui == "jp") return NavUILang::Ja;
         return NavUILang::En;
