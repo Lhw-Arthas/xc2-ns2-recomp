@@ -5,8 +5,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Please check the [latest release](https://github.com/weile10000/xc2-ns2-recomp/releases/latest) first** — your idea may already be in recent builds.
-        **提交前请先确认最新版是否已包含该功能。**
+        **Please check the [latest release](https://github.com/weile10000/xc2-ns2-recomp/releases/latest) first** — your idea may already be in recent builds. Do **not** upload or link to game files, keys, or external voice/subtitle packs.
+        **提交前请先确认最新版是否已包含该功能；严禁上传或分享游戏文件、密钥及任何外部语音/字幕包或其下载链接。**
   - type: textarea
     id: what
     attributes:

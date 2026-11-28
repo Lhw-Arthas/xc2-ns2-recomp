@@ -5,8 +5,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Please make sure you are on the latest release** (Launcher: **About → Check now**, or <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>).
-        **请先确认已升级到最新版**（启动器 **关于 → 检查更新**）。
+        **Please make sure you are on the latest release** (Launcher: **About → Check now**, or <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>). Do **not** upload or link to game files, keys, or external voice/subtitle packs.
+        **请先确认已升级到最新版**（启动器 **关于 → 检查更新**）；**严禁上传或分享游戏文件、密钥及任何外部语音/字幕包或其下载链接。**
 
         The report zip carries the frame times, what grew during a slow frame, and whether a cutscene had just ended. Without it a stutter report can only be guessed at.
   - type: dropdown
@@ -86,5 +86,5 @@ body:
     attributes:
       label: Confirmation
       options:
-        - label: I attached no game files.
+        - label: I have not attached or linked any game files, keys, or external voice/subtitle packs.
           required: true

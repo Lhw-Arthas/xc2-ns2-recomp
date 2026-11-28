@@ -8,8 +8,9 @@ body:
         **Quick checks before submitting:**
         - Update to the [latest release](https://github.com/weile10000/xc2-ns2-recomp/releases/latest) first (**About → Check now** in the launcher).
         - Common non-bugs: NVIDIA App global DLSS model M/L override causes horizontal black lines; Switch 1 mods/cheats are not directly compatible with Switch 2 3.0.1. ([Known issues](https://github.com/weile10000/xc2-ns2-recomp/blob/main/docs/COMPATIBILITY.md))
+        - **Content policy:** Do **not** upload or link to game files, dumps, keys, lifted binaries, or external voice/subtitle packs.
 
-        **提交前请顺手确认：** 先在启动器 **关于 → 检查更新** 升级到最新版；N 卡横条黑线通常是 NVIDIA App 全局强开了 DLSS 模型 M/L 覆盖；NS1 模组/金手指与 NS2 3.0.1 不直接通用。
+        **提交前请顺手确认：** 先在启动器 **关于 → 检查更新** 升级到最新版；N 卡横条黑线通常是 NVIDIA App 全局强开了 DLSS 模型 M/L 覆盖；NS1 模组/金手指与 NS2 3.0.1 不直接通用；**严禁在 Issue 中上传或分享游戏本体、密钥、举升程序及任何外部语音/字幕包或其下载链接。**
   - type: input
     id: build
     attributes:
@@ -90,5 +91,5 @@ body:
     attributes:
       label: Confirmation
       options:
-        - label: This repository contains no game files, and I have not attached any.
+        - label: This repository contains no game files, and I have not attached or linked any game files, keys, or external voice/subtitle packs.
           required: true
