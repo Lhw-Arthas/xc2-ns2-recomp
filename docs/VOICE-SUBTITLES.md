@@ -118,7 +118,7 @@ Keys are Wwise event names (e.g. `voice_01050101_Play`) or decimal cue ID string
 
 - **Live in-game inspection**: Set `[xc2] voice_debug = true` in `nxrt.ini` to log triggered Wwise event names in real time while playing, so you can map or refine specific lines directly.
 - **Open-source local pipeline scripts**: Developers working from their own legally dumped game files can also inspect the reference helper scripts in [`tools/voice/`](../tools/voice/) for manifest indexing and formatting.
-- **Packaging for distribution**: Zip one or more `<lang>.json` files together with a `README.txt` (keep the `.json` files at the zip root or under `voice_subtitles/`). Any community mod platform (GameBanana, GBAtemp, personal repos, etc.) works cleanly with the launcher's local importer.
+- **Packaging for local import**: Zip one or more pure-text `<lang>.json` files together with a `README.txt` (keep the `.json` files at the zip root or under `voice_subtitles/`) so players can import them locally via the launcher. Do **not** bundle any copyrighted game audio, textures, or binaries inside a pack, and do **not** upload or link subtitle packs in this repository's Issues or PRs.
 
 ---
 
@@ -242,4 +242,4 @@ Keys are Wwise event names (e.g. `voice_01050101_Play`) or decimal cue ID string
 
 - **游戏内实时查看事件名**：在 `nxrt.ini` 中开启 `[xc2] voice_debug = true`，游玩时日志会输出实时触发的 Wwise 事件名，方便逐条核对或润色翻译。
 - **开源辅助脚本参考**：基于自己合法提取的本地游戏文件制作词表时，可参考 [`tools/voice/`](../tools/voice/) 下的开源索引与格式化脚本。
-- **打包分发**：将一个或多个 `<lang>.json`（放在压缩包根目录或 `voice_subtitles/` 下）与自述 `README.txt` 打成 `.zip` 即可分享给其他玩家，通过启动器「导入字幕包」一键安装。
+- **打包供本地导入**：将一个或多个纯文本 `<lang>.json`（放在压缩包根目录或 `voice_subtitles/` 下）与自述 `README.txt` 打成 `.zip`，即可通过启动器「导入字幕包」本地安装。**切勿在压缩包内附带任何原版音频、贴图或二进制文件，也不要将字幕包上传或链接至本仓库的 Issue/PR。**
