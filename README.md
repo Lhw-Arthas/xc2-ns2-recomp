@@ -123,7 +123,7 @@ Requirements: **Native Windows 11 x64** *(primary target covered by release test
 | Category | Documents |
 |---|---|
 | **Getting Started** | [QUICKSTART.md](docs/QUICKSTART.md) · [COMPATIBILITY.md](docs/COMPATIBILITY.md) · [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) · [SETTINGS.md](docs/SETTINGS.md) |
-| **Building & Internals** | [BUILD.md](docs/BUILD.md) · [ENVIRONMENT.md](docs/ENVIRONMENT.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [MEDIA.md](docs/MEDIA.md) · [MODS.md](docs/MODS.md) |
+| **Building & Internals** | [BUILD.md](docs/BUILD.md) · [ENVIRONMENT.md](docs/ENVIRONMENT.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [MEDIA.md](docs/MEDIA.md) · [MODS.md](docs/MODS.md) · [VOICE-SUBTITLES.md](docs/VOICE-SUBTITLES.md) |
 | **Governance & History** | [INVARIANTS.md](docs/INVARIANTS.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md) · [STATUS.md](STATUS.md) · [SECURITY.md](SECURITY.md) |
 
 ---
@@ -271,7 +271,7 @@ ExeFS (NSO) ──nxrecomp 举升──▶ C++ ──Zig / clang-cl──▶ 模
 | 分类 | 文档列表 |
 |---|---|
 | **使用与排查** | [QUICKSTART.md](docs/QUICKSTART.md) · [COMPATIBILITY.md](docs/COMPATIBILITY.md) · [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) · [SETTINGS.md](docs/SETTINGS.md) |
-| **构建与架构** | [BUILD.md](docs/BUILD.md) · [ENVIRONMENT.md](docs/ENVIRONMENT.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [MEDIA.md](docs/MEDIA.md) · [MODS.md](docs/MODS.md) |
+| **构建与架构** | [BUILD.md](docs/BUILD.md) · [ENVIRONMENT.md](docs/ENVIRONMENT.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [MEDIA.md](docs/MEDIA.md) · [MODS.md](docs/MODS.md) · [VOICE-SUBTITLES.md](docs/VOICE-SUBTITLES.md#中文) |
 | **规范与里程碑** | [INVARIANTS.md](docs/INVARIANTS.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md) · [STATUS.md](STATUS.md) · [SECURITY.md](SECURITY.md) |
 
 ---
