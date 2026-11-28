@@ -3,11 +3,14 @@
 //! repository's own lift and build scripts on this PC, writes fefw.ini in a run folder and starts the game. It ships no game files.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod arh;
 mod cpu;
 mod dump;
 mod fsr;
 mod ini;
 mod locale;
+mod mod_import;
+mod mods;
 mod nup;
 mod play;
 mod settings;
@@ -82,8 +85,10 @@ fn is_repo(dir: &Path) -> bool {
 /// The checkout the launcher runs in: the configured one, else the first parent of the launcher's exe that is one.
 fn repo_of(cfg: &Config) -> Option<PathBuf> {
     if package_tools().is_some() {
-        // the release package: the install folder plays the checkout's part
-        return Some(if cfg.game_dir.trim().is_empty() { exe_dir() } else { PathBuf::from(cfg.game_dir.trim()) });
+        // the release package: the launcher's folder holds tools/, runtime/xc2_rt.lib and xc2/sites even when the
+        // player installs game data into a separate folder (cfg.game_dir); passing cfg.game_dir as --repo would
+        // send xc2_setup.py into checkout mode instead of package mode (#58).
+        return Some(exe_dir());
     }
     if !cfg.repo_dir.trim().is_empty() {
         let p = PathBuf::from(cfg.repo_dir.trim());
@@ -337,10 +342,9 @@ struct UpscalerFiles {
     fsr_framegen: FeatureFiles,
     dlss: FeatureFiles,
     dlss_framegen: FeatureFiles,
-    xess: FeatureFiles,
 }
 
-/// The folders the game searches (runtime/src/gfx/extras/ffx_files.cpp, temporal_dlss.cpp, temporal_xess.cpp): the setting's folder (a file in it counts), then
+/// The folders the game searches (temporal_ffx.cpp, temporal_dlss.cpp, framegen_ffx.cpp): the setting's folder (a file in it counts), then
 /// `upscalers/<sub>` next to the game, next to the launcher and in the run folder.
 fn upscaler_dirs(setting: &str, sub: &str, game: &Path, exe: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = Vec::new();
@@ -379,7 +383,7 @@ fn files_in(dirs: &[PathBuf], sets: &[&[&str]], what: &str) -> FeatureFiles {
 }
 
 #[tauri::command]
-fn upscaler_files(app: AppHandle, fsr_dir: String, dlss_dir: String, xess_dir: Option<String>) -> Result<UpscalerFiles, String> {
+fn upscaler_files(app: AppHandle, fsr_dir: String, dlss_dir: String) -> Result<UpscalerFiles, String> {
     let cfg = load_config(&app);
     let repo = need_repo(&cfg)?;
     let game = game_dir_of(&cfg, &repo);
@@ -397,11 +401,6 @@ fn upscaler_files(app: AppHandle, fsr_dir: String, dlss_dir: String, xess_dir: O
     } else {
         sl.iter().find(|d| d.join("sl.interposer.dll").is_file()).cloned().map(|d| vec![d]).unwrap_or(sl.clone())
     };
-    // XeSS (runtime/src/gfx/extras/temporal_xess.cpp): libxess.dll in the setting's folder, upscalers/xess, else next to the game
-    let mut xess = upscaler_dirs(xess_dir.as_deref().unwrap_or(""), "xess", &game, &exe);
-    if let Some(d) = exe.parent() {
-        xess.push(d.to_path_buf());
-    }
     const DLSS: [&str; 4] = ["sl.interposer.dll", "sl.common.dll", "sl.dlss.dll", "nvngx_dlss.dll"];
     const DLSS_G: [&str; 9] =
         ["sl.interposer.dll", "sl.common.dll", "sl.dlss.dll", "nvngx_dlss.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll", "NvLowLatencyVk.dll"];
@@ -410,7 +409,6 @@ fn upscaler_files(app: AppHandle, fsr_dir: String, dlss_dir: String, xess_dir: O
         fsr_framegen: files_in(&fsr, &[&["amd_fidelityfx_vk.dll"]], "amd_fidelityfx_vk.dll (FidelityFX SDK v1.1.4)"),
         dlss: files_in(&sl_pick, &[&DLSS], "the Streamline files"),
         dlss_framegen: files_in(&sl_pick, &[&DLSS_G], "the Streamline frame generation files"),
-        xess: files_in(&xess, &[&["libxess.dll"]], "libxess.dll"),
     })
 }
 
@@ -491,7 +489,7 @@ fn cancel_setup(state: State<Arc<setup::Shared>>) {
 }
 
 #[tauri::command]
-fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> {
+fn play(app: AppHandle, state: State<Arc<setup::Shared>>, safe_mode: Option<bool>) -> Result<(), String> {
     if state.progress.lock().unwrap().state == "running" {
         return Err("Setup is running. Wait for it or pause it first.".into());
     }
@@ -501,7 +499,7 @@ fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> 
         return Err("Setup is not finished: open Setup and press Set up.".into());
     }
     settings::ensure_play_paths(&p.game_dir, &p)?;
-    play::start(&app, &p, &exe_dir(), cfg.minimize_on_play, &cfg.runner)
+    play::start(&app, &p, &exe_dir(), cfg.minimize_on_play, &cfg.runner, safe_mode.unwrap_or(false))
 }
 
 /// Linux: whether Steam is installed and the shortcut to fefw.exe exists.
@@ -587,6 +585,266 @@ fn open_mods_dir(app: AppHandle) -> Result<(), String> {
     play::open_with_shell(&dir)
 }
 
+fn mods_context(app: &AppHandle, state: &State<play::PlayState>) -> Result<(PathBuf, mods::ExefsTargetInfo, Option<PathBuf>, bool), String> {
+    let cfg = load_config(app);
+    let repo = need_repo(&cfg)?;
+    let game_dir = game_dir_of(&cfg, &repo);
+    let plain = if package_tools().is_some() { game_dir.join("exefs") } else { repo.join("game").join("dump").join("exefs") };
+    let exefs_dir = if plain.join("main").is_file() { Some(plain) } else { paths(&cfg).ok().map(|p| p.exefs) };
+    let target = mods::exefs_target_info(exefs_dir.as_deref(), Some(&repo));
+    let romfs_cand = game_dir.join("game").join("romfs-301");
+    let vanilla_romfs = if romfs_cand.is_dir() {
+        Some(romfs_cand)
+    } else {
+        paths(&cfg).ok().map(|p| p.romfs).filter(|p| p.is_dir())
+    };
+    let running = state.0.lock().map(|s| s.state == "running").unwrap_or(false);
+    Ok((game_dir, target, vanilla_romfs, running))
+}
+
+#[tauri::command]
+fn list_mods(app: AppHandle, state: State<play::PlayState>) -> Result<mods::ModsSnapshot, String> {
+    let (game_dir, target, vanilla_romfs, running) = mods_context(&app, &state)?;
+    Ok(mods::compute_snapshot(&game_dir, &target, vanilla_romfs.as_deref(), running))
+}
+
+#[tauri::command]
+fn save_mods_state(app: AppHandle, state: State<play::PlayState>, input: mods::SaveModsStateInput) -> Result<mods::ModsSnapshot, String> {
+    let (game_dir, target, vanilla_romfs, running) = mods_context(&app, &state)?;
+    mods::save_state(&game_dir, &target, vanilla_romfs.as_deref(), input, running)
+}
+
+#[tauri::command]
+fn open_mod_folder(app: AppHandle, name: String) -> Result<(), String> {
+    if name.trim().is_empty() || name.starts_with('.') || name.contains(['/', '\\', ':']) || name == ".." {
+        return Err("Invalid mod folder name.".into());
+    }
+    let cfg = load_config(&app);
+    let dir = game_dir_of(&cfg, &need_repo(&cfg)?).join("mods").join(&name);
+    if !dir.is_dir() {
+        return Err(format!("Mod folder '{name}' does not exist."));
+    }
+    play::open_with_shell(&dir)
+}
+
+#[tauri::command]
+async fn pick_mod_file(app: AppHandle, title: String) -> Option<String> {
+    app.dialog()
+        .file()
+        .set_title(title)
+        .add_filter("XC2 Mods & Cheats", &["zip", "7z", "txt", "json", "ips", "pchtxt", "bdat", "wismt"])
+        .blocking_pick_file()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| dump::fwd(&p))
+}
+
+#[tauri::command]
+fn import_mod(app: AppHandle, state: State<play::PlayState>, source_path: String) -> Result<mods::ImportModResult, String> {
+    let (game_dir, target, vanilla_romfs, running) = mods_context(&app, &state)?;
+    let arh = arh::cached_arh_index(vanilla_romfs.as_deref());
+    let summary = mod_import::import_mod_source(
+        &game_dir.join("mods"),
+        Path::new(source_path.trim()),
+        &target,
+        vanilla_romfs.as_deref(),
+        arh.as_deref(),
+    )?;
+    let snapshot = mods::compute_snapshot(&game_dir, &target, vanilla_romfs.as_deref(), running);
+    Ok(mods::ImportModResult {
+        folder: summary.folder,
+        warnings: summary.warnings,
+        has_exefs: summary.has_exefs,
+        snapshot,
+    })
+}
+
+#[tauri::command]
+fn install_mod_folder(app: AppHandle, state: State<play::PlayState>, source_path: String) -> Result<mods::ModsSnapshot, String> {
+    let res = import_mod(app, state, source_path)?;
+    Ok(res.snapshot)
+}
+
+#[tauri::command]
+fn delete_mod(app: AppHandle, state: State<play::PlayState>, name: String) -> Result<mods::DeleteModResult, String> {
+    let (game_dir, target, vanilla_romfs, running) = mods_context(&app, &state)?;
+    mods::delete_mod(&game_dir, &target, vanilla_romfs.as_deref(), &name, running)
+}
+
+#[derive(Serialize, Clone)]
+struct VoiceSubtitlesStatus {
+    dir: String,
+    packs: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct VoiceSubtitlesImportResult {
+    installed: Vec<String>,
+    status: VoiceSubtitlesStatus,
+}
+
+fn list_voice_subtitles(dir: &Path) -> VoiceSubtitlesStatus {
+    let mut packs: Vec<String> = fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if !p.is_file() {
+                return None;
+            }
+            let ext = p.extension()?.to_str()?;
+            if !ext.eq_ignore_ascii_case("json") {
+                return None;
+            }
+            let stem = p.file_stem()?.to_str()?.trim();
+            if stem.is_empty() {
+                return None;
+            }
+            Some(stem.to_string())
+        })
+        .collect();
+    packs.sort();
+    packs.dedup();
+    VoiceSubtitlesStatus { dir: dump::fwd(dir), packs }
+}
+
+fn sanitize_voice_lang_stem(raw: &str) -> Option<String> {
+    let s: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    (!s.is_empty() && s.len() <= 32).then_some(s)
+}
+
+fn validate_and_copy_voice_json(src: &Path, dst_dir: &Path) -> Result<Option<String>, String> {
+    let Some(ext) = src.extension().and_then(|s| s.to_str()) else {
+        return Ok(None);
+    };
+    if !ext.eq_ignore_ascii_case("json") {
+        return Ok(None);
+    }
+    let Some(raw_stem) = src.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(None);
+    };
+    let Some(stem) = sanitize_voice_lang_stem(raw_stem) else {
+        return Ok(None);
+    };
+    let bytes = fs::read(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(None);
+    };
+    let valid_cues = val
+        .as_object()
+        .and_then(|o| o.get("cues"))
+        .and_then(|c| c.as_object())
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+    if !valid_cues {
+        return Ok(None);
+    }
+    fs::create_dir_all(dst_dir).map_err(|e| format!("cannot create {}: {e}", dst_dir.display()))?;
+    let dest = dst_dir.join(format!("{stem}.json"));
+    fs::write(&dest, &bytes).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+    Ok(Some(stem))
+}
+
+fn import_voice_subtitles_from(src: &Path, dst_dir: &Path) -> Result<Vec<String>, String> {
+    if !src.is_file() {
+        return Err(format!("File not found: {}", src.display()));
+    }
+    let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    let mut installed = Vec::new();
+    if ext == "json" {
+        if let Some(stem) = validate_and_copy_voice_json(src, dst_dir)? {
+            installed.push(stem);
+        }
+    } else if ext == "zip" {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!("xc2-voice-import-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&tmp).map_err(|e| format!("cannot create temp dir: {e}"))?;
+        let extract_res = mod_import::extract_zip(src, &tmp);
+        if let Err(e) = extract_res {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+        let mut stack = vec![(tmp.clone(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > 4 {
+                continue;
+            }
+            if let Ok(rd) = fs::read_dir(&dir) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if p.is_dir() {
+                        stack.push((p, depth + 1));
+                    } else if p.is_file() {
+                        if let Ok(Some(stem)) = validate_and_copy_voice_json(&p, dst_dir) {
+                            installed.push(stem);
+                        }
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    } else {
+        return Err("Unsupported file type. Select a .zip or .json voice subtitle pack.".into());
+    }
+    installed.sort();
+    installed.dedup();
+    if installed.is_empty() {
+        return Err("No valid voice subtitle JSON files (with a non-empty 'cues' table) were found.".into());
+    }
+    Ok(installed)
+}
+
+#[tauri::command]
+fn voice_subtitles_status(app: AppHandle) -> Result<VoiceSubtitlesStatus, String> {
+    let cfg = load_config(&app);
+    let dir = game_dir_of(&cfg, &need_repo(&cfg)?).join("voice_subtitles");
+    Ok(list_voice_subtitles(&dir))
+}
+
+#[tauri::command]
+async fn pick_voice_subtitle_file(app: AppHandle, title: String) -> Option<String> {
+    app.dialog()
+        .file()
+        .set_title(title)
+        .add_filter("Voice Subtitle Pack (.zip, .json)", &["zip", "json"])
+        .blocking_pick_file()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| dump::fwd(&p))
+}
+
+#[tauri::command]
+fn import_voice_subtitles(app: AppHandle, path: String) -> Result<VoiceSubtitlesImportResult, String> {
+    let cfg = load_config(&app);
+    let dir = game_dir_of(&cfg, &need_repo(&cfg)?).join("voice_subtitles");
+    let installed = import_voice_subtitles_from(Path::new(path.trim()), &dir)?;
+    let status = list_voice_subtitles(&dir);
+    Ok(VoiceSubtitlesImportResult { installed, status })
+}
+
+#[tauri::command]
+fn open_voice_subtitles_dir(app: AppHandle) -> Result<(), String> {
+    let cfg = load_config(&app);
+    let dir = game_dir_of(&cfg, &need_repo(&cfg)?).join("voice_subtitles");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    play::open_with_shell(&dir)
+}
+
+#[tauri::command]
+fn read_mod_log(app: AppHandle) -> Result<mods::ModLogView, String> {
+    let cfg = load_config(&app);
+    let game_dir = game_dir_of(&cfg, &need_repo(&cfg)?);
+    mods::read_last_mod_log(&game_dir)
+}
+
 #[tauri::command]
 fn open_setup_log(app: AppHandle) -> Result<(), String> {
     let cfg = load_config(&app);
@@ -605,8 +863,8 @@ fn start_report(app: AppHandle) -> Result<String, String> {
     let cfg = load_config(&app);
     let repo = need_repo(&cfg)?;
     let dir = game_dir_of(&cfg, &repo);
-    let (py, script) = if package_tools().is_some() {
-        (dir.join("tools").join("python").join("python.exe"), dir.join("tools").join("report.py"))
+    let (py, script) = if let Some(tools) = package_tools() {
+        (tools.join("python").join("python.exe"), tools.join("report.py"))
     } else {
         let py = std::env::var_os("XC2_PYTHON").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("python"));
         (py, repo.join("tools").join("report.py"))
@@ -711,6 +969,29 @@ fn game_run_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(exe.parent().map(|d| d.to_path_buf()).unwrap_or(game))
 }
 
+#[derive(Serialize)]
+struct UpscalerDownloadInfo {
+    #[serde(flatten)]
+    manifest: streamline::DownloadManifest,
+    dest: String,
+}
+
+#[tauri::command]
+fn upscaler_download_manifest(app: AppHandle, kind: String) -> Result<UpscalerDownloadInfo, String> {
+    let game_dir = game_run_dir(&app)?;
+    match kind.as_str() {
+        "dlss" => Ok(UpscalerDownloadInfo {
+            manifest: streamline::manifest(),
+            dest: dump::fwd(&streamline::dest(&game_dir)),
+        }),
+        "fsr" => Ok(UpscalerDownloadInfo {
+            manifest: fsr::manifest(),
+            dest: dump::fwd(&fsr::dest(&game_dir)),
+        }),
+        _ => Err(format!("unknown upscaler download kind: {kind}")),
+    }
+}
+
 #[tauri::command]
 fn dlss_download_status(state: State<Arc<streamline::Shared>>) -> streamline::Status {
     let mut s = state.status.lock().unwrap().clone();
@@ -722,7 +1003,10 @@ fn dlss_download_status(state: State<Arc<streamline::Shared>>) -> streamline::St
 
 /// Downloads NVIDIA's Streamline SDK release and installs the DLSS files (streamline.rs); progress through dlss_download_status.
 #[tauri::command]
-fn start_dlss_download(app: AppHandle, state: State<Arc<streamline::Shared>>, play_state: State<play::PlayState>) -> Result<(), String> {
+fn start_dlss_download(app: AppHandle, state: State<Arc<streamline::Shared>>, play_state: State<play::PlayState>, confirmed: bool) -> Result<(), String> {
+    if !confirmed {
+        return Err("Download requires explicit user confirmation.".into());
+    }
     if play_state.0.lock().unwrap().state == "running" {
         return Err("The game is running. Close it first: it keeps the DLSS files open.".into());
     }
@@ -763,7 +1047,10 @@ fn fsr_download_status(state: State<'_, Arc<fsr::Shared>>) -> streamline::Status
 
 /// Downloads AMD's signed FidelityFX SDK DLLs (v2.4.0 + v1.1.4) directly from GPUOpen's official GitHub tags.
 #[tauri::command]
-fn start_fsr_download(app: AppHandle, state: State<'_, Arc<fsr::Shared>>, play_state: State<play::PlayState>) -> Result<(), String> {
+fn start_fsr_download(app: AppHandle, state: State<'_, Arc<fsr::Shared>>, play_state: State<play::PlayState>, confirmed: bool) -> Result<(), String> {
+    if !confirmed {
+        return Err("Download requires explicit user confirmation.".into());
+    }
     if play_state.0.lock().unwrap().state == "running" {
         return Err("The game is running. Close it first: it keeps the FSR files open.".into());
     }
@@ -798,7 +1085,7 @@ fn cancel_fsr_download(state: State<'_, Arc<fsr::Shared>>) {
 fn restart_launcher(app: AppHandle) -> Result<(), String> {
     let exe = match std::env::var_os("APPIMAGE") {
         Some(a) if !cfg!(windows) => PathBuf::from(a),
-        _ => exe_dir().join(if cfg!(windows) { "fefw-launcher.exe" } else { "fefw-launcher" }),
+        _ => exe_dir().join(if cfg!(windows) { "xc2-launcher.exe" } else { "xc2-launcher" }),
     };
     let mut c = std::process::Command::new(&exe);
     setup::host_env(&mut c); // not this AppImage's environment: its mount goes away when this launcher exits
@@ -849,6 +1136,18 @@ fn main() {
             open_game_file,
             open_game_dir,
             open_mods_dir,
+            list_mods,
+            save_mods_state,
+            open_mod_folder,
+            pick_mod_file,
+            import_mod,
+            install_mod_folder,
+            delete_mod,
+            read_mod_log,
+            voice_subtitles_status,
+            pick_voice_subtitle_file,
+            import_voice_subtitles,
+            open_voice_subtitles_dir,
             open_setup_log,
             start_report,
             open_reports_dir,
@@ -856,6 +1155,7 @@ fn main() {
             update_status,
             start_update,
             cancel_update,
+            upscaler_download_manifest,
             dlss_download_status,
             start_dlss_download,
             cancel_dlss_download,
@@ -894,6 +1194,27 @@ mod tests {
         // a second import into the same install lands in the folder that is already there
         let (again, _) = copy_saves(&account, &src).unwrap();
         assert_eq!(again, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_voice_subtitles_validates_and_copies_json() {
+        let root = std::env::temp_dir().join(format!("xc2-voice-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let good = root.join("en.json");
+        fs::write(&good, br#"{"speakers":{},"cues":{"voice_01010101_Play":{"text_full":"Hi"}}}"#).unwrap();
+        let bad = root.join("not_voice.json");
+        fs::write(&bad, br#"{"hello":"world"}"#).unwrap();
+        let dst = root.join("voice_subtitles");
+
+        let ok = import_voice_subtitles_from(&good, &dst).unwrap();
+        assert_eq!(ok, vec!["en".to_string()]);
+        assert!(dst.join("en.json").is_file());
+        assert!(import_voice_subtitles_from(&bad, &dst).is_err());
+
+        let st = list_voice_subtitles(&dst);
+        assert_eq!(st.packs, vec!["en".to_string()]);
         let _ = fs::remove_dir_all(&root);
     }
 }

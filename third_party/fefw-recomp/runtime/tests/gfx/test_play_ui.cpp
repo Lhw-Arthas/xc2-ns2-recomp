@@ -231,3 +231,96 @@ NXTEST(fps_flip_after_load_draws_without_apply) {
     CHECK_EQ(host.applies, 0);
     CHECK_EQ(host.begins, 0);
 }
+
+NXTEST(gamepad_dpad_nav_stays_in_rows_pane) {
+    Headless ui;
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    FakeHost host;
+
+    auto draw_once = [&](bool first_open) {
+        ImGui::NewFrame();
+        ImGui::SetNextWindowSize(ImVec2(1280, 720), ImGuiCond_Always);
+        if (first_open) ImGui::SetNextWindowFocus();
+        if (ImGui::Begin("##xc2_settings_modal")) {
+            ImGui::Button("Quit game");
+            ImGui::SameLine();
+            ImGui::Button("Close");
+            play::draw_settings_page(host);
+        }
+        ImGui::End();
+        ImGui::Render();
+    };
+    auto press_key = [&](ImGuiKey key) {
+        for (int f = 0; f < 3; ++f) {
+            io.AddKeyEvent(key, f == 0);
+            draw_once(false);
+        }
+    };
+
+    draw_once(true);
+    draw_once(false);
+    draw_once(false);
+
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    REQUIRE(ctx->NavWindow != nullptr);
+    CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+    const ImGuiID id0 = ctx->NavId;
+    CHECK(id0 != 0);
+
+    // D-pad Down moves to card 2 inside ##rows_pane, never wiping NavId or escaping to ##xc2_settings_modal.
+    press_key(ImGuiKey_GamepadDpadDown);
+    CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+    const ImGuiID id1 = ctx->NavId;
+    CHECK(id1 != 0);
+    CHECK(id1 != id0);
+
+    // D-pad Right then Left adjusts card 2's value without moving focus out of card 2.
+    press_key(ImGuiKey_GamepadDpadRight);
+    CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+    CHECK_EQ(ctx->NavId, id1);
+    press_key(ImGuiKey_GamepadDpadLeft);
+    CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+    CHECK_EQ(ctx->NavId, id1);
+    press_key(ImGuiKey_GamepadDpadUp);
+    CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+    CHECK_EQ(ctx->NavId, id0);
+    press_key(ImGuiKey_GamepadDpadDown);
+    CHECK_EQ(ctx->NavId, id1);
+
+    // R1 switches to Graphics tab and keeps focus inside the new tab's ##rows_pane; Down moves through multiple cards.
+    press_key(ImGuiKey_GamepadR1);
+    CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+    const ImGuiID tab2_id0 = ctx->NavId;
+    CHECK(tab2_id0 != 0);
+
+    press_key(ImGuiKey_GamepadDpadDown);
+    CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+    const ImGuiID tab2_id1 = ctx->NavId;
+    CHECK(tab2_id1 != 0);
+    CHECK(tab2_id1 != tab2_id0);
+
+    press_key(ImGuiKey_GamepadDpadDown);
+    CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+    CHECK(ctx->NavId != 0);
+    CHECK(ctx->NavId != tab2_id1);
+
+    // Step across to Controls tab (Display -> Graphics -> Audio -> Controls) and verify Down crosses all cards + skips monitor lamps cleanly.
+    press_key(ImGuiKey_GamepadR1);
+    press_key(ImGuiKey_GamepadR1);
+    CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+    ImGuiID prev_ctrl = ctx->NavId;
+    CHECK(prev_ctrl != 0);
+    for (int step = 0; step < 8; ++step) {
+        press_key(ImGuiKey_GamepadDpadDown);
+        CHECK(std::strstr(ctx->NavWindow->Name, "##rows_pane") != nullptr);
+        CHECK(ctx->NavId != 0);
+        CHECK(ctx->NavId != prev_ctrl);
+        prev_ctrl = ctx->NavId;
+    }
+
+    // ZR (GamepadR2) applies & saves settings cleanly from gamepad.
+    press_key(ImGuiKey_GamepadR2);
+    CHECK(host.applies >= 1);
+}

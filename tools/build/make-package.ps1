@@ -1,22 +1,45 @@
-﻿# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Assembles the portable tree: the launcher, the runtime as a DLL, and the two tools that compile the lifted code, so
 # a player unpacks it and needs nothing installed - no MSVC, no Windows SDK, no Python, no .NET, no Zig.
 #
-#   pwsh tools\build\make-package.ps1 -Out E:\XC2-package
+#   pwsh tools\build\make-package.ps1 -Out D:\dist\xc2-package
 #
 # What it does NOT contain: any game file. The exe is built on the player's PC from their own dump (that is the whole
 # point of the recompilation), and the shader cache is translated from their own shaders.
 param(
     [string]$Out = '',
     [string]$Launcher = '',   # default: <checkout>\launcher
-    [string]$Zig = 'E:\Tools\dev\zig',
+    [string]$Zig = '',        # default: $env:XC2_ZIG, zig.exe on PATH, or sibling Tools\dev\zig
     [switch]$SkipHarness,
     [switch]$SkipPython,
     [switch]$AllowNoFFmpeg    # build a package whose 4K openings fall back to the CPU decoders, on purpose
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # the checkout
+
+# Refuse to touch a folder something is running from. The copy step deletes the destination first, so a launcher
+# started from an older package made the build die half way and left a 294 MB stump where a 645 MB package was
+# (2026-11-26) - a guard here costs nothing and turns that into one clear sentence.
+$outFull = if ($Out) { [System.IO.Path]::GetFullPath($Out) } else { '' }
+if ($outFull) {
+    $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -and $_.Path.StartsWith($outFull, [System.StringComparison]::OrdinalIgnoreCase) } catch { $false }
+    })
+    if ($busy.Count -gt 0) {
+        throw ("$($busy[0].ProcessName).exe (pid $($busy[0].Id)) is running from $outFull - close it first, or pick another -Out")
+    }
+}
 if (-not $Out) { $Out = Join-Path (Split-Path -Parent $root) 'XC2-package' }
+if (-not $Zig) {
+    if ($env:XC2_ZIG) {
+        $Zig = if ((Test-Path $env:XC2_ZIG -PathType Leaf)) { Split-Path -Parent $env:XC2_ZIG } else { $env:XC2_ZIG }
+    } elseif ($zigCmd = Get-Command zig.exe -ErrorAction SilentlyContinue) {
+        $Zig = Split-Path -Parent $zigCmd.Source
+    } else {
+        $driveRoot = Split-Path -Parent (Split-Path -Parent $root)
+        if ($driveRoot) { $Zig = Join-Path $driveRoot 'Tools\dev\zig' }
+    }
+}
 
 function Say($text) { Write-Host ("  " + $text) }
 function Need($path, $what) { if (-not (Test-Path $path)) { throw "missing $what : $path" } }
@@ -89,7 +112,8 @@ Say ("runtime       {0:N1} MB  (xc2_rt.dll + the import library)" -f (((Get-Item
 # its own directory, so they go in runtime and the setup copies every runtime*.dll next to xc2_boot.exe. A package without
 # them still runs - every 4K opening falls back to the CPU decoders (8-17 fps against 30).
 $ffmpeg = ''
-foreach ($cand in @($env:NXRT_FFMPEG_DIR, 'E:\XC2\lan\ffmpeg\ffmpeg-master-latest-win64-gpl-shared')) {
+$wsFFmpeg = Join-Path (Split-Path -Parent $root) 'lan\ffmpeg\ffmpeg-master-latest-win64-gpl-shared'
+foreach ($cand in @($env:NXRT_FFMPEG_DIR, $wsFFmpeg)) {
     if ($cand -and (Test-Path (Join-Path $cand 'bin\avcodec-63.dll'))) { $ffmpeg = $cand; break }
 }
 if ($ffmpeg) {
@@ -166,8 +190,17 @@ Say ("zig           {0:N1} MB" -f (Size (Join-Path $Out 'tools\build\zig')))
 
 # --- 3b. what this folder is, so a player who unzips it has somewhere to start --------------------------------
 Copy-Item (Join-Path $PSScriptRoot 'PACKAGE-README.txt') (Join-Path $Out 'README.txt') -Force
-$notes = Join-Path $root 'docs\RELEASE-0.2.1.md'
-if (Test-Path $notes) { Copy-Item $notes (Join-Path $Out 'RELEASE-NOTES.md') -Force }
+$notes = ''
+if ($want) {
+    $cand = Join-Path $root ("docs\RELEASE-$want.md")
+    if (Test-Path $cand) { $notes = $cand }
+}
+if (-not $notes -or -not (Test-Path $notes)) {
+    $latestNotes = Get-ChildItem -LiteralPath (Join-Path $root 'docs') -Filter 'RELEASE-*.md' -File -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if ($latestNotes) { $notes = $latestNotes.FullName }
+}
+if ($notes -and (Test-Path $notes)) { Copy-Item $notes (Join-Path $Out 'RELEASE-NOTES.md') -Force }
 
 # --- 3c. the support tools a player is asked to run: the report collector and the dev run scripts ---------------
 New-Item -ItemType Directory -Force (Join-Path $Out 'tools\run') | Out-Null
@@ -194,7 +227,9 @@ Copy-Item (Join-Path $root 'tools\shader\patch_ds_samplers.py') (Join-Path $Out 
 # The engine's --nup path runs this with the bundled Python (zstandard is in it), for a player whose dump is a .nup.
 New-Item -ItemType Directory -Force (Join-Path $Out 'tools\analysis') | Out-Null
 Copy-Item (Join-Path $root 'tools\analysis\nup_extract.py') (Join-Path $Out 'tools\analysis') -Force
-Say 'engine        xc2_setup.py + the shader chain + nup_extract.py'
+New-Item -ItemType Directory -Force (Join-Path $Out 'tools\mods') | Out-Null
+Copy-Item (Join-Path $root 'tools\mods\exefs_patch.py') (Join-Path $Out 'tools\mods') -Force
+Say 'engine        xc2_setup.py + the shader chain + nup_extract.py + exefs_patch.py'
 New-Item -ItemType Directory -Force (Join-Path $Out 'xc2\sites') | Out-Null
 Copy-Item (Join-Path $root 'xc2\sites\*.txt') (Join-Path $Out 'xc2\sites') -Force
 New-Item -ItemType Directory -Force (Join-Path $Out 'xc2\src') | Out-Null

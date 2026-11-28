@@ -25,12 +25,14 @@
 
 #include "api_dlss.h"
 #include "extras/framegen.h"
+#include "extras/hdr_nvn.h"
 #include "nvn_framegen.h"
 #include "extras/taau.h"
 #include "extras/temporal.h"
 #include "nvn_format.h"
 #include "nvn_gpu_internal.h"
 #include "nxrt/config.h"
+#include "nxrt/gfx_tuning.h"
 #include "nxrt/log.h"
 #include "nxrt/nvn_backend.h"
 
@@ -646,6 +648,7 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
     // scale (and bring an unscaled one up), so the upscaler writes the full output size.
     if (gpu::tex_gpu_attachment(out) && gpu::tex_scale_wanted(out) != gpu::tex_scale(out))
         gpu::tex_rescale(out, f, gpu::tex_scale_wanted(out), "the upscaler's output");
+    if (extras::hdr_highlights_kept()) gpu::tex_promote_float(out, f, "the upscaler's output");   // the tone map's highlights above 1
     if (!gpu::tex_gpu(color) || !gpu::tex_gpu(out) || gpu::tex_is_depth(out)) {
         static bool told = false;
         if (!told) {
@@ -671,6 +674,24 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
     if (!n.logged) {
         n.logged = true;
         log_first(*e, c, ro, u);
+    }
+
+    // Automatic negative mip bias for temporal upscalers (DLSS / FSR / TAAU, issue #79):
+    // AMD & NVIDIA guidelines use log2(render_w / output_w) - 1, quantized to 0.25 steps so dynamic resolution
+    // does not churn the sampler cache. Applied in tuned_sampler() only to material samplers (game aniso > 1).
+    {
+        static const bool auto_mip_bias = config_get_bool("upscale", "auto_mip_bias", true);
+        float want_bias = 0.0f;
+        if (auto_mip_bias && u != Upscaler::Bilinear && in_img.width > 0 && out_img.width > 0) {
+            const float raw = std::log2(static_cast<float>(in_img.width) / static_cast<float>(out_img.width)) - 1.0f;
+            want_bias = std::clamp(std::round(raw * 4.0f) * 0.25f, -3.0f, 0.0f);
+        }
+        const float prev_bias = gfx::tuning().upscale_lod_bias.exchange(want_bias, std::memory_order_relaxed);
+        if (prev_bias != want_bias) {
+            NXLOG_I(kTag, "upscaler auto mip bias: %.2f (in %ux%u -> out %ux%u, auto_mip_bias=%d)",
+                    static_cast<double>(want_bias), in_img.width, in_img.height, out_img.width, out_img.height,
+                    auto_mip_bias ? 1 : 0);
+        }
     }
 
     // inputs
@@ -817,13 +838,14 @@ void dlss_replay(gpu::Frame& f, Obj* o) {
     h.prev_jitter[1] = jy;
     n.resets += reset ? 1 : 0;
     ++n.evals;
-    g_in_use.store(static_cast<int>(tf.spatial ? Upscaler::Bilinear : Upscaler::Taau), std::memory_order_relaxed);
+    const Upscaler active = tf.spatial ? Upscaler::Bilinear : Upscaler::Taau;
+    g_in_use.store(static_cast<int>(active), std::memory_order_relaxed);
     gpu::counters().dispatches.fetch_add(1, std::memory_order_relaxed);
     maybe_dump(f, n, *e, c, rm, dst.img);
     feed_framegen(f, n, prep, in_img, tf.jitter, reset, tf.depth_inverted, false);
     if (n.evals % 1800 == 0)
         NXLOG_I(kTag, "network %u: %llu evaluations, %llu history resets, %s %ux%u -> %ux%u", net.id, static_cast<unsigned long long>(n.evals),
-                static_cast<unsigned long long>(n.resets), upscaler_name(u), in_img.width, in_img.height, out_img.width, out_img.height);
+                static_cast<unsigned long long>(n.resets), upscaler_name(active), in_img.width, in_img.height, out_img.width, out_img.height);
 }
 
 const char* dlss_upscaler_in_use() {

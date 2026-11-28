@@ -66,6 +66,7 @@ std::atomic<bool> g_inited{false};
 std::atomic<uint64_t> g_default_heap{0};  // bytes, from Config or [memory] heap_gb
 std::mutex g_alias_base_mu;
 std::atomic<uint64_t> g_alias_base{0};
+std::atomic<uint64_t> g_alias_guard{0};   // init()-time MEM_RESERVE holding the alias window before Vulkan/drivers load
 
 bool host_range_free(uint64_t base, uint64_t size, MEMORY_BASIC_INFORMATION* blocker = nullptr) {
     uint64_t cur = base;
@@ -353,6 +354,25 @@ bool init(const Config& cfg) {
             release_fixed(kStackBase);
             return false;
         }
+        // Hold the alias window BEFORE Vulkan / ICDs initialize so bottom-up 256 GiB driver VA arenas (issue #33) cannot
+        // swallow 0x2000000000..0x4000000000; released lazily once the guest / heap starts mapping inside it.
+        std::lock_guard al(g_alias_base_mu);
+        uint64_t chosen = g_alias_base.load(std::memory_order_relaxed);
+        if (!chosen) {
+            chosen = select_alias_base();
+            g_alias_base.store(chosen, std::memory_order_release);
+        }
+        if (g_alias_guard.load(std::memory_order_relaxed) == 0) {
+            void* guard = VirtualAlloc(reinterpret_cast<void*>(chosen), static_cast<SIZE_T>(kAliasSize), MEM_RESERVE, PAGE_NOACCESS);
+            if (guard && reinterpret_cast<uint64_t>(guard) == chosen) {
+                g_alias_guard.store(chosen, std::memory_order_release);
+            } else {
+                const DWORD err = guard ? 0 : GetLastError();
+                if (guard) VirtualFree(guard, 0, MEM_RELEASE);
+                NXLOG_W(kTag, "init: alias guard %llx (+%llx) failed (error %lu)", static_cast<unsigned long long>(chosen),
+                        static_cast<unsigned long long>(kAliasSize), static_cast<unsigned long>(err));
+            }
+        }
     }
     {
         std::lock_guard kl(g_kernel_mu);
@@ -415,10 +435,25 @@ void shutdown() {
         std::lock_guard kl(g_kernel_mu);
         g_kernel_next = kKernelBase;
     }
+    release_alias_guard();
     g_default_heap.store(0);
     g_alias_base.store(0, std::memory_order_release);
     g_inited.store(false);
     NXLOG_I(kTag, "shutdown: all mappings of this module released");
+}
+
+void release_alias_guard() {
+    if (g_alias_guard.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard lk(g_alias_base_mu);
+    const uint64_t guard = g_alias_guard.exchange(0, std::memory_order_acq_rel);
+    if (!guard) return;
+    if (!VirtualFree(reinterpret_cast<void*>(guard), 0, MEM_RELEASE)) {
+        NXLOG_W(kTag, "release_alias_guard %llx: VirtualFree failed, error %lu", static_cast<unsigned long long>(guard),
+                static_cast<unsigned long>(GetLastError()));
+    } else {
+        NXLOG_D(kTag, "released alias guard at %llx (+%llx)", static_cast<unsigned long long>(guard),
+                static_cast<unsigned long long>(kAliasSize));
+    }
 }
 
 uint64_t alias_base() {
@@ -810,6 +845,7 @@ uint64_t heap_granted() {     // the guest's SetHeapSize value
 }
 
 uint64_t heap_alias(uint64_t offset, uint64_t size, uint64_t at, Prot p) {
+    release_alias_guard();
     std::lock_guard lk(g_heap_mu);
     if (!g_heap_size || !g_section) {
         NXLOG_W(kTag, "heap_alias: %s", g_heap_size ? "the heap is private memory (no section): no alias views" : "no heap");

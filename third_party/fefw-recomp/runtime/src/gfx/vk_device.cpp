@@ -14,11 +14,14 @@
 #include <memory>
 #include <mutex>
 #include <tuple>
+#include <unordered_map>
 
 #include "nxrt/config.h"
+#include "nxrt/diag.h"
 #include "nxrt/gauge.h"
 #include "nxrt/memguard.h"
 #include "nxrt/gfx.h"
+#include "nxrt/gfx_tuning.h"
 #include "nxrt/log.h"
 #include "nxrt/platform.h"
 #include "vk_gauges.h"
@@ -229,6 +232,14 @@ struct Device::Impl {
     std::atomic<uint64_t> errors{0}, warnings{0}, infos{0}, verbose{0};
     std::mutex first_error_mu;
     std::string first_error;
+
+    // sticky device-lost latch + cached VK_EXT_device_fault string + interned NV checkpoint tags
+    std::atomic<bool> device_lost{false};
+    std::mutex fault_mu;
+    std::string fault_text;
+    bool fault_queried = false;
+    std::mutex cp_mu;
+    std::unordered_map<std::string, std::unique_ptr<char[]>> cp_intern;
 
     // image-format cache
     struct Key {
@@ -647,6 +658,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     queue_family_ = cands[pick].qfam;
     NXLOG_I(kTag, "using GPU %zu: %s%s", pick, gpus_[pick].name.c_str(), gpu_want.empty() ? " (default rule)" : " (override)");
     vkGetPhysicalDeviceProperties(physical_, &props_);
+    note_render_gpu_info(static_cast<int>(pick), gpus_[pick].vendor_id, gpus_[pick].name.c_str());
 
     extras::streamline_check_framegen(physical_);   // before device/swapchain hooks can allocate FG resources
 
@@ -667,6 +679,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT afsi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     VkPhysicalDeviceDepthClipControlFeaturesEXT adcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT adce = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT adbc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT acbc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT aeds3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT avids = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
@@ -691,6 +704,9 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     const bool x_fsi = add_ext(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, &afsi);
     const bool x_dcc = add_ext(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, &adcc);
     const bool x_dce = add_ext(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, &adce);
+    // Opt-in only ([nvn] depth_bias_force_unorm = 1): enabling FORCE_UNORM globally broke RTX 40/50 shadow passes (#51, #54, #39).
+    const bool want_dbc = nxrt::config_get_bool("nvn", "depth_bias_force_unorm", false);
+    const bool x_dbc = want_dbc && add_ext(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME, &adbc);
     const bool x_cbc = add_ext(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, &acbc);
     const bool x_eds3 = add_ext(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, &aeds3);
     const bool x_vids = add_ext(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, &avids);
@@ -726,6 +742,8 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     // availability chain with the others, so nothing is enabled that the physical device does not report (issue 10).
     VkPhysicalDeviceFaultFeaturesEXT adf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     add_ext(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &adf);
+    features_.device_diagnostic_checkpoints = has_dext(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    if (features_.device_diagnostic_checkpoints) dev_exts.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     features_.external_memory_host = has_dext(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (features_.external_memory_host) dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     features_.memory_budget = has_dext(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
@@ -792,6 +810,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.attachment_feedback_loop_layout = x_fbl && afbl.attachmentFeedbackLoopLayout;
     features_.depth_clip_control = x_dcc && adcc.depthClipControl;
     features_.depth_clip_enable = x_dce && adce.depthClipEnable;
+    features_.depth_bias_control_force_unorm = x_dbc && adbc.depthBiasControl && adbc.leastRepresentableValueForceUnormRepresentation;
     features_.custom_border_color = x_cbc && acbc.customBorderColors && acbc.customBorderColorWithoutFormat;
     features_.extended_dynamic_state3 = x_eds3;
     features_.vertex_input_dynamic_state = x_vids && avids.vertexInputDynamicState;
@@ -817,14 +836,15 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.present_id = x_pid && apid.presentId;
     features_.low_latency2 = x_ll2 && features_.present_id;
     features_.anti_lag = x_aal && aal.antiLag;
+    features_.device_fault = adf.deviceFault == VK_TRUE;
     features_.ubo_robustness = (x_prb && aprb.pipelineRobustness) ? (rba2 ? 2 : 1) : 0;   // robustBufferAccess itself is a required feature
     NXLOG_I(kTag, "texture compression on this GPU: BC %s, ASTC-LDR %s, ETC2 %s", features_.bc ? "yes" : "no",
             features_.astc_ldr ? "yes" : "no", features_.etc2 ? "yes" : "no");
-    NXLOG_I(kTag, "features: geometry %d float64 %d int64 %d dualSrc %d logicOp %d multiViewport %d drawParams %d descIndexing %d interlock %d depthClipControl %d customBorder %d hostMemImport %d pushDesc %d uboRobustness %d deviceFault %d",
+    NXLOG_I(kTag, "features: geometry %d float64 %d int64 %d dualSrc %d logicOp %d multiViewport %d drawParams %d descIndexing %d interlock %d depthClipControl %d depthBiasForceUnorm %d customBorder %d hostMemImport %d pushDesc %d uboRobustness %d deviceFault %d diagCheckpoints %d",
             features_.geometry_shader, features_.shader_float64, features_.shader_int64, features_.dual_src_blend, features_.logic_op,
             features_.multi_viewport, features_.shader_draw_parameters, features_.descriptor_indexing, features_.fragment_shader_interlock,
-            features_.depth_clip_control, features_.custom_border_color, features_.external_memory_host, features_.push_descriptor,
-            features_.ubo_robustness, adf.deviceFault ? 1 : 0);
+            features_.depth_clip_control, features_.depth_bias_control_force_unorm, features_.custom_border_color, features_.external_memory_host, features_.push_descriptor,
+            features_.ubo_robustness, adf.deviceFault ? 1 : 0, features_.device_diagnostic_checkpoints ? 1 : 0);
     {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT xh = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
         VkPhysicalDeviceVulkan11Properties p11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, features_.external_memory_host ? &xh : nullptr};
@@ -891,6 +911,13 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     std::vector<VkQueueFamilyProperties> qf(nq);
     vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nq, qf.data());
     timestamp_valid_bits_ = qf[queue_family_].timestampValidBits;
+    if (features_.device_diagnostic_checkpoints && nq > queue_family_) {
+        std::vector<VkQueueFamilyCheckpointPropertiesNV> qcp(nq, {VK_STRUCTURE_TYPE_QUEUE_FAMILY_CHECKPOINT_PROPERTIES_NV});
+        std::vector<VkQueueFamilyProperties2> qf2(nq, {VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2});
+        for (uint32_t i = 0; i < nq; ++i) qf2[i].pNext = &qcp[i];
+        vkGetPhysicalDeviceQueueFamilyProperties2(physical_, &nq, qf2.data());
+        if (qcp[queue_family_].checkpointExecutionStageMask == 0) features_.device_diagnostic_checkpoints = false;
+    }
 
     VmaVulkanFunctions vf = {};
     vf.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
@@ -914,6 +941,9 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
 
     NXLOG_I(kTag, "device ready: %s, queue family %u, validation %s, %s", props_.deviceName, queue_family_, validation_ ? "on" : "off",
             headless ? "headless" : "window surface");
+    // Do NOT call prewarm_hwdec_async() here: creating a second FFmpeg Vulkan device concurrently with
+    // initial swapchain / NVN pipeline bring-up deadlocks nvoglv64.dll / amdvlk64.dll on boot (#91, #42).
+    // Hardware video decode initializes lazily on the decoder worker thread when the first cutscene opens.
     return true;
 }
 
@@ -1187,6 +1217,7 @@ void Device::invalidate_buffer(const Buffer& b) {
 
 // ---- one-shot submit, idle, stats -------------------------------------------------------------------------------------
 bool Device::submit_once(const std::function<void(VkCommandBuffer)>& fn) {
+    if (!device_ || device_lost()) return false;
     std::lock_guard<std::mutex> lk(impl_->once_mu);
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = impl_->once_pool;
@@ -1203,21 +1234,177 @@ bool Device::submit_once(const std::function<void(VkCommandBuffer)>& fn) {
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    bool ok;
+    VkResult sr = VK_ERROR_UNKNOWN;
     {
         std::lock_guard<std::mutex> ql(queue_mutex_);
-        ok = vkQueueSubmit(queue_, 1, &si, impl_->once_fence) == VK_SUCCESS;
+        sr = vkQueueSubmit(queue_, 1, &si, impl_->once_fence);
     }
-    if (ok) ok = vkWaitForFences(device_, 1, &impl_->once_fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
-    vkResetFences(device_, 1, &impl_->once_fence);
+    bool ok = (sr == VK_SUCCESS);
+    if (!ok) note_device_lost(sr, "Device::submit_once(vkQueueSubmit)");
+    if (ok) {
+        for (;;) {
+            const VkResult wr = vkWaitForFences(device_, 1, &impl_->once_fence, VK_TRUE, 2000000000ull);
+            if (wr == VK_SUCCESS) break;
+            if (wr == VK_TIMEOUT && !device_lost()) continue;
+            note_device_lost(wr, "Device::submit_once(vkWaitForFences)");
+            ok = false;
+            break;
+        }
+    }
+    if (ok && !device_lost()) vkResetFences(device_, 1, &impl_->once_fence);
     vkFreeCommandBuffers(device_, impl_->once_pool, 1, &cmd);
     vk_gauge_command_buffers().sub(1);
     return ok;
 }
 
 void Device::wait_idle() {
-    std::lock_guard<std::mutex> ql(queue_mutex_);
-    vkDeviceWaitIdle(device_);
+    if (!device_ || device_lost()) return;
+    VkResult r = VK_SUCCESS;
+    {
+        std::lock_guard<std::mutex> ql(queue_mutex_);
+        r = vkDeviceWaitIdle(device_);
+    }
+    note_device_lost(r, "Device::wait_idle");
+}
+
+bool Device::device_lost() const {
+    return impl_ && impl_->device_lost.load(std::memory_order_acquire);
+}
+
+bool Device::note_device_lost(VkResult r, const char* where) {
+    if (!impl_) return r == VK_ERROR_DEVICE_LOST;
+    if (r != VK_ERROR_DEVICE_LOST) return impl_->device_lost.load(std::memory_order_acquire);
+    if (!impl_->device_lost.exchange(true, std::memory_order_acq_rel)) {
+        const std::string why = query_device_fault();
+        const std::string cps = query_checkpoints();
+        NXLOG_E(kTag, "VK_ERROR_DEVICE_LOST observed at %s%s%s%s%s", where ? where : "(unknown)",
+                why.empty() ? "" : "; device fault: ", why.empty() ? "" : why.c_str(),
+                cps.empty() ? "" : "; checkpoints: ", cps.empty() ? "" : cps.c_str());
+
+        std::string snap = std::string("DEVICE LOST at ") + (where ? where : "(unknown)") + "\n";
+        if (!why.empty()) snap += "device fault: " + why + "\n";
+        if (!cps.empty()) snap += "checkpoints: " + cps + "\n";
+        snap += diag_extra_reports();
+        snap += "last files opened (oldest first):\n";
+        const std::vector<std::string> files = diag_recent_files();
+        if (files.empty()) snap += "  (none)\n";
+        for (const std::string& f : files) snap += "  " + f + "\n";
+
+        for (size_t pos = 0; pos < snap.size();) {
+            size_t eol = snap.find('\n', pos);
+            if (eol == std::string::npos) eol = snap.size();
+            if (eol > pos) NXLOG_E(kTag, "devicelost: %.*s", static_cast<int>(eol - pos), snap.data() + pos);
+            pos = eol + 1;
+        }
+        log_flush();
+
+        std::string path = crash_report_path();
+        const std::string suf = "_crash.txt";
+        if (path.size() >= suf.size() && path.compare(path.size() - suf.size(), suf.size(), suf) == 0) {
+            path.replace(path.size() - suf.size(), suf.size(), "_devicelost.txt");
+            if (FILE* fp = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(snap.data(), 1, snap.size(), fp);
+                std::fclose(fp);
+            }
+        }
+    }
+    return true;
+}
+
+std::string Device::query_device_fault() const {
+    if (!impl_ || !features_.device_fault || !device_) return {};
+    std::unique_lock<std::mutex> lk(impl_->fault_mu, std::try_to_lock);
+    if (!lk.owns_lock()) return {};
+    if (impl_->fault_queried && !impl_->fault_text.empty()) return impl_->fault_text;
+    auto pfn = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(device_, "vkGetDeviceFaultInfoEXT"));
+    if (!pfn) {
+        impl_->fault_queried = true;
+        return {};
+    }
+    VkDeviceFaultCountsEXT counts = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    const VkResult cr = pfn(device_, &counts, nullptr);
+    if (cr != VK_SUCCESS && cr != VK_INCOMPLETE) return {};
+    constexpr VkDeviceSize kMaxVendorBinary = 16ull << 20;
+    std::vector<VkDeviceFaultAddressInfoEXT> addrs(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    std::vector<uint8_t> vendor_bin;
+    if (counts.vendorBinarySize > kMaxVendorBinary) {
+        counts.vendorBinarySize = 0;
+    } else if (counts.vendorBinarySize > 0) {
+        vendor_bin.resize(static_cast<size_t>(counts.vendorBinarySize));
+    }
+    VkDeviceFaultInfoEXT info = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addrs.empty() ? nullptr : addrs.data();
+    info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+    // NVIDIA RTX 40xx drivers crash writing 0x0 inside nvoglv64.dll if counts.vendorBinarySize > 0 and pVendorBinaryData is null (#41).
+    info.pVendorBinaryData = vendor_bin.empty() ? nullptr : vendor_bin.data();
+    const VkResult ir = pfn(device_, &counts, &info);
+    if (ir != VK_SUCCESS && ir != VK_INCOMPLETE) return {};
+    impl_->fault_queried = true;
+    char buf[400];
+    std::string out;
+    std::snprintf(buf, sizeof buf, "description '%s'", info.description[0] ? info.description : "(none)");
+    out = buf;
+    for (size_t i = 0; i < counts.addressInfoCount && i < addrs.size(); ++i) {
+        const VkDeviceFaultAddressInfoEXT& a = addrs[i];
+        std::snprintf(buf, sizeof buf, "; address 0x%llx (type %d, precision 0x%llx)",
+                      static_cast<unsigned long long>(a.reportedAddress), static_cast<int>(a.addressType),
+                      static_cast<unsigned long long>(a.addressPrecision));
+        out += buf;
+    }
+    for (size_t i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i) {
+        const VkDeviceFaultVendorInfoEXT& v = vendors[i];
+        std::snprintf(buf, sizeof buf, "; vendor '%s' code 0x%llx data 0x%llx", v.description,
+                      static_cast<unsigned long long>(v.vendorFaultCode), static_cast<unsigned long long>(v.vendorFaultData));
+        out += buf;
+    }
+    if (!vendor_bin.empty() && counts.vendorBinarySize > 0) {
+        std::snprintf(buf, sizeof buf, "; vendorBinary %llu bytes", static_cast<unsigned long long>(counts.vendorBinarySize));
+        out += buf;
+    }
+    impl_->fault_text = std::move(out);
+    return impl_->fault_text;
+}
+
+void Device::cmd_checkpoint(VkCommandBuffer cb, const char* tag) const {
+    if (!impl_ || !features_.device_diagnostic_checkpoints || !vkCmdSetCheckpointNV || !cb || !tag || !*tag || device_lost()) return;
+    const char* stable = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(impl_->cp_mu);
+        auto it = impl_->cp_intern.find(tag);
+        if (it != impl_->cp_intern.end()) {
+            stable = it->second.get();
+        } else if (impl_->cp_intern.size() < 4096) {
+            const size_t n = std::strlen(tag) + 1;
+            auto buf = std::make_unique<char[]>(n);
+            std::memcpy(buf.get(), tag, n);
+            stable = buf.get();
+            impl_->cp_intern.emplace(tag, std::move(buf));
+        } else {
+            stable = "<checkpoint-cap>";
+        }
+    }
+    vkCmdSetCheckpointNV(cb, stable);
+}
+
+std::string Device::query_checkpoints() const {
+    if (!impl_ || !features_.device_diagnostic_checkpoints || !vkGetQueueCheckpointDataNV || !queue_) return {};
+    std::unique_lock<std::mutex> ql(queue_mutex_, std::try_to_lock);
+    if (!ql.owns_lock()) return {};
+    uint32_t n = 0;
+    vkGetQueueCheckpointDataNV(queue_, &n, nullptr);
+    if (!n) return {};
+    std::vector<VkCheckpointDataNV> cp(n, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+    vkGetQueueCheckpointDataNV(queue_, &n, cp.data());
+    std::string out;
+    for (uint32_t i = 0; i < n; ++i) {
+        const char* m = static_cast<const char*>(cp[i].pCheckpointMarker);
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "%sstage 0x%x: %s", out.empty() ? "" : "; ",
+                      static_cast<unsigned>(cp[i].stage), m ? m : "(null)");
+        out += buf;
+    }
+    return out;
 }
 
 Device::MemoryStats Device::memory_stats() {

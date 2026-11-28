@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "../src/services/fs_romfs.h"
+#include "nxrt/config.h"
 #include "test_framework.h"
 
 NXTEST_GROUP(svc_fs_romfs)
@@ -777,4 +778,222 @@ NXTEST(romfs_from_nup_package) {
         REQUIRE(o.load());
         o.check_layout(2, 2);
     }
+}
+
+namespace {
+std::vector<uint8_t> make_xbc1(const char* name, uint32_t unc, uint32_t comp, const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> out(0x30 + payload.size(), 0);
+    auto put32 = [&](size_t o, uint32_t v) { for (int i = 0; i < 4; i++) out[o + i] = static_cast<uint8_t>(v >> (8 * i)); };
+    std::memcpy(out.data(), "xbc1", 4);
+    put32(0x04, 1);
+    put32(0x08, unc);
+    put32(0x0C, comp);
+    put32(0x10, 0x12345678u);
+    const size_t n = std::min<size_t>(std::strlen(name), 27);
+    std::memcpy(out.data() + 0x14, name, n);
+    std::memcpy(out.data() + 0x30, payload.data(), payload.size());
+    return out;
+}
+}  // namespace
+
+NXTEST(romfs_mods_m2_and_m2b_archive_override) {
+    TempTree t;
+    const auto rom = t.root / "romfs";
+    const auto mods = t.root / "mods";
+    const auto m2mod = mods / "M2Test";
+    std::error_code ec;
+    std::filesystem::create_directories(rom, ec);
+    std::filesystem::create_directories(m2mod / "romfs", ec);
+    std::filesystem::create_directories(m2mod / ".ard", ec);
+
+    // Host bf2.ard: record 0 ("font_binary2.txt", 48+64 bytes) followed by record 1 ("other.dat", 48+64 bytes).
+    std::vector<uint8_t> rec0_van = make_xbc1("font_binary2.txt", 200, 64, pattern(64, 10));
+    std::vector<uint8_t> rec1_van = make_xbc1("other.dat", 120, 64, pattern(64, 20));
+    std::vector<uint8_t> ard_van = rec0_van;
+    ard_van.insert(ard_van.end(), rec1_van.begin(), rec1_van.end());
+    { std::ofstream(long_path(rom / "bf2.ard"), std::ios::binary).write(reinterpret_cast<const char*>(ard_van.data()), ard_van.size()); }
+
+    // M2 override (.rec) + M2b tail (append.bin).
+    std::vector<uint8_t> rec0_mod = make_xbc1("font_binary2.txt", 300, 64, pattern(64, 99));
+    std::vector<uint8_t> tail_mod = make_xbc1("big_tex.dds", 500, 80, pattern(80, 77));
+    { std::ofstream(long_path(m2mod / ".ard" / "font_binary2.txt.rec"), std::ios::binary).write(reinterpret_cast<const char*>(rec0_mod.data()), rec0_mod.size()); }
+    { std::ofstream(long_path(m2mod / ".ard" / "append.bin"), std::ios::binary).write(reinterpret_cast<const char*>(tail_mod.data()), tail_mod.size()); }
+
+    struct ConfigGuard {
+        ~ConfigGuard() { nxrt::config_clear(); }
+    } cg;
+    nxrt::config_set("fs", "romfs", utf8(rom).c_str());
+    nxrt::config_set("fs", "mods", utf8(mods).c_str());
+
+    RomfsImage img;
+    REQUIRE(build_from(rom, img));
+
+    uint64_t ard_off = 0, ard_sz = 0;
+    REQUIRE(img.file_extent("/bf2.ard", &ard_off, &ard_sz));
+    CHECK_EQ(ard_sz, ard_van.size() + tail_mod.size());
+
+    // Vanilla record 1 (< ard_real_size) must still be readable when append.bin is present.
+    std::vector<uint8_t> got_rec1(rec1_van.size());
+    REQUIRE(img.read(ard_off + rec0_van.size(), got_rec1.data(), got_rec1.size()));
+    CHECK(got_rec1 == rec1_van);
+
+    // M2 .rec: header read + split multi-chunk payload reads must all come from the .rec file.
+    std::vector<uint8_t> got_hdr(0x30), got_p1(32), got_p2(32);
+    REQUIRE(img.read(ard_off, got_hdr.data(), 0x30));
+    REQUIRE(img.read(ard_off + 0x30, got_p1.data(), 32));
+    REQUIRE(img.read(ard_off + 0x30 + 32, got_p2.data(), 32));
+    std::vector<uint8_t> got_rec0 = got_hdr;
+    got_rec0.insert(got_rec0.end(), got_p1.begin(), got_p1.end());
+    got_rec0.insert(got_rec0.end(), got_p2.begin(), got_p2.end());
+    CHECK(got_rec0 == rec0_mod);
+
+    // M2b append.bin: direct tail read + read spanning the real/tail boundary.
+    std::vector<uint8_t> got_tail(tail_mod.size());
+    REQUIRE(img.read(ard_off + ard_van.size(), got_tail.data(), got_tail.size()));
+    CHECK(got_tail == tail_mod);
+
+    std::vector<uint8_t> got_span(rec1_van.size() + tail_mod.size());
+    REQUIRE(img.read(ard_off + rec0_van.size(), got_span.data(), got_span.size()));
+    std::vector<uint8_t> want_span = rec1_van;
+    want_span.insert(want_span.end(), tail_mod.begin(), tail_mod.end());
+    CHECK(got_span == want_span);
+}
+
+NXTEST(romfs_mods_m2b_multi_mod_tails_and_arh_compose) {
+    auto make_arh = [](uint64_t off0, uint32_t c0, uint32_t u0, uint64_t off1, uint32_t c1, uint32_t u1) {
+        std::vector<uint8_t> b(0x30 + 2 * 24, 0);
+        auto put32 = [&](size_t o, uint32_t v) { for (int i = 0; i < 4; i++) b[o + i] = static_cast<uint8_t>(v >> (8 * i)); };
+        auto put64 = [&](size_t o, uint64_t v) { put32(o, static_cast<uint32_t>(v)); put32(o + 4, static_cast<uint32_t>(v >> 32)); };
+        std::memcpy(b.data(), "arh1", 4);
+        put32(0x1C, 0x30);
+        put32(0x20, 2);
+        put64(0x30, off0); put32(0x38, c0); put32(0x3C, u0);
+        put64(0x48, off1); put32(0x50, c1); put32(0x54, u1);
+        return b;
+    };
+    auto get64 = [](const uint8_t* p) -> uint64_t {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++) v |= uint64_t(p[i]) << (8 * i);
+        return v;
+    };
+    auto get32 = [](const uint8_t* p) -> uint32_t {
+        return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+    };
+
+    TempTree t;
+    const auto rom = t.root / "romfs";
+    const auto mods = t.root / "mods";
+    const auto m_low = mods / "ModLow";
+    const auto m_high = mods / "ModHigh";
+    std::error_code ec;
+    std::filesystem::create_directories(rom, ec);
+    std::filesystem::create_directories(m_low / "romfs", ec);
+    std::filesystem::create_directories(m_low / ".ard", ec);
+    std::filesystem::create_directories(m_high / "romfs", ec);
+    std::filesystem::create_directories(m_high / ".ard", ec);
+
+    std::vector<uint8_t> ard_van = pattern(128, 5);
+    std::vector<uint8_t> arh_van = make_arh(0, 10, 20, 64, 10, 20);
+    { std::ofstream(long_path(rom / "bf2.ard"), std::ios::binary).write(reinterpret_cast<const char*>(ard_van.data()), ard_van.size()); }
+    { std::ofstream(long_path(rom / "bf2.arh"), std::ios::binary).write(reinterpret_cast<const char*>(arh_van.data()), arh_van.size()); }
+
+    // ModLow alters entry 0 to appended offset 128 (+0 in ModLow tail).
+    std::vector<uint8_t> tail_low = pattern(96, 33);
+    std::vector<uint8_t> arh_low = make_arh(128, 48, 90, 64, 10, 20);
+    { std::ofstream(long_path(m_low / ".ard" / "append.bin"), std::ios::binary).write(reinterpret_cast<const char*>(tail_low.data()), tail_low.size()); }
+    { std::ofstream(long_path(m_low / "romfs" / "bf2.arh"), std::ios::binary).write(reinterpret_cast<const char*>(arh_low.data()), arh_low.size()); }
+
+    // ModHigh alters entry 1 to appended offset 128 (+0 in ModHigh tail); must relocate to 128 + 96 = 224.
+    std::vector<uint8_t> tail_high = pattern(80, 77);
+    std::vector<uint8_t> arh_high = make_arh(0, 10, 20, 128, 32, 70);
+    { std::ofstream(long_path(m_high / ".ard" / "append.bin"), std::ios::binary).write(reinterpret_cast<const char*>(tail_high.data()), tail_high.size()); }
+    { std::ofstream(long_path(m_high / "romfs" / "bf2.arh"), std::ios::binary).write(reinterpret_cast<const char*>(arh_high.data()), arh_high.size()); }
+
+    struct ConfigGuard {
+        ~ConfigGuard() { nxrt::config_clear(); }
+    } cg;
+    nxrt::config_set("fs", "romfs", utf8(rom).c_str());
+    nxrt::config_set("fs", "mods", utf8(mods).c_str());
+    nxrt::config_set("mods", "order", "ModHigh, ModLow");
+
+    RomfsImage img;
+    REQUIRE(build_from(rom, img));
+
+    uint64_t ard_off = 0, ard_sz = 0, arh_off = 0, arh_sz = 0;
+    REQUIRE(img.file_extent("/bf2.ard", &ard_off, &ard_sz));
+    REQUIRE(img.file_extent("/bf2.arh", &arh_off, &arh_sz));
+    CHECK_EQ(ard_sz, ard_van.size() + tail_low.size() + tail_high.size());
+    CHECK_EQ(arh_sz, arh_van.size());
+
+    // Multi-slice tail read spanning vanilla -> ModLow -> ModHigh in one read.
+    std::vector<uint8_t> got_all(ard_sz);
+    REQUIRE(img.read(ard_off, got_all.data(), got_all.size()));
+    std::vector<uint8_t> want_all = ard_van;
+    want_all.insert(want_all.end(), tail_low.begin(), tail_low.end());
+    want_all.insert(want_all.end(), tail_high.begin(), tail_high.end());
+    CHECK(got_all == want_all);
+
+    // Composed bf2.arh keeps ModLow's entry 0 at 128 and relocates ModHigh's entry 1 to 224.
+    std::vector<uint8_t> got_arh(arh_sz);
+    REQUIRE(img.read(arh_off, got_arh.data(), got_arh.size()));
+    CHECK_EQ(get64(got_arh.data() + 0x30), 128ull);
+    CHECK_EQ(get32(got_arh.data() + 0x38), 48u);
+    CHECK_EQ(get64(got_arh.data() + 0x48), 128ull + tail_low.size());
+    CHECK_EQ(get32(got_arh.data() + 0x50), 32u);
+}
+
+NXTEST(romfs_mods_m4_option_layers_and_pending_rebuild) {
+    TempTree t;
+    const auto rom = t.root / "romfs";
+    const auto mods = t.root / "mods";
+    const auto opt_mod = mods / "BetterTex";
+    const auto pend_mod = mods / "CodeMod";
+    const auto dot_dir = mods / ".hidden";
+    std::error_code ec;
+    std::filesystem::create_directories(rom, ec);
+    std::filesystem::create_directories(opt_mod / "romfs", ec);
+    std::filesystem::create_directories(opt_mod / "romfs_high", ec);
+    std::filesystem::create_directories(pend_mod / "romfs", ec);
+    std::filesystem::create_directories(dot_dir / "romfs", ec);
+
+    { std::ofstream(long_path(rom / "a.txt"), std::ios::binary) << "vanilla-a"; }
+    { std::ofstream(long_path(rom / "b.txt"), std::ios::binary) << "vanilla-b"; }
+    { std::ofstream(long_path(rom / "c.txt"), std::ios::binary) << "vanilla-c"; }
+    { std::ofstream(long_path(opt_mod / "romfs" / "a.txt"), std::ios::binary) << "base-a"; }
+    { std::ofstream(long_path(opt_mod / "romfs" / "b.txt"), std::ios::binary) << "base-b"; }
+    { std::ofstream(long_path(opt_mod / "romfs_high" / "a.txt"), std::ios::binary) << "high-a"; }
+    { std::ofstream(long_path(pend_mod / "romfs" / "c.txt"), std::ios::binary) << "code-c"; }
+    { std::ofstream(long_path(dot_dir / "romfs" / "c.txt"), std::ios::binary) << "dot-c"; }
+    // Unsafe traversal layer must be ignored without escaping mod_dir.
+    {
+        std::ofstream layers(long_path(mods / ".mod_layers.tsv"), std::ios::binary);
+        layers << "BetterTex\tromfs_high\n";
+        layers << "BetterTex\t../escape\n";
+    }
+
+    struct ConfigGuard {
+        ~ConfigGuard() { nxrt::config_clear(); }
+    } cg;
+    nxrt::config_set("fs", "romfs", utf8(rom).c_str());
+    nxrt::config_set("fs", "mods", utf8(mods).c_str());
+    nxrt::config_set("mods", "pending_rebuild", "CodeMod");
+
+    RomfsImage img;
+    REQUIRE(build_from(rom, img));
+
+    auto read_txt = [&](const char* path) -> std::string {
+        uint64_t off = 0, sz = 0;
+        if (!img.file_extent(path, &off, &sz)) return {};
+        std::string s(static_cast<size_t>(sz), '\0');
+        if (!img.read(off, s.data(), sz)) return {};
+        return s;
+    };
+    CHECK_EQ(read_txt("/a.txt"), "high-a");
+    CHECK_EQ(read_txt("/b.txt"), "base-b");
+    CHECK_EQ(read_txt("/c.txt"), "vanilla-c");
+
+    // Once Set up clears pending_rebuild, CodeMod's romfs takes effect cleanly.
+    nxrt::config_set("mods", "pending_rebuild", "");
+    REQUIRE(build_from(rom, img));
+    CHECK_EQ(read_txt("/c.txt"), "code-c");
 }

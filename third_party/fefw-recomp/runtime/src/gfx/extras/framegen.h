@@ -16,6 +16,16 @@ bool framegen_requested();   // mode != 0
 bool framegen_dlss();        // mode 1 or 2: Streamline is needed
 bool framegen_running();     // the chosen backend works (DLSS-G supported, or the FSR 3 swapchain made)
 
+struct FramegenTelemetry {
+    bool requested = false;   // [dlss] frame_gen != 0
+    bool available = false;   // active FG backend is initialized and usable
+    bool active = false;      // actively interpolating frames right now
+    int mode = 0;             // 0 off, 1 DLSS-G, 2 DLSS-G standby, 3 FSR 3 FG
+    double game_fps = 0.0;    // measured game presents/s (~0.5 s window)
+    double shown_fps = 0.0;   // measured swapchain presents/s (~0.5 s window)
+};
+FramegenTelemetry framegen_telemetry();
+
 // The Streamline frame token for DLSS SR's constants (viewport 0). Without frame_gen: a new token per call, as before. With it: the frame
 // the render thread is building (its index advances at each present; a second evaluation before the present takes the next index, since
 // Streamline refuses two sets of constants in one frame). Null without Streamline.

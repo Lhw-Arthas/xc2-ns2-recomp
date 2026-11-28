@@ -235,7 +235,7 @@ void OverlayComposite::begin_overlay(VkCommandBuffer cb) {
 
 void OverlayComposite::composite(VkCommandBuffer cb, VkImageView dst_view, VkFormat dst_format, VkExtent2D dst_extent, OutputKind kind, float paper_white_nits,
                                  float peak_nits) {
-    if (!dev_ || !target_ || kind == OutputKind::Sdr8 || !dst_extent.width || !dst_extent.height) return;
+    if (!dev_ || !target_ || !dst_extent.width || !dst_extent.height) return;
     VkPipeline pipe = pipeline(dst_format);
     if (!pipe) return;
 
@@ -246,7 +246,7 @@ void OverlayComposite::composite(VkCommandBuffer cb, VkImageView dst_view, VkFor
     target_read_ = true;
 
     CompositePush pc = {};
-    pc.p[0] = kind == OutputKind::Hdr10 ? 2.0f : 3.0f;
+    pc.p[0] = kind == OutputKind::Hdr10 ? 2.0f : kind == OutputKind::ScRgb ? 3.0f : 1.0f;
     pc.p[1] = paper_white_nits;
     pc.p[2] = peak_nits;
 

@@ -15,6 +15,7 @@
 // The same signature is used the other way round by the tests: abi::Caller<R(A...)> marshals a C++ call into guest
 // registers and runs the thunk the way the generated code's call_indirect does, so a test calls NVN exactly like a game.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <tuple>
@@ -22,6 +23,7 @@
 #include <utility>
 
 #include "nxrt/abi.h"
+#include "nxrt/diag.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/nvn.h"
 #include <nvn/nvn.h>
@@ -125,26 +127,22 @@ inline void write_result(::Ctx* c, R v) {
 // ---- the thunk ---------------------------------------------------------------------------------------------------------
 // Set when a recording ran out of the command or control memory the game added (api_cmdbuf.cpp): the thunk calls the game's
 // memory callback after the NVN function returns, with no lock held, on the recording thread.
+// g_cmdmem_pending_count guards t_cmdmem_pending with a single predicted-not-taken global load, avoiding DLL TLS access on 99.999% of calls.
 inline thread_local bool t_cmdmem_pending = false;
+inline std::atomic<uint32_t> g_cmdmem_pending_count{0};
 void cmdmem_run_pending(::Ctx* c);
 
 template <auto Fn>
 struct Thunk;
 
-// The Ctx of the HLE call this thread is inside, or null (thread_local, set by the thunks below).
-inline thread_local ::Ctx* t_ctx = nullptr;
-inline ::Ctx* current_ctx() { return t_ctx; }
+// The Ctx of the active guest thread (registered once at thread start in diag_register_thread; avoids per-call TLS save/restore + EH frame).
+inline ::Ctx* current_ctx() { return nxrt::diag_thread_ctx(); }
 
 template <class R, class... A, R (*Fn)(A...)>
 struct Thunk<Fn> {
     static constexpr char kRet = class_of<R>();
     static constexpr char kArgs[sizeof...(A) + 1] = {class_of<A>()..., '\0'};
     static void call(::Ctx* c) {
-        // The Ctx of the call this thread is inside, so a deep callee (the movie player's tick on the presenting thread) can call
-        // guest code: the runtime holds no other handle on it inside an HLE function.
-        Ctx* const outer = t_ctx;
-        t_ctx = c;
-        struct Restore { Ctx* prev; ~Restore() { t_ctx = prev; } } restore{outer};
         ArgReader rd{c};
         if constexpr (std::is_void_v<R>) {
             std::apply(Fn, std::tuple<A...>{rd.template next<A>()...});
@@ -152,7 +150,8 @@ struct Thunk<Fn> {
             R r = std::apply(Fn, std::tuple<A...>{rd.template next<A>()...});
             write_result<R>(c, r);
         }
-        if (t_cmdmem_pending) cmdmem_run_pending(c);
+        if (g_cmdmem_pending_count.load(std::memory_order_relaxed) != 0 && t_cmdmem_pending) [[unlikely]]
+            cmdmem_run_pending(c);
     }
 };
 

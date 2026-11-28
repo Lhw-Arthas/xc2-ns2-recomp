@@ -165,6 +165,33 @@ NXTEST(peak_ratio_values) {
     CHECK(hdr::peak_ratio(100.0f, 203.0f, 1.0f) == 1.0f);                // peak below paper white: never below 1
 }
 
+// ---- the UI on HDR output ---------------------------------------------------------------------------------------------------------
+
+NXTEST(hdr_ui_split_decision) {
+    // not HDR output: never wanted, the UI at paper white
+    hdr::HdrUiSplit s = hdr::hdr_ui_split(false, 3.0f, 200.0f, 150.0);
+    CHECK(!s.wanted);
+    CHECK(s.ui_scale == 1.0f);
+    // the highlight boost alone wants the copy; the UI stays at paper white
+    s = hdr::hdr_ui_split(true, 2.6f, 200.0f, 0.0);
+    CHECK(s.wanted);
+    CHECK(s.ui_scale == 1.0f);
+    // no boost and the UI at paper white: nothing to do
+    s = hdr::hdr_ui_split(true, 1.0f, 200.0f, 0.0);
+    CHECK(!s.wanted);
+    s = hdr::hdr_ui_split(true, 1.0f, 200.0f, 200.0);
+    CHECK(!s.wanted);
+    CHECK(s.ui_scale == 1.0f);
+    // no boost but a UI brightness of its own: wanted, the scale over paper white
+    s = hdr::hdr_ui_split(true, 1.0f, 200.0f, 150.0);
+    CHECK(s.wanted);
+    CHECK(std::fabs(s.ui_scale - 0.75f) < 1e-6f);
+    // paper white not known: the UI at paper white
+    s = hdr::hdr_ui_split(true, 1.0f, 0.0f, 150.0);
+    CHECK(!s.wanted);
+    CHECK(s.ui_scale == 1.0f);
+}
+
 // ---- HDR encodes ----------------------------------------------------------------------------------------------------------------
 
 NXTEST(encode_hdr10_and_scrgb_clamps_and_scales) {

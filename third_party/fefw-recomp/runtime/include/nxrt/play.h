@@ -21,10 +21,12 @@
 //   log_status = 0              1: one status line per second in the log (context, aim state, input counts)
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include "nxrt/frame_limiter.h"
 #include "nxrt/gfx.h"
+#include "nxrt/overlay.h"
 
 namespace nxrt::play {
 
@@ -51,14 +53,35 @@ struct StartOptions {
 };
 bool start(const StartOptions& opt);        // after nxrt::init, the renderer and the NVN back end; installs the hid input source and the hooks
 void stop();                                // saves changed settings, removes the hooks and the input source
+void set_hud_callback(std::function<void(const gfx::HudCanvas&)> fn);   // optional foreground HUD drawn over the game frame
+uint64_t create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes);  // upload BC3 texture for HudCanvas::image
+void set_picker(gfx::PickerCallbacks cb);                                // optional searchable destination picker window (e.g. F4)
+void toggle_picker();                                                    // toggle destination picker window
 bool overlay_blocks_game();                 // true while the F1 overlay (or on-screen keyboard) wants keyboard/mouse/pad input
+
+// The binding engine's contribution at `now_ns`: Switch buttons plus stick deflection in -1..1. Play mode installs its
+// own input source (PlaySource) that already merges this, but a game whose own source replaces it (xc2_boot's LiveInput
+// does, on purpose) gets nothing from the keyboard unless it asks for this. False when play mode is not running.
+bool binding_output(uint64_t now_ns, uint64_t* buttons, float* lx, float* ly, float* rx, float* ry);
+
+// Hands the pointer to an external input source (xc2_boot's LiveInput turns the counts into right-stick camera
+// movement). While this is on, play mode stops capturing and releasing the mouse itself, and stops reading the
+// counts for its own aim, so the two never fight over the same deltas.
+void set_external_mouse_capture(bool on);
 
 // Live gamepad tuning read by external input sources (e.g. xc2_boot's LiveInput). Lock-free snapshot.
 struct LivePadConfig {
     bool label_abxy = false;
     float stick_deadzone = 0.10f;
     float right_deadzone = 0.10f;
+    float stick_max = 1.0f;                 // left stick outer-range scale (0.5..1.0; issue #76)
     float look_sens = 1.0f;
+    float mouse_stick_scale = 8.0f;         // keyboard/mouse camera: mouse counts for a full right-stick deflection
+    bool mouse_camera_capture = true;       // live toggle from F1 Mouse group (issue #78)
+    int ls_center_x = 0, ls_center_y = 0;   // left-stick centre from the F1 calibration, subtracted before the dead zone
+    float raw_ls_x = 0, raw_ls_y = 0;       // the left stick as the pad reports it, for the calibration readout
+    int rs_center_x = 0, rs_center_y = 0;
+    float raw_rs_x = 0, raw_rs_y = 0;
     bool invert_y = false;
     bool rumble = true;
     float rumble_scale = 1.0f;
@@ -68,6 +91,10 @@ LivePadConfig live_pad_config();
 // gamepad navigation (- + + chord, A/B/D-pad) and Live Switch Pad Monitor work live. Returns the Switch button mask
 // currently held back from the game by the overlay (e.g. buttons still held right after closing the menu).
 uint64_t note_external_pad(uint64_t buttons, int lx, int ly, int rx, int ry);
+// The left stick as the pad reports it (-1..1, y up), published by the external input source so the F1 calibration can
+// show it and the player can see how far the rest position has drifted (issue #76).
+void publish_raw_left_stick(float x, float y);
+void publish_raw_right_stick(float x, float y);
 
 // Counters for the tests and the log.
 struct Stats {

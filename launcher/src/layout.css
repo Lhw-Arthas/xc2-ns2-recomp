@@ -97,3 +97,26 @@ body {
   #nav .label, #nav .brand .name { display: none; }
   .field { grid-template-columns: 1fr; gap: var(--space-2); }
 }
+
+/* The language switch in the top-right corner: one click, always shows the language it switches to. */
+.lang-switch {
+  position: fixed;
+  top: var(--space-3, 12px);
+  right: var(--space-4, 16px);
+  z-index: 40;
+  padding: 9px 20px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border-strong, #6aa6c9);
+  background: var(--color-surface-raised, #eef8fe);
+  color: var(--color-text, #0c2b40);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.lang-switch:hover, .lang-switch:focus-visible {
+  border-color: var(--color-accent, #d0244c);
+  color: var(--color-accent, #d0244c);
+  outline: none;
+}

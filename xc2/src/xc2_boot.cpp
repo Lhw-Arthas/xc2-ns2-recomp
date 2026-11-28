@@ -22,6 +22,7 @@
 #include <string>
 
 #include "nxrt/config.h"
+#include "nxrt/diag.h"
 #include "nxrt/render_quality.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/fiber.h"
@@ -34,10 +35,13 @@
 #include "nxrt/log.h"
 #include "nxrt/memory.h"
 #include "nxrt/module.h"
+#include "nxrt/movie_vdec.h"
 #include "nxrt/nxmodule.h"
 #include "nxrt/runtime.h"
+#include "nxrt/services_api.h"
 #include "nxrt/svc.h"
 #include "nxrt/gfx.h"
+#include "nxrt/gfx_tuning.h"
 #include "nxrt/nvn.h"
 #include "nxrt/nvn_backend.h"
 #include "nxrt/platform.h"
@@ -46,11 +50,206 @@
 #include <memory>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 #include "xc2ns2/xc2ns2_game.h"
 #include "xc2_modules.h"
+#include "xc2_nav_overlay.h"
+#include "voice/xc2_voice_overlay.h"
+
+#include "play_types.h"
+
+// ---- the keyboard/mouse scheme the game starts with ---------------------------------------------------------------
+// Play mode already feeds the binding engine (src/gfx/play/play_engine.h) from the SDL event pump and merges its
+// Switch-pad output into every snapshot, for any game. XC2 had no factory bindings, so the engine had nothing to
+// apply and the hardcoded keys in LiveInput below were the only way in. These are the defaults a fresh controls.ini
+// is written with, and every one of them can be changed in the F1 page (controls.ini is the file that page edits).
+static const char* const kXc2SettingsText = R"INI(
+[meta]
+defaults_rev = 13
+
+[bindings.all]
+# movement: WASD and the arrow keys
+W = move_forward
+S = move_back
+A = move_left
+D = move_right
+Up = move_forward
+Down = move_back
+Left = move_left
+Right = move_right
+# camera by keyboard; the mouse drives the stick separately (see LiveInput)
+I = look_up
+K = look_down
+J = look_left
+L = look_right
+# attack / confirm (A): E, and the left mouse button the way a PC port does it
+E = btn_a
+Mouse1 = btn_a
+Return = btn_a
+# jump / cancel (B)
+Space = btn_b
+Backspace = btn_b
+Escape = btn_b
+# lock-on (R): right click. SDL numbers the buttons 1 left, 2 middle, 3 right, so Mouse3 is the right one.
+Mouse3 = btn_r
+# the face buttons on the number row; Q/R page the arts palette (ZL/ZR)
+1 = btn_y
+2 = btn_a
+3 = btn_b
+4 = btn_x
+Q = btn_zl
+R = btn_zr
+# the shoulders
+F = btn_l
+G = btn_r
+# menu (Tab), map / minus (V); Esc stays cancel (B), which is what people expect. M carries the left-stick click.
+Tab = btn_plus
+V = btn_minus
+M = btn_lstick
+# the wheel scrolls up/down; Z/C drive d-pad left/right (blade switch, party commands, menus)
+WheelUp = dpad_up
+WheelDown = dpad_down
+Z = dpad_left
+C = dpad_right
+# stick clicks (the left one sits on M, see above)
+Left Ctrl = btn_rstick
+
+[mouse]
+# The mouse drives the camera and its buttons are bound above, so it must not also act as a menu pointer: with
+# menu_cursor on, the game's touch path takes the left click before the binding sees it, and Mouse1 = btn_a does
+# nothing (issue #69). Set it back to 1 to use the mouse as a pointer in menus.
+menu_cursor = 0
+
+[display]
+# 16x anisotropic filtering keeps angled ground/distant textures sharp at negligible GPU cost (issue #79).
+anisotropy = 16
+)INI";
+
+// The `all` layer, not `play`: play mode takes the engine's context from the game table's frame callback, and XC2
+// declares no frame-step site, so the context never leaves `menu` - a `play` binding would never apply.
+//
+// controls.ini files written before those bindings existed carry empty [bindings.*] sections, and an empty section
+// means "this file is the whole truth", so the factory text above never reaches them. The additions are what play
+// mode appends to such a file (defaults_rev 3 -> 4), keeping the old one as .bak.
+static const nxrt::play::GameDefaultAddition kXc2Additions[] = {
+    {7, nxrt::play::Ctx::All, "W", nxrt::play::Act::MoveForward},
+    {7, nxrt::play::Ctx::All, "S", nxrt::play::Act::MoveBack},
+    {7, nxrt::play::Ctx::All, "A", nxrt::play::Act::MoveLeft},
+    {7, nxrt::play::Ctx::All, "D", nxrt::play::Act::MoveRight},
+    {7, nxrt::play::Ctx::All, "Up", nxrt::play::Act::MoveForward},
+    {7, nxrt::play::Ctx::All, "Down", nxrt::play::Act::MoveBack},
+    {7, nxrt::play::Ctx::All, "Left", nxrt::play::Act::MoveLeft},
+    {7, nxrt::play::Ctx::All, "Right", nxrt::play::Act::MoveRight},
+    {7, nxrt::play::Ctx::All, "I", nxrt::play::Act::LookUp},
+    {7, nxrt::play::Ctx::All, "K", nxrt::play::Act::LookDown},
+    {7, nxrt::play::Ctx::All, "J", nxrt::play::Act::LookLeft},
+    {7, nxrt::play::Ctx::All, "L", nxrt::play::Act::LookRight},
+    {7, nxrt::play::Ctx::All, "E", nxrt::play::Act::BtnA},
+    {7, nxrt::play::Ctx::All, "Mouse1", nxrt::play::Act::BtnA},
+    {7, nxrt::play::Ctx::All, "Return", nxrt::play::Act::BtnA},
+    {7, nxrt::play::Ctx::All, "Space", nxrt::play::Act::BtnB},
+    {7, nxrt::play::Ctx::All, "Backspace", nxrt::play::Act::BtnB},
+    {7, nxrt::play::Ctx::All, "Escape", nxrt::play::Act::BtnB},
+    {7, nxrt::play::Ctx::All, "Mouse3", nxrt::play::Act::BtnR},
+    {11, nxrt::play::Ctx::All, "M", nxrt::play::Act::BtnLStick},
+    {10, nxrt::play::Ctx::All, "WheelUp", nxrt::play::Act::DpadUp},
+    {10, nxrt::play::Ctx::All, "WheelDown", nxrt::play::Act::DpadDown},
+    {13, nxrt::play::Ctx::All, "Z", nxrt::play::Act::DpadLeft},
+    {13, nxrt::play::Ctx::All, "C", nxrt::play::Act::DpadRight},
+    {13, nxrt::play::Ctx::All, "V", nxrt::play::Act::BtnMinus},
+    {9, nxrt::play::Ctx::All, "1", nxrt::play::Act::BtnY},
+    {9, nxrt::play::Ctx::All, "2", nxrt::play::Act::BtnA},
+    {9, nxrt::play::Ctx::All, "3", nxrt::play::Act::BtnB},
+    {9, nxrt::play::Ctx::All, "4", nxrt::play::Act::BtnX},
+    {7, nxrt::play::Ctx::All, "Q", nxrt::play::Act::BtnZL},
+    {7, nxrt::play::Ctx::All, "R", nxrt::play::Act::BtnZR},
+    {7, nxrt::play::Ctx::All, "F", nxrt::play::Act::BtnL},
+    {7, nxrt::play::Ctx::All, "G", nxrt::play::Act::BtnR},
+    {7, nxrt::play::Ctx::All, "Tab", nxrt::play::Act::BtnPlus},
+    {7, nxrt::play::Ctx::All, "M", nxrt::play::Act::BtnMinus},
+    {8, nxrt::play::Ctx::All, "V", nxrt::play::Act::BtnLStick},
+    {7, nxrt::play::Ctx::All, "Left Ctrl", nxrt::play::Act::BtnRStick},
+};
+
+// Readable names for the slots the F1 rebind page lists. The settings-file key stays act_info(a).name ("btn_a"); these
+// are only what the page shows, so "1 = Y" reads as "Y" and "Mouse3 = R" as "锁定 (R)".
+static const nxrt::play::GameActLabel kXc2Labels[] = {
+    {nxrt::play::Act::MoveForward, "前进", "移动"},
+    {nxrt::play::Act::MoveBack, "后退", "移动"},
+    {nxrt::play::Act::MoveLeft, "左移", "移动"},
+    {nxrt::play::Act::MoveRight, "右移", "移动"},
+    {nxrt::play::Act::LookUp, "视角上", "视角"},
+    {nxrt::play::Act::LookDown, "视角下", "视角"},
+    {nxrt::play::Act::LookLeft, "视角左", "视角"},
+    {nxrt::play::Act::LookRight, "视角右", "视角"},
+    {nxrt::play::Act::BtnA, "确认 / 攻击 (A)", "按键"},
+    {nxrt::play::Act::BtnB, "取消 / 跳跃 (B)", "按键"},
+    {nxrt::play::Act::BtnX, "X", "按键"},
+    {nxrt::play::Act::BtnY, "Y", "按键"},
+    {nxrt::play::Act::BtnL, "L", "按键"},
+    {nxrt::play::Act::BtnR, "锁定 (R)", "按键"},
+    {nxrt::play::Act::BtnZL, "ZL (技能盘翻页)", "按键"},
+    {nxrt::play::Act::BtnZR, "ZR (技能盘翻页)", "按键"},
+    {nxrt::play::Act::BtnPlus, "菜单 (+)", "按键"},
+    {nxrt::play::Act::BtnMinus, "地图 (-)", "按键"},
+    {nxrt::play::Act::BtnLStick, "左摇杆按下", "按键"},
+    {nxrt::play::Act::BtnRStick, "右摇杆按下", "按键"},
+    {nxrt::play::Act::DpadUp, "十字键 上", "按键"},
+    {nxrt::play::Act::DpadDown, "十字键 下", "按键"},
+    {nxrt::play::Act::DpadLeft, "十字键 左", "按键"},
+    {nxrt::play::Act::DpadRight, "十字键 右", "按键"},
+};
+
+static const nxrt::play::GameVocabulary& xc2_vocabulary() {
+    static const nxrt::play::GameVocabulary v = [] {
+        nxrt::play::GameVocabulary g;
+        g.labels = kXc2Labels;
+        g.label_count = static_cast<unsigned>(sizeof kXc2Labels / sizeof kXc2Labels[0]);
+        return g;
+    }();
+    return v;
+}
+// Settings a later revision changed, for a controls.ini that still holds the old factory value: the mouse pointer
+// (rev 12) was on by default until the keyboard/mouse scheme made it take the left click.
+static const nxrt::play::GameDefaultChange kXc2Changes[] = {
+    {12, "mouse", "menu_cursor", "1", "0"},
+    {13, "display", "anisotropy", "0", "16"},
+};
+
+static const nxrt::play::GameDefaults& xc2_play_defaults() {
+    static const nxrt::play::GameDefaults d = [] {
+        nxrt::play::GameDefaults g;
+        g.settings_text = kXc2SettingsText;
+        g.defaults_rev = 12;
+        g.additions = kXc2Additions;
+        g.addition_count = static_cast<unsigned>(sizeof kXc2Additions / sizeof kXc2Additions[0]);
+        g.vocabulary = &xc2_vocabulary();
+        g.changes = kXc2Changes;
+        g.change_count = static_cast<unsigned>(sizeof kXc2Changes / sizeof kXc2Changes[0]);
+        return g;
+    }();
+    return d;
+}
+
+static const nxrt::game::Info& xc2_game_info() {
+    static const nxrt::game::Info info = [] {
+        nxrt::game::Info g = nxrt::games::xc2ns2::core_info();
+        g.play_defaults = &xc2_play_defaults();
+        return g;
+    }();
+    return info;
+}
+
+// The build the log reports. Both build paths fill this in: tools\build\build-boot.ps1 and xc2\release\CMakeLists.txt
+// run `git describe --tags --always --dirty`, so a player's log says which build ran (tag, commit, and whether the
+// tree was dirty) instead of a literal that goes stale the moment a release ships.
+#ifndef XC2_BUILD_STAMP
+#define XC2_BUILD_STAMP "dev"
+#endif
 
 extern "C" {
 void xc2_opus301_install();    // x2_opus301.cpp: hardware Opus -> the sdk's software OpusDecoder (HANDOVER 90)
@@ -192,6 +391,7 @@ private:
     unsigned shot_raw_idx = 0;
     void write_raw_frame();
     bool f12_was_down = false;
+    bool f3_was_down = false;
     bool f11_was_down = false;
 };
 
@@ -243,6 +443,22 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
     const HWND fg = ::GetForegroundWindow();
     const bool focused = own && fg == own;
     const bool menu_blocked = nxrt::play::overlay_blocks_game();
+    // Mouse camera: capture the pointer (relative mode, raw and unaccelerated counts) while the game has the focus and no
+    // page is open, and turn the counts into right-stick deflection for this frame. The game's own camera curve runs on top,
+    // which is why this drives the stick instead of a yaw angle. [xc2] mouse_capture = 0 leaves the pointer to the game.
+    static const bool ini_mouse_cam = nxrt::config_get_bool("xc2", "mouse_capture", true);
+    const bool mouse_cam = ini_mouse_cam && nxrt::play::live_pad_config().mouse_camera_capture;
+    // The gain is the F1 page's [mouse] stick_scale (controls.ini), read live so its slider needs no restart.
+    static const bool mouse_invert_y = nxrt::config_get_bool("xc2", "mouse_invert_y", false);
+    static bool mouse_held = false;
+    const bool want_mouse = mouse_cam && own != nullptr && focused && !menu_blocked;
+    if (want_mouse != mouse_held) {
+        mouse_held = want_mouse;
+        nxrt::play::set_external_mouse_capture(mouse_held);
+        nxrt::platform::set_relative_mouse(mouse_held);
+        if (mouse_held) nxrt::input::mouse_delta_take();   // drop whatever piled up before the capture
+        NXLOG_I("input", "mouse camera %s", mouse_held ? "on (pointer captured)" : "off");
+    }
     // one line the first time a mapped key is down, so a hands-on session can be told from "the keyboard is not seen"
     static bool said_focus = false;
     if (!said_focus && own && (down('W') || down(VK_SPACE) || down(VK_RETURN) || down(VK_ESCAPE) || down('A'))) {
@@ -251,28 +467,39 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
                 focused ? "keys go to the game" : "the game does not have the focus: keys are ignored");
     }
     if (focused && !menu_blocked) {
-        // left stick: WASD or the arrow keys; right stick (camera): IJKL
-        if (down('W') || down(VK_UP)) ky += 32767;
-        if (down('S') || down(VK_DOWN)) ky -= 32767;
-        if (down('D') || down(VK_RIGHT)) kx += 32767;
-        if (down('A') || down(VK_LEFT)) kx -= 32767;
-        if (down('I')) kly += 32767;
-        if (down('K')) kly -= 32767;
-        if (down('L')) klx += 32767;
-        if (down('J')) klx -= 32767;
-        // face buttons and shoulders: Space/Enter = A, Backspace/Esc = B, U = X, O = Y, Q/E = L/R, 1/2 = ZL/ZR
-        if (down(VK_SPACE) || down(VK_RETURN)) kb |= btn(kBtnA);
-        if (down(VK_BACK) || down(VK_ESCAPE)) kb |= btn(kBtnB);
-        if (down('U')) kb |= btn(kBtnX);
-        if (down('O')) kb |= btn(kBtnY);
-        if (down('Q')) kb |= btn(kBtnL);
-        if (down('E')) kb |= btn(kBtnR);
-        if (down('1')) kb |= btn(kBtnZL);
-        if (down('2')) kb |= btn(kBtnZR);
-        if (down(VK_TAB) || down(VK_OEM_PLUS)) kb |= btn(kBtnPlus);
-        if (down(VK_OEM_MINUS)) kb |= btn(kBtnMinus);
-        if (down(VK_SHIFT)) kb |= btn(kBtnStickL);
-        if (down(VK_CONTROL)) kb |= btn(kBtnStickR);
+        // The keyboard and mouse buttons are not read here: play mode's binding engine owns them (kXc2SettingsText at the
+        // top of this file, rebindable in the F1 page). PlaySource would merge the engine's output itself, but this source
+        // replaces PlaySource on purpose (see the set_input_source call below), so ask the engine directly.
+        uint64_t eb = 0;
+        float blx = 0, bly = 0, brx = 0, bry = 0;
+        if (nxrt::play::binding_output(nxrt::FrameLimiter::now_ns(), &eb, &blx, &bly, &brx, &bry)) {
+            kb |= eb;
+            if (blx != 0.0f || bly != 0.0f) {
+                kx += static_cast<int>(std::lround(blx * 32767.0f));
+                ky += static_cast<int>(std::lround(bly * 32767.0f));
+            }
+            if (brx != 0.0f || bry != 0.0f) {
+                klx += static_cast<int>(std::lround(brx * 32767.0f));
+                kly += static_cast<int>(std::lround(bry * 32767.0f));
+            }
+        }
+        if (mouse_held) {
+            // This source is polled every 5 ms but the game samples the pad once a frame (~16.7 ms), so the counts have to
+            // outlive the tick that read them: summing them into a decaying accumulator keeps roughly a frame of motion
+            // instead of handing the game only the last 5 ms of it (which is what made the camera crawl).
+            static double acc_x = 0.0, acc_y = 0.0;
+            const nxrt::input::MouseDelta d = nxrt::input::mouse_delta_take();
+            acc_x += d.dx;
+            acc_y += d.dy;
+            const double full = (std::max)(1.0, static_cast<double>(nxrt::play::live_pad_config().mouse_stick_scale));
+            if (acc_x != 0.0 || acc_y != 0.0) {
+                const double dy = mouse_invert_y ? -acc_y : acc_y;
+                klx += static_cast<int>(std::lround(std::clamp(acc_x / full, -1.0, 1.0) * 32767.0));
+                kly += static_cast<int>(std::lround(std::clamp(-dy / full, -1.0, 1.0) * 32767.0));
+            }
+            acc_x *= 0.55;      // ~10 ms of memory: a frame's worth at 60 fps, and no leftover after a stop
+            acc_y *= 0.55;
+        }
     }
     if (focused) {
         // F12: write the next presented frame as shots_manual/shot_NNNN.png (RGBA8). Works any time, also mid-cutscene.
@@ -295,6 +522,35 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
             NXLOG_I("input", "F12: %d frame(s) into %s", shot_burst, shot_raw ? "shots_raw" : "shots_manual");
         }
         f12_was_down = f12;
+        const bool f3 = down(VK_F3) || tapped(VK_F3);
+        if (f3 && !f3_was_down) xc2::nav::toggle();
+        f3_was_down = f3;
+        static bool f4_was_down = false;
+        const bool f4 = down(VK_F4) || tapped(VK_F4);
+        if (f4 && !f4_was_down) nxrt::play::toggle_picker();
+        f4_was_down = f4;
+        static bool f5_was_down = false;
+        const bool f5 = down(VK_F5) || tapped(VK_F5);
+        if (f5 && !f5_was_down) {
+            if (down(VK_CONTROL))    xc2::voice::toggle_log();
+            else if (down(VK_SHIFT)) xc2::voice::cycle_density();
+            else                     xc2::voice::toggle();
+        }
+        f5_was_down = f5;
+        if (xc2::voice::debug_enabled()) {
+            static bool f6_was_down = false;
+            const bool f6 = down(VK_F6) || tapped(VK_F6);
+            if (f6 && !f6_was_down) xc2::voice::trigger_mock(0);
+            f6_was_down = f6;
+            static bool f7_was_down = false;
+            const bool f7 = down(VK_F7) || tapped(VK_F7);
+            if (f7 && !f7_was_down) xc2::voice::trigger_mock(1);
+            f7_was_down = f7;
+            static bool f8_was_down = false;
+            const bool f8 = down(VK_F8) || tapped(VK_F8);
+            if (f8 && !f8_was_down) xc2::voice::toggle_mock_combat_mode();
+            f8_was_down = f8;
+        }
         if (shot_raw) {
             if (f12_left > 0 && shot_raw_have) {
                 write_raw_frame();     // the buffer filled at the end of the previous frame
@@ -312,23 +568,23 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
             g_renderer->request_screenshot(path);
             if (--f12_left == 0) NXLOG_I("input", "F12: %u screenshots written", shots);
         }
-        // Ctrl+F11: trace the next presented frame (plain F11 is fullscreen toggle in play mode).
-        const bool f11 = down(VK_CONTROL) && (down(VK_F11) || tapped(VK_F11));
-        if (f11 && !f11_was_down) {
+        // F9 or Ctrl+F11: trace the next presented frame (plain F11 is fullscreen toggle in play mode).
+        const bool trace_key = (down(VK_F9) || tapped(VK_F9)) || (down(VK_CONTROL) && (down(VK_F11) || tapped(VK_F11)));
+        if (trace_key && !f11_was_down) {
             static const int trace_span = [] {
                 const char* s = std::getenv("NXRT_TRACE_SPAN");
                 return s ? std::atoi(s) : 0;
             }();
             if (trace_span > 0) {
                 nxrt::nvn::backend_trace_frames(trace_span);
-                NXLOG_I("input", "Ctrl+F11: tracing the next %d frames", trace_span);
+                NXLOG_I("input", "F9/Ctrl+F11: tracing the next %d frames", trace_span);
             } else {
                 nxrt::nvn::backend_trace_next_frame();
-                NXLOG_I("input", "Ctrl+F11: tracing the next frame (render targets -> trace_t<id>_<fmt>.png here)");
+                NXLOG_I("input", "F9/Ctrl+F11: tracing the next frame (render targets -> trace_t<id>_<fmt>.png here)");
             }
         }
-        f11_was_down = f11;
-    } else if (down(VK_F12)) {
+        f11_was_down = trace_key;
+    } else if (down(VK_F12) || down(VK_F9)) {
         // a hotkey is held but the window does not have the focus: say so once, so a session log can tell it apart from
         // "the hotkey is broken"
         static bool said = false;
@@ -441,17 +697,27 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
             if (raw.axes[2] * raw.axes[2] > prx * prx) prx = raw.axes[2];
             { const int v = -raw.axes[3]; if (v * v > pry * pry) pry = v; }
         }
-        auto apply_deadzone = [](int &sx, int &sy, float dz) {
+        // What the pad reports, before anything is applied: the F1 calibration shows it and stores the rest position.
+        nxrt::play::publish_raw_left_stick(static_cast<float>(px) / 32767.0f, static_cast<float>(py) / 32767.0f);
+        // A worn stick rests off zero, and a radial dead zone cannot fix that: it removes the small signal but the axis
+        // still leans one way, so "push back" becomes a slow walk (issue #76). Subtract the measured centre first.
+        nxrt::play::publish_raw_right_stick(static_cast<float>(prx) / 32767.0f, static_cast<float>(pry) / 32767.0f);
+        px = std::clamp(px - pcfg.ls_center_x, -32767, 32767);
+        py = std::clamp(py - pcfg.ls_center_y, -32767, 32767);
+        prx = std::clamp(prx - pcfg.rs_center_x, -32767, 32767);
+        pry = std::clamp(pry - pcfg.rs_center_y, -32767, 32767);
+        auto apply_deadzone = [](int &sx, int &sy, float dz, float max_travel) {
             const float fx = static_cast<float>(sx) / 32767.0f;
             const float fy = static_cast<float>(sy) / 32767.0f;
             const float mag = std::sqrt(fx * fx + fy * fy);
             if (mag <= dz || dz >= 0.99f) { sx = 0; sy = 0; return; }
-            const float sc = (std::min)(1.0f, (mag - dz) / (1.0f - dz)) / mag;
+            const float span = (std::max)(0.05f, max_travel - dz);
+            const float sc = (std::min)(1.0f, (mag - dz) / span) / mag;
             sx = std::clamp(static_cast<int>(std::lround(fx * sc * 32767.0f)), -32767, 32767);
             sy = std::clamp(static_cast<int>(std::lround(fy * sc * 32767.0f)), -32767, 32767);
         };
-        apply_deadzone(px, py, pcfg.stick_deadzone);
-        apply_deadzone(prx, pry, pcfg.right_deadzone);
+        apply_deadzone(px, py, pcfg.stick_deadzone, pcfg.stick_max);
+        apply_deadzone(prx, pry, pcfg.right_deadzone, 1.0f);
         if (prx || pry) {
             prx = std::clamp(static_cast<int>(std::lround(static_cast<float>(prx) * pcfg.look_sens)), -32767, 32767);
             pry = std::clamp(static_cast<int>(std::lround(static_cast<float>(pry) * pcfg.look_sens)), -32767, 32767);
@@ -492,7 +758,27 @@ void LiveInput::live(nxrt::hid::InputSnapshot &out) {
     }
     const uint64_t b_all = kb | pb;
     const int sx = kx ? kx : px, sy = ky ? ky : py, rx = klx ? klx : prx, ry = kly ? kly : pry;
-    const uint64_t menu_mask = nxrt::play::note_external_pad(b_all, sx, sy, rx, ry);
+    // Gamepad chords for 3D Navigation (conflict-free with XC2 field controls and Minus+Plus F1 menu):
+    //   ZL + L3 = toggle 3D nav mode (F3)
+    //   ZL + R3 = open/close 3D nav destination picker (F4)
+    static uint64_t nav_pad_prev = 0;
+    static uint64_t nav_pad_mask = 0;
+    {
+        const uint64_t chord_f3 = btn(kBtnZL) | btn(kBtnStickL);
+        const uint64_t chord_f4 = btn(kBtnZL) | btn(kBtnStickR);
+        const uint64_t fresh_pb = pb & ~nav_pad_prev;
+        if (!menu_blocked && (pb & chord_f3) == chord_f3 && (fresh_pb & chord_f3)) {
+            xc2::nav::toggle();
+            nav_pad_mask |= chord_f3;
+        }
+        if ((pb & chord_f4) == chord_f4 && (fresh_pb & chord_f4)) {
+            nxrt::play::toggle_picker();
+            nav_pad_mask |= chord_f4;
+        }
+        nav_pad_mask &= pb;
+        nav_pad_prev = pb;
+    }
+    const uint64_t menu_mask = nxrt::play::note_external_pad(b_all, sx, sy, rx, ry) | nav_pad_mask;
     if (menu_blocked) return;
     const uint64_t b = b_all & ~menu_mask;
     if (!b && !sx && !sy && !rx && !ry) return;
@@ -679,6 +965,168 @@ static void arm_model_probe(uint64_t main_base) {
 // (NS1 does the same through a patch page: frame_rate.c xc2_rate_store, patches-v301.txt set xc2fps. Their build reads the period through
 // the virtual every frame; ours has to be checked - if the game caches it at boot, this write lands before the read either way.)
 static nxrt::FrameLimiter *g_frame_limiter = nullptr;   // the play-mode limiter: its measured interval is the display time
+static std::atomic<float> g_fps_limiter_step{1.0f / 60.0f};
+static std::atomic<float> g_fps_game_step{1.0f / 60.0f};
+static uint64_t g_fps_main_base = 0;
+
+// Retail 3.0.1 vsync-period virtual override (main+0xba1320, vtable slot +0xc8 at main+0xe62780; zero direct BL callers).
+// Separates NS1-style dual words without binary patching:
+//   - renderSyncSys limiter (lr = main+0xb8eb4c / 0xb8ebd0) receives exact target step (1/90 gameplay, 1/60 cutscene), never self-locking;
+//   - getFrameStep (0xb865bc, 0xb8e540) receives the 5-frame real-time moving average so gameplay/hair/cloth keep 1.0x real time.
+static void host_vsync_period_301(::Ctx *c) {
+    const uint64_t mb = g_fps_main_base;
+    int32_t iv = 1;
+    const uint64_t iv_addr = mb + 0xe95460;   // retail 3.0.1 vsync interval (written to 1 at boot by 0x735300)
+    if (nxrt::mem::is_mapped(iv_addr, 4)) {
+        std::memcpy(&iv, reinterpret_cast<const void *>(iv_addr), 4);
+    }
+    if (iv <= 0) iv = 2;   // matches cbz w8 -> 2*period in renderSyncSys (0xb8eba0)
+    const uint64_t lr = c->x[30];
+    const bool is_limiter = (lr == mb + 0xb8eb4c || lr == mb + 0xb8ebd0);
+    static std::atomic<uint64_t> seen[8] = {};
+    static std::atomic<int> nseen{0};
+    bool known = false;
+    const int n = nseen.load(std::memory_order_relaxed);
+    for (int i = 0; i < n && i < 8; ++i) {
+        if (seen[i].load(std::memory_order_relaxed) == lr) { known = true; break; }
+    }
+    if (!known && n < 8) {
+        const int idx = nseen.fetch_add(1, std::memory_order_relaxed);
+        if (idx < 8) {
+            seen[idx].store(lr, std::memory_order_relaxed);
+            NXLOG_I("xc2", "vsync_period(0xba1320): caller lr=0x%llx (main+0x%llx) role=%s iv=%d",
+                    static_cast<unsigned long long>(lr), static_cast<unsigned long long>(lr - mb),
+                    is_limiter ? "renderSyncSys-limiter" : "game-step", iv);
+        }
+    }
+    const float step = is_limiter ? g_fps_limiter_step.load(std::memory_order_relaxed)
+                                  : g_fps_game_step.load(std::memory_order_relaxed);
+    c->v[0].u64[0] = 0;
+    c->v[0].u64[1] = 0;
+    c->v[0].f[0] = step / static_cast<float>(iv);
+}
+
+static std::atomic<int64_t> g_teardown_fps{60};
+static nxrt::GuestFn g_orig_821b40 = nullptr;
+static nxrt::GuestFn g_orig_822570 = nullptr;
+static nxrt::GuestFn g_orig_822600 = nullptr;
+
+// Scale guest-83's frame-counted 0x27d0 resource-bank teardown (main+0x820200 via 0x821b40/0x822570, and main+0x822600) back to <=60 Hz wall time.
+// Main retires consumer nodes at 30 Hz (33.3 ms), while 60 fps teardown waits 4 rendered frames per stage (66.7 ms); above 60 fps,
+// unmodified 2/4-frame thresholds finish in <=33.3 ms and unmap active pools during cutscene exit or fast travel.
+static bool hold_teardown_counter(uint64_t bank, uint16_t off, uint16_t trigger_minus_one, uint16_t hold_limit, uint16_t& held) {
+    if (held < hold_limit) {
+        ++held;
+        const uint16_t back = static_cast<uint16_t>(trigger_minus_one - 1);
+        std::memcpy(reinterpret_cast<void*>(bank + off), &back, 2);
+        return true;
+    }
+    return false;
+}
+
+static void handle_teardown_tick(uint64_t bank, bool is_820200) {
+    if (!bank || !nxrt::mem::is_mapped(bank, 0x10c0)) return;
+    const int64_t cur_fps = g_teardown_fps.load(std::memory_order_relaxed);
+    const int64_t scale = (cur_fps > 60) ? ((cur_fps + 59) / 60) : 1;
+
+    struct TeardownHold {
+        uint64_t bank = 0;
+        uint16_t h4184_3 = 0;
+        uint16_t h4182_1 = 0;
+        uint16_t h4182_3 = 0;
+    };
+    static std::mutex mu;
+    static std::vector<TeardownHold> holds;
+    static std::atomic<bool> logged_once{false};
+
+    uint32_t flags = 0;
+    std::memcpy(&flags, reinterpret_cast<const void*>(bank + 4284), 4);
+    const bool phase4184 = is_820200 && ((flags & 0x40000u) == 0);
+    const bool phase4182 = !is_820200 || ((flags & 0x40000u) != 0 && (flags & 0x8000000u) != 0);
+    if (!phase4184 && !phase4182) return;
+
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = std::find_if(holds.begin(), holds.end(), [bank](const TeardownHold& e) { return e.bank == bank; });
+    if (scale <= 1) {
+        if (it != holds.end()) holds.erase(it);
+        return;
+    }
+
+    const uint16_t extra2 = static_cast<uint16_t>(2 * (scale - 1));
+    const uint16_t extra4 = static_cast<uint16_t>(4 * (scale - 1));
+    bool held_now = false;
+    if (phase4184) {
+        uint16_t c4184 = 0;
+        std::memcpy(&c4184, reinterpret_cast<const void*>(bank + 4184), 2);
+        if (c4184 == 0) {
+            if (it != holds.end()) it->h4184_3 = 0;
+            return;
+        }
+        if (c4184 != 3) return;
+        if (it == holds.end()) {
+            holds.push_back({bank, 0, 0, 0});
+            it = holds.end() - 1;
+        }
+        held_now = hold_teardown_counter(bank, 4184, 3, extra4, it->h4184_3);
+    } else {
+        uint16_t c4182 = 0;
+        std::memcpy(&c4182, reinterpret_cast<const void*>(bank + 4182), 2);
+        if (c4182 == 0) {
+            if (it != holds.end()) {
+                it->h4182_1 = 0;
+                it->h4182_3 = 0;
+            }
+            return;
+        }
+        if (c4182 == 1) {
+            if (it == holds.end()) {
+                holds.push_back({bank, 0, 0, 0});
+                it = holds.end() - 1;
+            }
+            held_now = hold_teardown_counter(bank, 4182, 1, extra2, it->h4182_1);
+        } else if (c4182 == 3) {
+            if (it == holds.end()) {
+                holds.push_back({bank, 0, 0, 0});
+                it = holds.end() - 1;
+            }
+            held_now = hold_teardown_counter(bank, 4182, 3, extra2, it->h4182_3);
+            if (!held_now) holds.erase(it);
+        }
+    }
+    if (held_now && !logged_once.exchange(true, std::memory_order_relaxed)) {
+        NXLOG_I("xc2", "teardown cadence: scaling bank 0x%llx cleanup at %lld fps (%lldx)",
+                static_cast<unsigned long long>(bank), static_cast<long long>(cur_fps), static_cast<long long>(scale));
+    }
+}
+
+static void wrap_teardown_821b40(::Ctx* c) {
+    if (c) handle_teardown_tick(c->x[0], true);
+    if (g_orig_821b40) g_orig_821b40(c);
+}
+
+static void wrap_teardown_822570(::Ctx* c) {
+    if (c) handle_teardown_tick(c->x[0], true);
+    if (g_orig_822570) g_orig_822570(c);
+}
+
+static void wrap_teardown_822600(::Ctx* c) {
+    if (c) handle_teardown_tick(c->x[0], false);
+    if (g_orig_822600) g_orig_822600(c);
+}
+
+static void arm_teardown_cadence_301(uint64_t main_base, int64_t fps) {
+    if (fps <= 60) return;
+    g_teardown_fps.store(fps, std::memory_order_relaxed);
+    g_orig_821b40 = nxrt::fn_lookup(main_base + 0x821b40ull);
+    g_orig_822570 = nxrt::fn_lookup(main_base + 0x822570ull);
+    g_orig_822600 = nxrt::fn_lookup(main_base + 0x822600ull);
+    if (g_orig_821b40) nxrt::fn_register(main_base + 0x821b40ull, wrap_teardown_821b40);
+    if (g_orig_822570) nxrt::fn_register(main_base + 0x822570ull, wrap_teardown_822570);
+    if (g_orig_822600) nxrt::fn_register(main_base + 0x822600ull, wrap_teardown_822600);
+    NXLOG_I("xc2", "teardown cadence: wrapped indirect dispatch 821b40=%d 822570=%d 822600=%d for >60 fps safety (target %lld fps, scale %lldx)",
+            g_orig_821b40 != nullptr, g_orig_822570 != nullptr, g_orig_822600 != nullptr,
+            static_cast<long long>(fps), static_cast<long long>((fps + 59) / 60));
+}
 
 static void arm_frame_rate(uint64_t main_base) {
     const int64_t fps = nxrt::config_get_int("xc2", "fps", 0);
@@ -689,8 +1137,32 @@ static void arm_frame_rate(uint64_t main_base) {
     // capture on when the copies' budget can hold them (a 16 GB card, not a 12 GB one, an APU or a Steam Deck), and then leads by one
     // frame without A7's per-draw instance snapshots; otherwise all stays as it was (no lead, snapshots on). Settings the player made win.
     // A stamp the log can be checked against: with two ways to build the runtime (this exe or the package's xc2_rt.dll),
-    // "which binary ran" decided several tests on 2026-11-21. Bump it whenever the film/decode model changes.
-    NXLOG_I("xc2", "build stamp: 0.2.0 media (end of stream is a separate output; the placeholder track ends with the picture)");
+    // "which binary ran" decided several tests on 2026-11-21. XC2_BUILD_STAMP is the tag and commit the build came from
+    // (see the top of this file); the media model below still needs its own bump whenever film/decode changes.
+    NXLOG_I("xc2", "build stamp: %s media (end of stream is a separate output; the placeholder track ends with the picture)",
+            XC2_BUILD_STAMP);
+    // The NXRT_* switches this run got, one line, so a log says which launch chain produced it. 2026-11-26: a dev
+    // profile that had lost NXRT_NVN_EARLYZ_FS=auto looked like a rendering regression in the code, and nothing in the
+    // log said the switch was missing. Paths are left out (they are long and say nothing about behaviour).
+    {
+        std::string switches;
+        if (LPCH block = ::GetEnvironmentStringsA()) {
+            for (const char* e = block; *e; e += std::strlen(e) + 1) {
+                if (std::strncmp(e, "NXRT_", 5) != 0) continue;
+                const char* eq = std::strchr(e, '=');
+                if (!eq) continue;
+                const std::string key(e, static_cast<std::size_t>(eq - e));
+                if (key == "NXRT_NVN_SHADER_CACHE" || key == "NXRT_FS_ROMFS" || key == "NXRT_FS_SAVE_DIR" ||
+                    key == "NXRT_AOC_DIR" || key == "NXRT_NVN_DUMP_MISSING" || key == "NXRT_INI" ||
+                    key == "NXRT_DLSS_HOT_FILE" || key == "NXRT_NVN_SKIP_FS_FILE" || key == "NXRT_NVN_HOT_STATE_FILE")
+                    continue;   // paths
+                if (!switches.empty()) switches += ' ';
+                switches += e;
+            }
+            ::FreeEnvironmentStringsA(block);
+        }
+        NXLOG_I("xc2", "launch switches: %s", switches.empty() ? "(none)" : switches.c_str());
+    }
     if (!nxrt::config_has("nvn", "mirror_capture")) nxrt::config_set("nvn", "mirror_capture", "auto");
     if (!nxrt::config_has("nvn", "snapshot_instances")) nxrt::config_set("nvn", "snapshot_instances", "auto");
     if (!nxrt::config_has("nvn", "present_ahead")) nxrt::config_set("nvn", "present_ahead", "auto");
@@ -700,19 +1172,64 @@ static void arm_frame_rate(uint64_t main_base) {
     NXLOG_I("xc2", "present_ahead = %s (auto = 1 while [nvn] mirror_capture is on, else 0; [nvn] present_ahead overrides this default)",
             nxrt::config_get_str("nvn", "present_ahead", "").c_str());
     if (fps <= 0) return;
-    const uint64_t period_addr = main_base + 0xf65a44;      // the 1/60 the vsync-period virtual loads (0x3C888889)
-    if (!nxrt::mem::is_mapped(period_addr, 4)) {
-        NXLOG_W("xc2", "frame rate: the vsync period is not mapped at 0x%llx: the game keeps its own 30 fps step",
-                static_cast<unsigned long long>(period_addr));
-        return;
-    }
+    const uint64_t period_addr = main_base + 0xf65a44;      // the 1/60 the vsync-period virtual loads (0x3C888889) on 3.0.0
     float old = 0.0f;
-    std::memcpy(&old, reinterpret_cast<const void*>(period_addr), 4);
-    // 0xf65a44 is the 3.0.0 rodata address of 1/60 (0x3C888889); on 3.0.1 it falls inside .bss (0.0f) and the game already
-    // runs natively at 60 fps (present interval 1). Skip patching and the fps_follow thread when the slot does not hold 1/60.
-    if (std::fabs(old - (1.0f / 60.0f)) > 1e-4f) {
-        NXLOG_I("xc2", "frame rate: main+0xf65a44 holds %.6f (expected 1/60); skipping 3.0.0 vsync-period patch",
-                static_cast<double>(old));
+    const bool has_300_slot = nxrt::mem::is_mapped(period_addr, 4) &&
+                              (std::memcpy(&old, reinterpret_cast<const void*>(period_addr), 4), std::fabs(old - (1.0f / 60.0f)) <= 1e-4f);
+    if (!has_300_slot) {
+        g_fps_main_base = main_base;
+        const float init_step = static_cast<float>(1.0 / static_cast<double>(fps));
+        g_fps_limiter_step.store(init_step, std::memory_order_relaxed);
+        g_fps_game_step.store(init_step, std::memory_order_relaxed);
+        nxrt::fn_register(main_base + 0xba1320, host_vsync_period_301);
+        arm_teardown_cadence_301(main_base, fps);
+        const int64_t cutscene_fps = nxrt::config_get_int("xc2", "cutscene_fps", fps > 60 ? 60 : 0);
+        NXLOG_I("xc2", "frame rate: hooked retail 3.0.1 vsync_period virtual at main+0xba1320 (target %lld fps, cutscene %lld fps, step %.2f ms)",
+                static_cast<long long>(fps), static_cast<long long>(cutscene_fps), static_cast<double>(init_step) * 1000.0);
+        nxrt::set_present_interval_hz(static_cast<double>(fps));
+        nxrt::services::viapi::set_display_vsync_hz(static_cast<double>(fps));
+        const bool follow = nxrt::config_get_bool("xc2", "fps_follow", true);
+        if ((!follow && cutscene_fps <= 0) || !g_frame_limiter) return;
+        std::thread([main_base, fps, cutscene_fps, follow] {
+            constexpr uint64_t kCutsceneFlagOff = 0xedf1a0ull;
+            int64_t cur_fps = fps;
+            bool was_rt_cutscene = false;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                const bool in_movie = nxrt::media::is_movie_playing();
+                bool in_rt_cutscene = false;
+                const uint64_t flag_addr = main_base + kCutsceneFlagOff;
+                if (nxrt::mem::is_mapped(flag_addr, 1)) {
+                    uint8_t flag = 0;
+                    std::memcpy(&flag, reinterpret_cast<const void *>(flag_addr), 1);
+                    in_rt_cutscene = (flag & 1u) != 0;
+                    if (in_rt_cutscene != was_rt_cutscene) {
+                        was_rt_cutscene = in_rt_cutscene;
+                        NXLOG_I("xc2", "real-time cutscene %s (main+0xedf1a0=0x%02x)", in_rt_cutscene ? "starts" : "ends", static_cast<unsigned>(flag));
+                    }
+                }
+                const bool in_cutscene = in_movie || in_rt_cutscene;
+                const int64_t want_fps = (in_cutscene && cutscene_fps > 0 && cutscene_fps < fps) ? cutscene_fps : fps;
+                if (want_fps != cur_fps) {
+                    cur_fps = want_fps;
+                    g_teardown_fps.store(cur_fps, std::memory_order_relaxed);
+                    nxrt::set_present_interval_hz(static_cast<double>(cur_fps));
+                    nxrt::services::viapi::set_display_vsync_hz(static_cast<double>(cur_fps));
+                    g_frame_limiter->set_target_fps(static_cast<double>(cur_fps));
+                    NXLOG_I("xc2", "frame rate -> %lld fps (%s)", static_cast<long long>(cur_fps),
+                            in_movie ? "AV1 movie" : in_rt_cutscene ? "real-time cutscene" : "gameplay");
+                }
+                const double target = 1.0 / static_cast<double>(cur_fps);
+                g_fps_limiter_step.store(static_cast<float>(target), std::memory_order_relaxed);
+                double step = target;
+                if (follow) {
+                    const double recent_ms = g_frame_limiter->recent_mean_ms(5, 250.0);
+                    if (recent_ms > 0.0) step = (std::max)(target, recent_ms / 1000.0);
+                    step = (std::min)(step, 1.0 / 15.0);
+                }
+                g_fps_game_step.store(static_cast<float>(step), std::memory_order_relaxed);
+            }
+        }).detach();
         return;
     }
     // [xc2] fps_interval (default 2): the game's "vsyncs per frame". 2 with period 1/(2 fps) is the shipping arrangement;
@@ -788,9 +1305,61 @@ static void arm_frame_rate(uint64_t main_base) {
     }).detach();
 }
 
-// The dynamic-resolution lock: any render quality but the console's implies it; otherwise [upscale] lock_render_size decides.
+struct Xc2RenderIntent {
+    int64_t mode = 0;
+    int64_t rcls = 0;
+    int32_t w = 2560;
+    int32_t h = 1440;
+    bool from_quality = false;
+    const char* quality_key = "";
+};
+
+// Resolve effective XC2 render mode & target dimensions:
+// 1. Explicit [xc2] native_res > 0 takes precedence with [xc2] native_w/native_h / [xc2] res_class.
+// 2. When [xc2] native_res == 0 (the default), [upscale] render_quality uses the NVN attachment scaling path in
+//    nvn_gpu_texture.cpp (quality_scales) together with xc2_lock_render_size() (#47).
+static Xc2RenderIntent resolve_xc2_render_intent() {
+    static const Xc2RenderIntent resolved = [] {
+        Xc2RenderIntent r;
+        int32_t am_w = 1920, am_h = 1080;
+        const bool have_am_res = [&] {
+            const std::string am_res = nxrt::config_get_str("am", "resolution", "");
+            const size_t xpos = am_res.find_first_of("xX");
+            if (xpos == std::string::npos) return false;
+            const int32_t pw = std::atoi(am_res.c_str());
+            const int32_t ph = std::atoi(am_res.c_str() + xpos + 1);
+            if (pw >= 1280 && ph >= 720 && pw <= 7680 && ph <= 4320) {
+                am_w = pw;
+                am_h = ph;
+                return true;
+            }
+            return false;
+        }();
+        const int64_t explicit_mode = nxrt::config_get_int("xc2", "native_res", 0);
+        const int64_t explicit_rcls = nxrt::config_get_int("xc2", "res_class", 0);
+        if (explicit_mode > 0) {
+            r.mode = explicit_mode;
+            r.rcls = explicit_rcls;
+            const int32_t def_w = have_am_res ? am_w : 2560;
+            const int32_t def_h = have_am_res ? am_h : 1440;
+            const int64_t cw = nxrt::config_get_int("xc2", "native_w", 0);
+            const int64_t ch = nxrt::config_get_int("xc2", "native_h", 0);
+            r.w = cw > 0 ? static_cast<int32_t>(cw) : def_w;
+            r.h = ch > 0 ? static_cast<int32_t>(ch) : def_h;
+        } else {
+            r.rcls = explicit_rcls;
+            r.w = am_w;
+            r.h = am_h;
+        }
+        return r;
+    }();
+    return resolved;
+}
+
+// The dynamic-resolution lock: when native_res is off, any render quality but the console's implies it; otherwise [upscale] lock_render_size decides.
 static bool xc2_lock_render_size() {
     static const bool on = [] {
+        if (resolve_xc2_render_intent().mode > 0) return false;
         const nxrt::RenderQualityMode* m = nxrt::render_quality_mode(nxrt::config_get_str("upscale", "render_quality", "").c_str());
         if (m && m->share > 0.0) return true;
         return nxrt::config_get_bool("upscale", "lock_render_size", false);
@@ -803,29 +1372,17 @@ static bool xc2_lock_render_size() {
 // [xc2] native_w / native_h: target 3D render size for native_res=2 (defaults to [am] resolution, fallback 2560x1440)
 // [xc2] res_class  = 0 (auto) | 2 (force mode 5: 2560x1440) | 1 (force mode 1: 3840x2160)
 static void arm_native_res(uint64_t main_base) {
+    const Xc2RenderIntent ri = resolve_xc2_render_intent();
     static int64_t g_nat_mode = 0;
     static int64_t g_rcls = 0;
-    g_nat_mode = nxrt::config_get_int("xc2", "native_res", 0);
+    g_nat_mode = ri.mode;
     const int64_t mode = g_nat_mode;
-    g_rcls = nxrt::config_get_int("xc2", "res_class", 0);
+    g_rcls = ri.rcls;
     const int64_t rcls = g_rcls;
-    int32_t def_w = 2560, def_h = 1440;
-    {
-        const std::string am_res = nxrt::config_get_str("am", "resolution", "");
-        const size_t xpos = am_res.find_first_of("xX");
-        if (xpos != std::string::npos) {
-            const int32_t pw = std::atoi(am_res.c_str());
-            const int32_t ph = std::atoi(am_res.c_str() + xpos + 1);
-            if (pw >= 1280 && ph >= 720 && pw <= 7680 && ph <= 4320) {
-                def_w = pw;
-                def_h = ph;
-            }
-        }
-    }
     static int32_t g_nat_w = 2560;
     static int32_t g_nat_h = 1440;
-    g_nat_w = static_cast<int32_t>(nxrt::config_get_int("xc2", "native_w", def_w));
-    g_nat_h = static_cast<int32_t>(nxrt::config_get_int("xc2", "native_h", def_h));
+    g_nat_w = ri.w;
+    g_nat_h = ri.h;
     // Always attach lightweight RT rebuild logger (logs first 8 calls or size changes) so logs confirm actual 3D resolution.
     nxrt::hook_add_entry(main_base + 0x844120, [](::Ctx* c, uint64_t, void*) -> int {
         static int last_rw = -1, last_rh = -1, last_bw = -1, last_bh = -1, count = 0;
@@ -841,6 +1398,25 @@ static void arm_native_res(uint64_t main_base) {
                 if (view && nxrt::mem::is_mapped(view + 0x18, 16)) {
                     std::memcpy(d, reinterpret_cast<const void*>(view + 0x18), 16);
                     have_dims = (d[2] > 0 && d[3] > 0);
+                    // Clamp dynamic-resolution drops BEFORE updating viewport info or logging rt_rebuild (#55),
+                    // so locked 1280x720 runs never report or publish transient 1216x684 / 960x540 rungs.
+                    static uint32_t g_pin_w = 0, g_pin_h = 0;
+                    static bool g_pin_init = false;
+                    if (!g_pin_init) {
+                        g_pin_init = true;
+                        if (const char* s = std::getenv("XC2_RENDER_SIZE_PIN")) {
+                            unsigned a = 0, b = 0;
+                            if (std::sscanf(s, "%ux%u", &a, &b) == 2 && a && b) { g_pin_w = a; g_pin_h = b; }
+                        }
+                        if (!g_pin_w && xc2_lock_render_size()) { g_pin_w = 1280; g_pin_h = 720; }
+                    }
+                    if (g_nat_mode == 0 && g_pin_w && d[0] > 0 && d[1] > 0 && d[0] <= 1920 && d[1] <= 1080 &&
+                        (d[0] < static_cast<int32_t>(g_pin_w) || d[1] < static_cast<int32_t>(g_pin_h))) {
+                        const uint32_t pinned[2] = {g_pin_w, g_pin_h};
+                        std::memcpy(reinterpret_cast<void*>(view + 0x18), pinned, 8);
+                        d[0] = static_cast<int32_t>(g_pin_w);
+                        d[1] = static_cast<int32_t>(g_pin_h);
+                    }
                     if (have_dims && d[0] > 0 && d[1] > 0) {
                         nxrt::nvn::set_game_viewport_info(static_cast<uint32_t>(d[0]), static_cast<uint32_t>(d[1]),
                                                           static_cast<uint32_t>(d[2]), static_cast<uint32_t>(d[3]),
@@ -881,11 +1457,14 @@ static void arm_native_res(uint64_t main_base) {
         return 0;
     });
     if (rcls > 0) {
-        // XC2 3.0.1 docked mode table (c_00a6.cpp): res_class=1 -> mode 4 (3840x2160), res_class=2 -> mode 5 (2560x1440).
-        // For res_class=3 (Native 1080p with full docked graphics quality), select docked mode 5 and patch its
-        // rodata dimensions at main+0xc346cc/0xc346d0 from 2560x1440 to 1920x1080.
+        // XC2 3.0.1 docked mode table (c_00a6.cpp:5208-5223): 0x8d9ce0 returning 0 selects mode 1 (3840x2160),
+        // returning 1 selects mode 4 (3072x1728), and returning 2 selects mode 5 (2560x1440).
+        // For res_class=1 we return 0 (mode 1: 3840x2160); for res_class=3 (Native 1080p with full docked quality)
+        // we select mode 5 (return 2) and patch its rodata dimensions at main+0xc346cc from 2560x1440 to 1920x1080.
         int64_t effective_rcls = rcls;
-        if (rcls == 3) {
+        if (rcls == 1) {
+            effective_rcls = 0;
+        } else if (rcls == 3) {
             effective_rcls = 2;
             const uint64_t dim_addr = main_base + 0xc346ccULL;
             if (nxrt::mem::is_mapped(dim_addr, 8)) {
@@ -1069,11 +1648,26 @@ static void arm_native_res(uint64_t main_base) {
             return 1;
         });
         nxrt::hook_add_inline(main_base + 0x7cfc2c, [](::Ctx* c, uint64_t, void*) {
-            // s0 was 0.5f; override to native_w / 3840 (e.g. 2560/3840 = 0.6667f)
-            c->v[0].f[0] = (std::min)(1.0f, static_cast<float>(g_nat_w) / 3840.0f);
+            // s0 was 0.5f; override to native_w / base_w (e.g. 2560/3840 = 0.6667f, or 1.0f at 1:1 native).
+            float denom = 3840.0f;
+            if (c->x[19] && nxrt::mem::is_mapped(c->x[19] + 1504, 8)) {
+                uint64_t view = 0;
+                std::memcpy(&view, reinterpret_cast<const void*>(c->x[19] + 1504), 8);
+                if (view && nxrt::mem::is_mapped(view + 40, 4)) {
+                    int32_t bw = 0;
+                    std::memcpy(&bw, reinterpret_cast<const void*>(view + 40), 4);
+                    if (bw > 0) denom = static_cast<float>(bw);
+                }
+            }
+            c->v[0].f[0] = (std::min)(1.0f, static_cast<float>(g_nat_w) / denom);
         });
     }
-    NXLOG_I("xc2", "native_res: armed mode %lld (target %dx%d)", static_cast<long long>(mode), g_nat_w, g_nat_h);
+    if (ri.from_quality) {
+        NXLOG_I("xc2", "native_res: armed mode %lld from [upscale] render_quality=%s (target %dx%d, res_class %lld)",
+                static_cast<long long>(mode), ri.quality_key, g_nat_w, g_nat_h, static_cast<long long>(rcls));
+    } else {
+        NXLOG_I("xc2", "native_res: armed mode %lld (target %dx%d)", static_cast<long long>(mode), g_nat_w, g_nat_h);
+    }
 }
 
 // ---- delta scan (diagnostic, HANDOVER 57) -----------------------------------------------------------------------------------
@@ -1994,6 +2588,108 @@ static void arm_ns2_mem_probe(uint64_t main_base) {
 // The release split (upstream's fefw_rt.dll / fefw_stub.cpp): the runtime and this boot code live in a DLL and
 // the player's exe only hands it the process. Built with XC2_RT_DLL the entry is exported under a C name so the
 // stub can find it; without the define this is still the exe entry it always was.
+static bool run_shader_prepare(bool interactive, bool force, const std::string& programs_file, bool* cancelled = nullptr) {
+    if (cancelled) *cancelled = false;
+    nxrt::nvn::ShaderPrepareOptions o;
+    o.programs_file = programs_file;
+    o.only_if_needed = !force;
+    o.force = force;
+
+    std::atomic<uint64_t> done{0}, total{0};
+    std::atomic<bool> stop{false}, finished{false};
+    std::mutex mu;
+    std::condition_variable cv;
+    bool ok = false;
+    nxrt::nvn::ShaderPrepareResult res;
+
+    auto run_body = [&] {
+        std::atomic<uint64_t> next_log{1000};
+        o.progress = [&](uint64_t d, uint64_t t) -> bool {
+            done.store(d, std::memory_order_relaxed);
+            total.store(t, std::memory_order_relaxed);
+            nxrt::diag_progress();
+            uint64_t m = next_log.load(std::memory_order_relaxed);
+            if ((d >= m || (t > 0 && d == t)) && next_log.compare_exchange_strong(m, d + 1000, std::memory_order_relaxed)) {
+                NXLOG_I("xc2", "shader prepare: %llu / %llu programs", static_cast<unsigned long long>(d),
+                        static_cast<unsigned long long>(t));
+                if (!interactive) {
+                    std::fprintf(stderr, "shader prepare: %llu / %llu\n", static_cast<unsigned long long>(d),
+                                 static_cast<unsigned long long>(t));
+                }
+            }
+            return !stop.load(std::memory_order_relaxed);
+        };
+        ok = nxrt::nvn::prepare_shaders(o, &res);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            finished.store(true, std::memory_order_release);
+        }
+        cv.notify_all();
+    };
+
+    if (!interactive) {
+        run_body();
+    } else {
+        std::thread worker(run_body);
+        uint64_t shown_done = ~0ull;
+        bool title_changed = false;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::milliseconds(5), [&] { return finished.load(std::memory_order_acquire); });
+        }
+        while (!finished.load(std::memory_order_acquire)) {
+            nxrt::diag_progress();
+            nxrt::platform::pump_events(false, 0);
+            if (nxrt::platform::quit_requested()) stop.store(true, std::memory_order_relaxed);
+            const uint64_t d = done.load(std::memory_order_relaxed);
+            const uint64_t t = total.load(std::memory_order_relaxed);
+            if (t > 0 && d != shown_done) {
+                shown_done = d;
+                title_changed = true;
+                char buf[160];
+                const int pct = static_cast<int>(d * 100 / t);
+                std::snprintf(buf, sizeof buf, "%s - Preparing Shaders %d%% (%llu / %llu)", nxrt::game::info().title, pct,
+                              static_cast<unsigned long long>(d), static_cast<unsigned long long>(t));
+                nxrt::platform::set_window_title(buf);
+            }
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::milliseconds(100), [&] { return finished.load(std::memory_order_acquire); });
+        }
+        worker.join();
+        if (title_changed) nxrt::platform::set_window_title(nxrt::game::info().title);
+    }
+
+    if (cancelled) *cancelled = res.cancelled;
+    if (!ok) {
+        if (interactive && res.error.rfind("cannot open ", 0) == 0) {
+            NXLOG_I("xc2", "shader prepare: skipped (%s)", res.error.c_str());
+            return true;
+        }
+        NXLOG_W("xc2", "shader prepare failed: %s", res.error.c_str());
+        if (!interactive) std::fprintf(stderr, "shader prepare failed: %s\n", res.error.c_str());
+        return false;
+    }
+    if (res.already_ready) {
+        NXLOG_I("xc2", "shader prepare: cache already up to date (%llu programs)",
+                static_cast<unsigned long long>(res.programs));
+        if (!interactive) {
+            std::fprintf(stderr, "shader prepare: already ready (%llu programs)\n",
+                         static_cast<unsigned long long>(res.programs));
+        }
+    } else {
+        NXLOG_I("xc2", "shader prepare: %s (%llu/%llu prepared, %llu parts, %.2f s)",
+                res.cancelled ? "cancelled" : "done", static_cast<unsigned long long>(res.prepared),
+                static_cast<unsigned long long>(res.programs), static_cast<unsigned long long>(res.parts), res.seconds);
+        if (!interactive) {
+            std::fprintf(stderr, "shader prepare: %llu/%llu prepared, %llu missing, %llu failed, %llu parts in %.2f s\n",
+                         static_cast<unsigned long long>(res.prepared), static_cast<unsigned long long>(res.programs),
+                         static_cast<unsigned long long>(res.missing_shaders), static_cast<unsigned long long>(res.failed),
+                         static_cast<unsigned long long>(res.parts), res.seconds);
+        }
+    }
+    return !res.cancelled && res.failed == 0;
+}
+
 #ifdef XC2_RT_DLL
 extern "C" __declspec(dllexport) int xc2_rt_main(int argc, char **argv) {
 #else
@@ -2002,6 +2698,9 @@ int main(int argc, char **argv) {
     std::string exefs;
     std::string link = "host";
     std::string entry_mode = "rtld";
+    std::string programs_file;
+    bool prepare_only = false;
+    bool force_prepare = false;
     uint64_t addr_override = 0;
     const char *logp = "xc2_boot.log";
     for (int i = 1; i < argc; i++) {
@@ -2012,12 +2711,17 @@ int main(int argc, char **argv) {
         else if (arg("--gfx")) ++i;   // parsed again below (window | headless)
         else if (arg("--entry")) entry_mode = argv[++i];
         else if (arg("--addr")) addr_override = std::strtoull(argv[++i], nullptr, 0);
-        else die("usage: xc2_boot --exefs DIR [--link host|rtld] [--gfx window|headless] [--log FILE]");
+        else if (!std::strcmp(argv[i], "--prepare-shaders")) prepare_only = true;
+        else if (!std::strcmp(argv[i], "--force-prepare")) force_prepare = true;
+        else if (arg("--programs")) programs_file = argv[++i];
+        else die("usage: xc2_boot --exefs DIR [--link host|rtld] [--gfx window|headless] [--prepare-shaders] [--log FILE]");
     }
-    if (exefs.empty()) die("--exefs is required: point it at the ExeFS you dumped from your own copy");
+    if (!prepare_only && exefs.empty()) die("--exefs is required: point it at the ExeFS you dumped from your own copy");
     if (!exefs.empty() && exefs.back() == '\\') exefs.pop_back();
 
-    nxrt_register_game_xc2ns2_core();   // before nxrt::init reads the title facts
+    // The game boundary: the core facts plus the factory bindings above, so play mode's binding engine has something to
+    // apply. Before nxrt::init reads the title facts.
+    nxrt::game::set_current(&xc2_game_info());
 
     nxrt::InitOptions opt;
     opt.log_path = logp;
@@ -2030,7 +2734,7 @@ int main(int argc, char **argv) {
     const char* gfxmode = "window";
     for (int i = 1; i < argc; i++)
         if (!std::strcmp(argv[i], "--gfx") && i + 1 < argc) gfxmode = argv[++i];
-    const bool headless = !std::strcmp(gfxmode, "headless");
+    const bool headless = prepare_only || !std::strcmp(gfxmode, "headless");
     std::unique_ptr<nxrt::gfx::Device> gfx_device;
     std::unique_ptr<nxrt::gfx::Renderer> gfx_renderer;
     nxrt::nvn::install();
@@ -2137,18 +2841,51 @@ int main(int argc, char **argv) {
         // arm_frame_rate all observe the same presented frames.
         nxrt::FrameLimiter *frame_limiter = nxrt::play::limiter();
         g_frame_limiter = frame_limiter;
+        const Xc2RenderIntent ri = resolve_xc2_render_intent();
+        if (ri.mode > 0 && !nxrt::config_has("gfx", "render_scale") && !nxrt::config_has("gfx", "output_scale")) {
+            nxrt::gfx::tuning().game_handles_render_quality.store(true, std::memory_order_relaxed);
+        }
         nxrt::nvn::BackendDesc bd;
         bd.device = gfx_device.get();
         bd.renderer = gfx_renderer.get();
         bd.limiter = frame_limiter;
         bd.keep_aspect = play_disp.keep_aspect;
         if (!nxrt::nvn::install_backend(bd)) die("NVN back end failed to start (see the log)");
+        if (prepare_only) {
+            const bool ok = run_shader_prepare(false, force_prepare, programs_file);
+            nxrt::nvn::shutdown_backend();
+            gfx_renderer.reset();
+            gfx_device.reset();
+            nxrt::shutdown();
+            return ok ? 0 : 1;
+        }
+        if (!headless && nxrt::config_get_bool("nvn", "auto_prepare", true)) {
+            bool prep_cancelled = false;
+            run_shader_prepare(true, force_prepare, programs_file, &prep_cancelled);
+            if (prep_cancelled || nxrt::platform::quit_requested()) {
+                nxrt::nvn::shutdown_backend();
+                gfx_renderer.reset();
+                gfx_device.reset();
+                if (!headless) nxrt::platform::shutdown();
+                nxrt::shutdown();
+                return 0;
+            }
+        }
         nxrt::play::StartOptions po;
         po.device = gfx_device.get();
         po.renderer = gfx_renderer.get();
         po.window = !headless;
         po.overlay = !headless;
         nxrt::play::start(po);
+        if (!headless) {
+            xc2::nav::init(kMainBase);
+            xc2::voice::init(kMainBase);
+            nxrt::play::set_hud_callback([](const nxrt::gfx::HudCanvas& c) {
+                xc2::nav::draw(c);
+                xc2::voice::draw(c);
+            });
+            nxrt::play::set_picker(xc2::nav::make_picker_callbacks());
+        }
     }
     // Input: the hid service reads this source every 5 ms. It is live (keyboard + first gamepad, see LiveInput above)
     // and carries the scripted XC2_PRESS presses on top, so a run can be driven by a script, by a human, or both.

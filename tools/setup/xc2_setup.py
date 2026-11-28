@@ -141,9 +141,16 @@ class Runner:
             logf.flush()
             # Streamed rather than captured: the log used to appear only when the command exited, so a four
             # minute build looked like a hang to anyone watching setup.log.
-            p = subprocess.Popen([str(a) for a in argv], cwd=str(cwd) if cwd else None, env=full_env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, errors="replace", bufsize=1)
+            try:
+                p = subprocess.Popen([str(a) for a in argv], cwd=str(cwd) if cwd else None, env=full_env,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, errors="replace", bufsize=1)
+            except OSError as exc:
+                msg = "  failed to start %s: %s" % (argv[0], exc)
+                self.log(msg)
+                logf.write(msg + "\n")
+                logf.flush()
+                return 127
             for line in p.stdout:
                 logf.write("    " + line)
                 logf.flush()
@@ -164,8 +171,24 @@ def first_file(*candidates):
     return Path(candidates[0])
 
 
+def find_powershell():
+    """Return pwsh when installed, else fall back to built-in Windows PowerShell 5.1 (#58)."""
+    candidates = [shutil.which("pwsh")]
+    if os.name == "nt":
+        sysroot = os.environ.get("SystemRoot") or r"C:\Windows"
+        candidates += [
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            shutil.which("powershell"),
+            os.path.join(sysroot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        ]
+    for c in candidates:
+        if c and Path(c).is_file():
+            return str(c)
+    return "powershell.exe" if os.name == "nt" else "pwsh"
+
+
 def pwsh(*args):
-    return ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *args]
+    return [find_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *args]
 
 
 NINJA_LINE = re.compile(r"^\[(\d+)/(\d+)\]")
@@ -202,11 +225,11 @@ def import_toolchain(r):
         r.log("  XC2_ENV points at %s, which is not a file; leaving PATH alone" % script)
         return
     try:
-        p = subprocess.run(["pwsh", "-NoProfile", "-Command",
+        p = subprocess.run([find_powershell(), "-NoProfile", "-Command",
                             ". $env:XC2_ENV *> $null; Write-Output $env:PATH"],
                            capture_output=True, text=True, timeout=180)
     except OSError as exc:
-        r.log("  could not run pwsh to read XC2_ENV: %s" % exc)
+        r.log("  could not run PowerShell to read XC2_ENV: %s" % exc)
         return
     lines = [ln for ln in (p.stdout or "").splitlines() if ln.strip()]
     if p.returncode != 0 or not lines:
@@ -324,12 +347,114 @@ def step_runtime(r, repo):
     return r.end_step("runtime", started, True)
 
 
+def prepare_patched_exefs(r, repo, install):
+    """M3: apply active .pchtxt/.ips mod code patches onto a staging copy (never modifying vanilla exefs).
+
+    Invalidates only modules whose patch state changed since the previous build so Set up incrementally
+    re-lifts and re-links without rebuilding unaffected modules. Returns the ExeFS Path to lift/run with.
+    """
+    vanilla = install / "exefs"
+    mods_dir = install / "mods"
+    patch_mod = repo / "tools" / "mods" / "exefs_patch.py"
+    patched_dir = install / "build" / "exefs-patched"
+    applied_file = install / "build" / "m3_applied.json"
+    if not vanilla.is_dir() or not mods_dir.is_dir() or not patch_mod.is_file():
+        return vanilla
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("xc2_exefs_patch", patch_mod)
+    if spec is None or spec.loader is None:
+        return vanilla
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    ini_path = install / "nxrt.ini"
+    state = mod.apply_exefs_patches(vanilla, patched_dir, mods_dir, ini_path=ini_path if ini_path.is_file() else None, dry_run=r.dry)
+    prev = {}
+    if applied_file.is_file():
+        try:
+            prev = json.loads(applied_file.read_text(encoding="utf-8")).get("modules", {})
+        except Exception:
+            prev = {}
+
+    changed = [m for m, h in state.get("modules", {}).items() if prev.get(m, "") != h]
+    pending_file = install / "build" / "m3_pending.json"
+    if changed and not r.dry:
+        r.log("  m3: code patches changed for: %s" % ", ".join(changed))
+        for m in changed:
+            for stale_dir in (
+                install / "build" / "lift" / m,
+                install / "build" / "obj-zig" / m,
+                repo / "xc2" / "build" / "301" / "lift" / m,
+                repo / "xc2" / "build" / "301" / "obj" / m,
+            ):
+                shutil.rmtree(stale_dir, ignore_errors=True)
+            for stale_file in (
+                repo / "xc2" / "build" / "301" / "lib" / (m + ".lib"),
+            ):
+                try:
+                    stale_file.unlink()
+                except FileNotFoundError:
+                    pass
+        for exe_cand in (install / "xc2_boot.exe", repo / "xc2" / "build" / "301" / "boot" / "xc2_boot.exe"):
+            try:
+                exe_cand.unlink()
+            except FileNotFoundError:
+                pass
+        pending_file.parent.mkdir(parents=True, exist_ok=True)
+        pending_file.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    elif not changed and not applied_file.is_file() and not r.dry:
+        pending_file.parent.mkdir(parents=True, exist_ok=True)
+        pending_file.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    for entry in state.get("applied", []):
+        r.log("  m3: %s <- %s (%d record(s))" % (entry["module"], entry["source"], entry["records"]))
+    for entry in state.get("unmatched", []):
+        r.log("  m3: skipped %s (build_id %s does not match this dump)" % (entry["source"], entry["build_id"]))
+    return patched_dir if state.get("active") else vanilla
+
+
+def finalize_m3_state(r, install):
+    """Promote build/m3_pending.json -> m3_applied.json and clear [mods] pending_rebuild after link succeeds."""
+    if r.dry:
+        return
+    pending = install / "build" / "m3_pending.json"
+    applied = install / "build" / "m3_applied.json"
+    if pending.is_file():
+        applied.parent.mkdir(parents=True, exist_ok=True)
+        applied.write_text(pending.read_text(encoding="utf-8"), encoding="utf-8")
+        try:
+            pending.unlink()
+        except OSError:
+            pass
+    ini_path = install / "nxrt.ini"
+    if ini_path.is_file():
+        lines = ini_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
+        in_mods = False
+        changed = False
+        out = []
+        for ln in lines:
+            st = ln.strip()
+            if st.startswith("[") and st.endswith("]"):
+                in_mods = st[1:-1].strip().lower() == "mods"
+            elif in_mods and "=" in ln and not st.startswith(("#", ";")):
+                k, _ = ln.split("=", 1)
+                if k.strip().lower() == "pending_rebuild" and ln.split("=", 1)[1].strip():
+                    eol = "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+                    ln = f"{k.rstrip()} ={eol}"
+                    changed = True
+            out.append(ln)
+        if changed:
+            ini_path.write_text("".join(out), encoding="utf-8")
+
+
 def step_lift(r, repo, install, jobs=0):
     started = r.step("lift")
+    exefs_dir = prepare_patched_exefs(r, repo, install)
     lib = repo / "xc2" / "build" / "301" / "lib"
     if all((lib / (m + ".lib")).is_file() for m in MODULES):
         return r.end_step("lift", started, True, "the libraries are already there")
-    argv = pwsh(repo / "tools" / "build" / "build.ps1", "-Exefs", install / "exefs", "-Run:$false",
+    argv = pwsh(repo / "tools" / "build" / "build.ps1", "-Exefs", exefs_dir, "-Run:$false",
                 "-Modules", ",".join(MODULES), "-LiftDir", repo / "xc2" / "build" / "301" / "lift",
                 "-ObjDir", repo / "xc2" / "build" / "301" / "obj", "-LibDir", lib)
     if jobs > 0:
@@ -345,12 +470,21 @@ def step_lift(r, repo, install, jobs=0):
 def step_link(r, repo, install):
     started = r.step("link")
     exe = repo / "xc2" / "build" / "301" / "boot" / "xc2_boot.exe"
-    if exe.is_file():
+    lib = repo / "xc2" / "build" / "301" / "lib"
+    # The exe is the lifted game code linked against the runtime headers, so it is stale as soon as one of those
+    # libraries is newer. Checking only that the file exists kept an old exe across a runtime change, and the mixed
+    # pair showed up as rendering faults that a fresh build fixed (a comment on the 0.2.1 video).
+    newest_lib = max((p.stat().st_mtime for p in lib.glob("*.lib")), default=0.0)
+    if exe.is_file() and exe.stat().st_mtime >= newest_lib:
         return r.end_step("link", started, True, "the boot exe is already there")
-    rc = r.run(pwsh(repo / "tools" / "build" / "build-boot.ps1", "-Exefs", install / "exefs",
+    patched = install / "build" / "exefs-patched"
+    exefs_dir = patched if (patched / "m3_state.json").is_file() and (patched / "main").is_file() else install / "exefs"
+    rc = r.run(pwsh(repo / "tools" / "build" / "build-boot.ps1", "-Exefs", exefs_dir,
                     "-OutDir", repo / "xc2" / "build" / "301" / "boot", "-LibDir", repo / "xc2" / "build" / "301" / "lib",
                     "-MainLib", repo / "xc2" / "build" / "301" / "lib" / "main.lib", "-Defines", "XC2_MODULES_7"), cwd=repo,
                 on_line=build_progress(r, "link"))
+    if rc == 0:
+        finalize_m3_state(r, install)
     return r.end_step("link", started, rc == 0, "" if rc == 0 else "build-boot.ps1 failed")
 
 
@@ -426,6 +560,7 @@ def step_doctor_package(r, repo, tools):
 
 def step_lift_package(r, repo, install, py, jobs):
     started = r.step("lift")
+    exefs_dir = prepare_patched_exefs(r, repo, install)
     # Build products live with the game, not in the package: a player's install folder is theirs to fill, and the
     # package stays exactly as it was unpacked.
     lift = install / "build" / "lift"
@@ -442,7 +577,7 @@ def step_lift_package(r, repo, install, py, jobs):
         s = sites / ("sites-%s.txt" % m)
         tasks.append({
             "name": m,
-            "input": str(install / "exefs" / m),
+            "input": str(exefs_dir / m),
             "out": str(out),
             "base": BASES[m],
             "sites": str(s) if s.is_file() else None,
@@ -498,10 +633,61 @@ def copy_runtime_dlls(r, runtime_dir, install):
     return n
 
 
+def clear_high_entropy_va(exe):
+    """Disable IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA (0x20) on xc2_boot.exe so Windows keeps bottom-up allocations
+    low and out of the guest alias/module address ranges (issue #25). Zig's GNU linker omits /HIGHENTROPYVA:NO."""
+    with open(exe, "r+b") as f:
+        f.seek(0x3C)
+        pe = int.from_bytes(f.read(4), "little")
+        f.seek(pe + 24)
+        if f.read(2) != b"\x0b\x02":
+            return False
+        off = pe + 24 + 70
+        f.seek(off)
+        dc = int.from_bytes(f.read(2), "little")
+        if not (dc & 0x20):
+            return False
+        f.seek(off)
+        f.write((dc & ~0x20).to_bytes(2, "little"))
+        return True
+
+
+def runtime_signature(rtlib):
+    """What the exe was linked against. An upgrade replaces the runtime DLL and keeps the exe, so this is the only
+    thing that says whether the pair still matches."""
+    try:
+        st = rtlib.stat()
+        return {"size": st.st_size, "mtime": int(st.st_mtime)}
+    except OSError:
+        return None
+
+
+def link_stamp_matches(stamp, sig):
+    try:
+        return sig is not None and json.loads(stamp.read_text(encoding="utf-8")) == sig
+    except (OSError, ValueError):
+        return False
+
+
+def install_runtime_signature(install):
+    """The runtime an install runs: the package's own copy while it is there, else the one beside the exe."""
+    for candidate in (Path(install) / "runtime" / "xc2_rt.dll", Path(install) / "xc2_rt.dll"):
+        if candidate.is_file():
+            return runtime_signature(candidate)
+    return None
+
+
 def step_link_package(r, repo, install, zig, rtlib, jobs):
     started = r.step("link")
     exe = install / "xc2_boot.exe"
-    if exe.is_file():
+    stamp = install / "build" / "link-stamp.json"
+    sig = runtime_signature(rtlib)
+    # Same rule as the checkout: keep the exe only when it was linked against this exact runtime. The exe carries the
+    # lifted game code, so pairing a new xc2_rt.dll with an exe from an older release is a mixed build.
+    if exe.is_file() and link_stamp_matches(stamp, sig):
+        # Clear high-entropy ASLR on existing installs across upgrades without forcing a full Zig relink.
+        if not r.dry and clear_high_entropy_va(exe):
+            r.log("  patched %s: cleared HIGH_ENTROPY_VA" % exe.name)
         # The exe is kept across an upgrade; the DLLs still have to land next to it (issue #2).
         copy_runtime_dlls(r, rtlib.parent, install)
         return r.end_step("link", started, True, "the boot exe is already there")
@@ -598,7 +784,13 @@ def step_link_package(r, repo, install, zig, rtlib, jobs):
              "-I" + str(inc), "-I" + str(stub.parent), str(rtlib), "-o", str(exe)])
     if r.run(argv) != 0:
         return r.end_step("link", started, False, "the exe did not link")
+    if not r.dry and exe.is_file() and clear_high_entropy_va(exe):
+        r.log("  patched %s: cleared HIGH_ENTROPY_VA" % exe.name)
     copy_runtime_dlls(r, rtlib.parent, install)
+    finalize_m3_state(r, install)
+    if not r.dry and sig is not None:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(json.dumps(sig), encoding="utf-8")
     return r.end_step("link", started, True)
 
 def junction(link, target, r):
@@ -642,33 +834,168 @@ def romfs_missing(looked_near, romfs_in):
             % (looked_near, looked_near / "romfs", looked_near.parent, looked_near.parent / "romfs"))
 
 
+NS2_UPGRADE_PACK_ID = "0100e95004039062"
+
+
+def _is_title_id(name):
+    return len(name) == 16 and all(c in "0123456789abcdefABCDEF" for c in name)
+
+
+def _update_version_in_path(path):
+    parts = [p.lower() for p in path.parts]
+    best = 0
+    for i in range(len(parts) - 1):
+        if parts[i] == "updates" and parts[i + 1].isdigit():
+            best = max(best, int(parts[i + 1]))
+    return best
+
+
+def find_addon_romfs(addon_dir, max_depth=6):
+    """Locate the best `romfs/` inside a title-ID folder, supporting both flat `<id>/romfs` and
+    raw nested layouts such as `<id>/0/updates/65536/program/0/romfs` or `<id>/0/data/0/romfs`."""
+    direct = addon_dir / "romfs"
+    if direct.is_dir():
+        return direct
+    found = []
+    stack = [(addon_dir, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        if depth >= max_depth:
+            continue
+        try:
+            entries = list(cur.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            low = entry.name.lower()
+            if low == "romfs":
+                found.append((entry, depth + 1))
+            elif low != "exefs":
+                stack.append((entry, depth + 1))
+    if not found:
+        return None
+
+    def rank(item):
+        p, depth = item
+        ard = p / "bf2.ard"
+        has_ard = ard.is_file()
+        ard_size = ard.stat().st_size if has_ard else 0
+        return (1 if has_ard else 0, ard_size, _update_version_in_path(p), -depth)
+
+    return max(found, key=rank)[0]
+
+
+def find_ns2_upgrade_romfs(root):
+    """In an un-trimmed raw Switch 2 dump, the full ~24 GB NS2 3.0.1 RomFS lives inside
+    `0100e95004039062` (e.g. `0100e95004039062/0/updates/65536/program/0/romfs`)."""
+    roots = [root]
+    if root.parent != root:
+        roots.append(root.parent)
+    for base in roots:
+        for parent in (base / "dlc", base):
+            if not parent.is_dir():
+                continue
+            try:
+                entries = list(parent.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.is_dir() and entry.name.lower() == NS2_UPGRADE_PACK_ID:
+                    romfs = find_addon_romfs(entry)
+                    if romfs is not None and (romfs / "bf2.ard").is_file():
+                        return romfs
+    return None
+
+
 def find_romfs(dump, explicit):
     # --romfs wins when it is given. Measured 2026-11-17: a run that passed --romfs looked like it had linked the
     # maintainer tree instead, and had not - Path.resolve() dereferences a junction, and the folder passed in WAS a
     # junction to that one, so the install's link named the real target. Both names reach the same files.
     if explicit:
         return explicit if (explicit / "bf2.ard").is_file() else None
+    upgrade = find_ns2_upgrade_romfs(dump)
+    if upgrade is not None:
+        return upgrade
     for candidate in (dump, dump / "romfs", dump.parent, dump.parent / "romfs"):
         if (candidate / "bf2.ard").is_file():
             return candidate
     return None
 
 
-def link_dlc(install, r):
-    """Link the dump's add-on content in: without it the game loads no DLC at all.
+def discover_dlc_romfs(src_dir):
+    """Return sorted list of (lowercase_title_id, romfs_path) for valid DLCs in `src_dir`,
+    skipping the NS2 upgrade pack (0100e95004039062)."""
+    if not src_dir or not src_dir.is_dir():
+        return []
+    found = {}
+    try:
+        entries = list(src_dir.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if not _is_title_id(name) or name.lower() == NS2_UPGRADE_PACK_ID:
+            continue
+        romfs = find_addon_romfs(entry)
+        if romfs is not None:
+            found[name.lower()] = romfs
+    return sorted(found.items())
 
-    The launcher hands the folder over as XC2_AOC_DIR, because it is the side that scanned the dump; the game reads
-    <install>/game/dlc-301, so that path gets the junction. A dump without add-ons is not an error.
+
+def _is_reparse_point(path):
+    if path.is_symlink():
+        return True
+    is_junc = getattr(path, "is_junction", None)
+    if callable(is_junc):
+        try:
+            return is_junc()
+        except OSError:
+            return False
+    return False
+
+
+def link_dlc(install, r, dump_hint=None):
+    """Link each valid add-on's `romfs/` into `<install>/game/dlc-301/<id>/romfs` via per-DLC junctions.
+
+    This keeps the player's dump read-only with zero file copies while normalizing raw nested DLC dumps
+    (`<id>/0/.../romfs` or DLC folders placed directly in the dump root) into the flat `<id>/romfs`
+    layout that the runtime (`misc.cpp`) expects, and always skips `0100e95004039062`.
     """
-    src = os.environ.get("XC2_AOC_DIR", "")
-    if not src or not Path(src).is_dir():
+    candidates = []
+    env_src = os.environ.get("XC2_AOC_DIR", "")
+    if env_src:
+        candidates.append(Path(env_src))
+    if dump_hint is not None:
+        hint = Path(dump_hint)
+        candidates.extend([hint / "dlc", hint])
+        if hint.parent != hint:
+            candidates.extend([hint.parent / "dlc", hint.parent])
+    src = None
+    addons = []
+    for cand in candidates:
+        found = discover_dlc_romfs(cand)
+        if found:
+            src = cand
+            addons = found
+            break
+    if not addons:
         r.log("  dlc: none in the dump (the game runs without add-on content)")
         return
-    game = install / "game"
+    dlc_root = install / "game" / "dlc-301"
     if not r.dry:
-        game.mkdir(parents=True, exist_ok=True)
-    if junction(game / "dlc-301", Path(src), r) == 0:
-        r.log("  dlc: linked %s" % src)
+        if _is_reparse_point(dlc_root):
+            # Replace legacy whole-folder junction with a real directory holding per-DLC junctions.
+            os.rmdir(dlc_root)
+        dlc_root.mkdir(parents=True, exist_ok=True)
+    linked = 0
+    for tid, target_romfs in addons:
+        if junction(dlc_root / tid / "romfs", target_romfs, r) == 0:
+            linked += 1
+    r.log("  dlc: linked %d add-on(s) from %s -> %s" % (linked, src, dlc_root))
 
 
 def step_ingest(r, repo, install, nup, dump, exefs_in, romfs_in):
@@ -676,6 +1003,7 @@ def step_ingest(r, repo, install, nup, dump, exefs_in, romfs_in):
     exefs = install / "exefs"
     romfs = install / "romfs"
     if have_modules(exefs) and romfs.is_dir():
+        link_dlc(install, r, dump_hint=dump or exefs_in)
         return r.end_step("ingest", started, True, "the game files are already installed")
     py = os.environ.get("XC2_PYTHON") or sys.executable
     extract = repo / "tools" / "analysis" / "nup_extract.py"
@@ -695,7 +1023,7 @@ def step_ingest(r, repo, install, nup, dump, exefs_in, romfs_in):
             return r.end_step("ingest", started, False, "could not link exefs")
         if junction(romfs, rom, r) != 0:
             return r.end_step("ingest", started, False, "could not link romfs")
-        link_dlc(install, r)
+        link_dlc(install, r, dump_hint=exefs_in)
     elif dump:
         found = dump if (dump / "main").is_file() else dump / "exefs"
         if not have_modules(found):
@@ -707,7 +1035,7 @@ def step_ingest(r, repo, install, nup, dump, exefs_in, romfs_in):
             return r.end_step("ingest", started, False, romfs_missing(dump, romfs_in))
         if junction(romfs, rom, r) != 0:
             return r.end_step("ingest", started, False, "could not link romfs")
-        link_dlc(install, r)
+        link_dlc(install, r, dump_hint=dump)
     else:
         return r.end_step("ingest", started, False, "give --nup or --dump")
     return r.end_step("ingest", started, True)
@@ -780,7 +1108,17 @@ def step_shaders_package(r, repo, install, py, jobs):
     # cache, 5 missing, black title) and every later setup skipped the step entirely.
     scanned = (spirv / "results.tsv").is_file() and any(spirv.glob("*.spv"))
     prefilled = install / "build" / "prefilled"
-    if scanned and prefilled.is_file():
+    # The prefill names the blocks no file contains, and which blocks those are depends on the runtime - a new
+    # xc2_rt.dll can ask for a different set. The translated cache is keyed by shader hash and stays as it is, so
+    # only the headless pass is redone; the marker therefore carries the runtime signature it was made against.
+    sig = install_runtime_signature(install)
+    prefill_stamp = install / "build" / "prefill-stamp.json"
+    prefill_stale = prefilled.is_file() and not link_stamp_matches(prefill_stamp, sig)
+    if prefill_stale:
+        r.log("  the runtime changed since the shader prefill; running that pass again (the cache is kept)")
+        if not r.dry:
+            prefilled.unlink(missing_ok=True)
+    if scanned and prefilled.is_file() and not prefill_stale:
         return r.end_step("shaders", started, True, "the shader cache is already there")
     if not scanned:
         tool = first_file(repo / "tools" / "shader" / "cache" / "build_cache.py", repo / "tools" / "shader-cache" / "build_cache.py")
@@ -816,11 +1154,38 @@ def step_shaders_package(r, repo, install, py, jobs):
         # Re-walking the archive only retries the 22 blocks the translator rejects, and build_cache.py treats "not one
         # shader came out" as a hard failure - measured 2026-11-18. The scan half is done; only the prefill is missing.
         r.log("  the archive scan is already there; only the headless prefill is missing")
+    programs = spirv.parent / "programs.bin"
+    tsv = install / "build" / "shader-cache" / "files.tsv"
+    ard = install / "romfs" / "bf2.ard"
+    if not programs.is_file() and ard.is_file() and tsv.is_file():
+        ext_tool = first_file(repo / "tools" / "shader" / "cache" / "extract_embedded.py",
+                              repo / "tools" / "shader-cache" / "extract_embedded.py")
+        if ext_tool.is_file():
+            n = jobs if jobs > 0 else max(2, (os.cpu_count() or 4) - 1)
+            r.log("  extracting paired shader programs list for pipeline prewarming...")
+            r.run([str(py), str(ext_tool), "--ard", str(ard), "--tsv", str(tsv),
+                   "--programs", str(programs), "--programs-only", "--jobs", str(n)], cwd=repo)
     note = prefill_package(r, repo, install, py, harness, spirv, jobs=jobs)
     r.log("  %d shader(s) in the cache" % len(list(spirv.glob("*.spv"))))
     if not prefilled.is_file():
         return r.end_step("shaders", started, False,
                           note or "the headless prefill named no block; the cache has the archive's share only")
+    if not r.dry and sig is not None:
+        prefill_stamp.parent.mkdir(parents=True, exist_ok=True)
+        prefill_stamp.write_text(json.dumps(sig), encoding="utf-8")
+    exe = install / "xc2_boot.exe"
+    if exe.is_file() and programs.is_file():
+        patched = install / "build" / "exefs-patched"
+        exefs_dir = patched if (patched / "m3_state.json").is_file() and (patched / "main").is_file() else install / "exefs"
+        env = launch_env(install)
+        env["NXRT_NVN_SHADER_CACHE"] = str(spirv)
+        r.log("  precompiling GPU pipeline cache from %s..." % programs.name)
+        r.note_progress("precompiling GPU pipeline cache")
+        rc = r.run([str(exe), "--exefs", str(exefs_dir), "--link", "host", "--gfx", "headless",
+                    "--prepare-shaders", "--log", str(install / "setup" / "prepare.log")],
+                   cwd=install, env=env)
+        if rc != 0:
+            r.log("  pipeline precompile returned exit %d (will retry automatically on launch)" % rc)
     return r.end_step("shaders", started, True)
 
 
@@ -944,7 +1309,9 @@ def prefill_package(r, repo, install, py, harness, spirv, seconds=40, jobs=0):
         "NXRT_FS_SAVE_DIR": str(install / "save"),
     }
     log = install / "setup" / "prefill.log"
-    argv = [str(exe), "--exefs", str(install / "exefs"), "--link", "host", "--gfx", "headless", "--log", str(log)]
+    patched = install / "build" / "exefs-patched"
+    exefs_dir = patched if (patched / "m3_state.json").is_file() and (patched / "main").is_file() else install / "exefs"
+    argv = [str(exe), "--exefs", str(exefs_dir), "--link", "host", "--gfx", "headless", "--log", str(log)]
     r.log("  prefill: the game runs headless for up to %d s to name the blocks no file contains" % seconds)
     full = os.environ.copy()
     full.update(launch_env(install))
@@ -1072,16 +1439,65 @@ def step_done_package(r, repo, install):
         made = write_ini(install, repo)
         if made:
             r.log("  wrote nxrt.ini")
+        unshadowed = unshadow_ini(install)
+        if unshadowed:
+            r.log("  nxrt.ini: dropped " + ", ".join(unshadowed) + " (the F1 page owns those; see #57 / #73)")
     game = install / "game"
     if not r.dry:
         game.mkdir(parents=True, exist_ok=True)
     junction(game / "romfs-301", install / "romfs", r)
     if (install / "nup_dump" / "dlc").is_dir():
-        junction(game / "dlc-301", install / "nup_dump" / "dlc", r)
+        link_dlc(install, r, dump_hint=install / "nup_dump")
     if not r.dry:
         (install / "setup_state.tsv").write_text("mprs_setup_state\t1\nmeta\tfinished\t1\n", encoding="utf-8")
     r.write_status(state="done", note="ready to play")
     return r.end_step("done", started, True, "ready to play")
+
+
+# The template used to seed keys that the F1 page owns, and nxrt.ini wins over controls.ini (play.cpp merge_env), so
+# the player's choice was replaced on every launch: [hdr] mode = auto pinned HDR (#57), [gfx] window_width/height pinned
+# the window size (#73). New installs no longer get them. An nxrt.ini written by an older template still holds them, so
+# setup drops each one while it still carries exactly the old default - a value the player set is left alone.
+SHADOWED_DEFAULTS = (("hdr", "mode", "auto"), ("gfx", "window_width", "1920"), ("gfx", "window_height", "1080"))
+
+
+def _shadowed_key(section, line):
+    body = line.split(";")[0].strip()
+    if "=" not in body:
+        return None
+    name, _, value = body.partition("=")
+    name = name.strip().lower()
+    value = value.strip().strip('"').lower()
+    for sec, key, default in SHADOWED_DEFAULTS:
+        if section == sec and name == key and value == default:
+            return sec + "/" + key
+    return None
+
+
+def unshadow_ini(install):
+    """Drop the keys an older template seeded with their default, so the F1 page decides those settings again."""
+    ini = install / "nxrt.ini"
+    if not ini.is_file():
+        return []
+    lines = ini.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    section = ""
+    kept = []
+    dropped = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip().lower()
+            kept.append(line)
+            continue
+        hit = _shadowed_key(section, line)
+        if hit:
+            dropped.append(hit)
+        else:
+            kept.append(line)
+    if not dropped:
+        return []
+    ini.write_text("".join(kept), encoding="utf-8", newline="\n")
+    return dropped
 
 
 def write_ini(install, repo):
@@ -1101,7 +1517,7 @@ def write_ini(install, repo):
     if template is None:
         return None
     dlc = install / "dlc"
-    for cand in (install / "nup_dump" / "dlc", install / "game" / "dlc-301", install / "dlc"):
+    for cand in (install / "game" / "dlc-301", install / "nup_dump" / "dlc", install / "dlc"):
         if cand.is_dir():
             dlc = cand
             break
@@ -1148,6 +1564,13 @@ def step_done(r, repo, install):
 
 
 def main():
+    if "--emit-env" in sys.argv[1:]:
+        # Prints GAME_ENV as KEY=VALUE lines. tools/run/play.ps1 sources this before launching, so a dev run gets the
+        # same switches a package gets from launch.env - the profile no longer keeps a copy that can drift (2026-11-26:
+        # a missing NXRT_NVN_EARLYZ_FS=auto turned distant geometry black and looked like a runtime regression).
+        for key in sorted(GAME_ENV):
+            print("%s=%s" % (key, GAME_ENV[key]))
+        return 0
     ap = argparse.ArgumentParser(description="first run of the XC2 NS2 recompilation")
     ap.add_argument("--repo", required=True)
     ap.add_argument("--install", required=True)

@@ -121,6 +121,14 @@ float peak_ratio(float peak_nits, float paper_white_nits, float boost) {
     return std::max(1.0f + b * (peak_nits / paper - 1.0f), 1.0f);
 }
 
+HdrUiSplit hdr_ui_split(bool hdr_output, float peak_ratio, float paper_white_nits, double ui_white_nits) {
+    HdrUiSplit r;
+    if (!hdr_output) return r;
+    if (ui_white_nits > 0 && paper_white_nits > 0) r.ui_scale = static_cast<float>(ui_white_nits) / paper_white_nits;
+    r.wanted = peak_ratio > 1.001f || std::fabs(r.ui_scale - 1.0f) > 0.001f;
+    return r;
+}
+
 // ---- HDR output encodes ----------------------------------------------------------------------------------------------------------
 
 void encode_hdr10(const float lin709[3], const HdrOut& o, float out[3]) {

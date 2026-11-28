@@ -242,10 +242,16 @@ fn package_command(dir: &Path, exe: &Path) -> Command {
     // The preload pack is read before the loose .spv files, so a pack older than a replaced shader hides the
     // replacement: the project deletes it on every launch for that reason (tools/run/play-301.cmd does the same).
     let _ = std::fs::remove_file(dir.join("shader_cache").join("spirv.preload.pack"));
+    let patched_exefs = dir.join("build").join("exefs-patched");
+    let exefs = if patched_exefs.join("m3_state.json").is_file() && patched_exefs.join("main").is_file() {
+        patched_exefs
+    } else {
+        dir.join("exefs")
+    };
     let mut c = Command::new(exe);
     c.current_dir(dir)
         .arg("--exefs")
-        .arg(dir.join("exefs"))
+        .arg(exefs)
         .arg("--link")
         .arg("host")
         .arg("--gfx")
@@ -261,9 +267,13 @@ fn package_command(dir: &Path, exe: &Path) -> Command {
     c.env("NXRT_INI", dir.join("nxrt.ini"));
     // The runtime's own lookup ends up answering AmericanEnglish for [system] language a moment after it read the
     // file correctly (measured 2026-11-18), so the choice is handed over as the environment value, which wins.
-    if let Some(lang) = ini_system_language(dir) {
+    if let Some(lang) = ini_value(dir, "system", "language") {
         c.env("NXRT_SYSTEM_LANGUAGE", lang);
     }
+    // launch.env locks NXRT_XC2_FPS=60 and NXRT_NVN_PRESENT_INTERVAL_HZ=60 by default; let [xc2] fps = 0/30 win here.
+    let (xc2_fps, present_hz) = fps_env_for_dir(dir);
+    c.env("NXRT_XC2_FPS", xc2_fps)
+        .env("NXRT_NVN_PRESENT_INTERVAL_HZ", present_hz);
     c.env("NXRT_FS_ROMFS", dir.join("game").join("romfs-301"))
         .env("NXRT_FS_SAVE_DIR", dir.join("save"))
         .env("NXRT_NVN_SHADER_CACHE", dir.join("shader_cache").join("spirv"))
@@ -275,7 +285,7 @@ fn package_command(dir: &Path, exe: &Path) -> Command {
     c
 }
 
-pub fn start(app: &AppHandle, p: &crate::setup::Paths, launcher_dir: &Path, minimize: bool, runner_setting: &str) -> Result<(), String> {
+pub fn start(app: &AppHandle, p: &crate::setup::Paths, launcher_dir: &Path, minimize: bool, runner_setting: &str, safe_mode: bool) -> Result<(), String> {
     if app.state::<PlayState>().0.lock().unwrap().state == "running" {
         return Err("The game is already running.".into());
     }
@@ -302,15 +312,20 @@ pub fn start(app: &AppHandle, p: &crate::setup::Paths, launcher_dir: &Path, mini
         // leading NAME=value words are environment variables, as in a shell (there is none in between here)
         let n = runner.iter().take_while(|w| w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && !k.contains('/'))).count();
         let (assign, _words) = runner.split_at(n);
+            let fps_flag = if fps_env_for_dir(&dir).1 == "30" { "-30" } else { "-60" };
         let mut cmd = match &script {
             Some(script) => {
                 let mut c = Command::new("cmd.exe");
-                c.args(["/d", "/c"]).arg(script).arg("-60");
+                c.args(["/d", "/c"]).arg(script).arg(fps_flag);
                 c
             }
             None => package_command(&dir, &exe),
         };
         crate::setup::host_env(&mut cmd);
+        if safe_mode {
+            // Non-existent path overrides [fs] mods so both fs_romfs.cpp and cheats.cpp skip all mods/cheats without modifying nxrt.ini.
+            cmd.env("NXRT_FS_MODS", "__safe_mode_no_mods__");
+        }
         cmd.envs(assign.iter().filter_map(|w| w.split_once('=')));
         // Steam's Proton (and umu-run) run in a container that does not see a dump outside the home folder, /mnt and /media (#142)
         if !cfg!(windows) && std::env::var_os("STEAM_COMPAT_MOUNTS").is_none() && !assign.iter().any(|w| w.starts_with("STEAM_COMPAT_MOUNTS=")) {
@@ -401,28 +416,27 @@ pub fn start(app: &AppHandle, p: &crate::setup::Paths, launcher_dir: &Path, mini
     Ok(())
 }
 
-/// `[system] language` from <install>\nxrt.ini: the game language the settings page writes.
-fn ini_system_language(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("nxrt.ini")).ok()?;
-    let mut in_system = false;
-    for line in text.lines() {
-        let l = line.trim();
-        if l.starts_with('[') {
-            in_system = l == "[system]";
-            continue;
-        }
-        if in_system {
-            if let Some((k, v)) = l.split_once('=') {
-                if k.trim() == "language" {
-                    let v = v.trim();
-                    if !v.is_empty() {
-                        return Some(v.to_string());
-                    }
-                }
+/// Reads a trimmed non-empty key from <install>\nxrt.ini.
+fn ini_value(dir: &Path, section: &str, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(crate::settings::GAME_INI)).ok()?;
+    let val = crate::ini::Ini::parse(&text).get(section, key)?;
+    let trimmed = val.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Maps [xc2] fps in nxrt.ini to (NXRT_XC2_FPS, NXRT_NVN_PRESENT_INTERVAL_HZ).
+fn fps_env_for_dir(dir: &Path) -> (String, String) {
+    match ini_value(dir, "xc2", "fps").as_deref() {
+        Some("0") | Some("30") => ("0".into(), "30".into()),
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) if (31..=240).contains(&n) => {
+                let s = n.to_string();
+                (s.clone(), s)
             }
-        }
+            _ => ("60".into(), "60".into()),
+        },
+        None => ("60".into(), "60".into()),
     }
-    None
 }
 
 /// Translate the shader blocks the game dumped because the cache had none (`[nvn] dump_missing`). Idempotent: blocks
@@ -537,7 +551,19 @@ fn fatal_message(text: &str) -> String {
 pub fn open_with_shell(path: &Path) -> Result<(), String> {
     let mut c = Command::new(if cfg!(windows) { "explorer.exe" } else { "xdg-open" });
     crate::setup::host_env(&mut c);
-    c.arg(path).spawn().map(|_| ()).map_err(|e| format!("Could not open {}: {}", path.display(), e))
+    #[cfg(windows)]
+    {
+        // explorer.exe rejects forward slashes (from dump::fwd / launcher.json) and \\?\ prefixes,
+        // silently falling back to opening Documents. Always pass a clean backslash Windows path.
+        let clean = path.to_string_lossy().replace('/', "\\");
+        let clean = clean.strip_prefix(r"\\?\").unwrap_or(&clean);
+        c.arg(clean);
+    }
+    #[cfg(not(windows))]
+    {
+        c.arg(path);
+    }
+    c.spawn().map(|_| ()).map_err(|e| format!("Could not open {}: {}", path.display(), e))
 }
 
 #[cfg(test)]
@@ -580,5 +606,23 @@ mod tests {
             assert_eq!(vdf_values(vdf, "path"), ["/mnt/a b"]);
             assert_eq!(vdf_values(vdf, "require_tool_appid"), ["1628350"]);
         }
+    }
+
+    #[test]
+    fn ini_fps_maps_to_30_or_60_hz() {
+        let dir = std::env::temp_dir().join(format!("xc2-play-fps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join(crate::settings::GAME_INI);
+        assert_eq!(fps_env_for_dir(&dir), ("60".into(), "60".into()));
+        std::fs::write(&ini, "[xc2]\nfps = 0\n").unwrap();
+        assert_eq!(fps_env_for_dir(&dir), ("0".into(), "30".into()));
+        std::fs::write(&ini, "[xc2]\nfps = 30\n").unwrap();
+        assert_eq!(fps_env_for_dir(&dir), ("0".into(), "30".into()));
+        std::fs::write(&ini, "[xc2]\nfps = 90\n").unwrap();
+        assert_eq!(fps_env_for_dir(&dir), ("90".into(), "90".into()));
+        std::fs::write(&ini, "[xc2]\nfps = 120\n").unwrap();
+        assert_eq!(fps_env_for_dir(&dir), ("120".into(), "120".into()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -599,3 +599,25 @@ NXTEST(heap_protect_cycle_is_fast_with_full_heap) {
     CHECK_MSG(ms < 2000, "50 protect cycles on a 256 MiB committed heap took " + std::to_string(ms) + " ms");
     mem::shutdown();
 }
+
+NXTEST(alias_guard_reserves_until_released_or_mapped) {
+    mem::shutdown();
+    CHECK(mem::init());
+    const uint64_t base = mem::alias_base();
+    MEMORY_BASIC_INFORMATION mbi{};
+    CHECK_EQ(VirtualQuery(reinterpret_cast<const void*>(base), &mbi, sizeof mbi), sizeof mbi);
+    CHECK_EQ(mbi.State, static_cast<DWORD>(MEM_RESERVE));
+    mem::release_alias_guard();
+    CHECK_EQ(VirtualQuery(reinterpret_cast<const void*>(base), &mbi, sizeof mbi), sizeof mbi);
+    CHECK_EQ(mbi.State, static_cast<DWORD>(MEM_FREE));
+    mem::shutdown();
+
+    // Also verify shutdown() cleanly releases an untouched alias guard.
+    CHECK(mem::init());
+    const uint64_t base2 = mem::alias_base();
+    CHECK_EQ(VirtualQuery(reinterpret_cast<const void*>(base2), &mbi, sizeof mbi), sizeof mbi);
+    CHECK_EQ(mbi.State, static_cast<DWORD>(MEM_RESERVE));
+    mem::shutdown();
+    CHECK_EQ(VirtualQuery(reinterpret_cast<const void*>(base2), &mbi, sizeof mbi), sizeof mbi);
+    CHECK_EQ(mbi.State, static_cast<DWORD>(MEM_FREE));
+}

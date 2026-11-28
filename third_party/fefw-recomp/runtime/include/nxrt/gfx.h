@@ -121,6 +121,7 @@ struct DeviceFeatures {
     bool image_cube_array = false, shader_draw_parameters = false, sampler_mirror_clamp_to_edge = false;
     bool descriptor_indexing = false, host_query_reset = false;
     bool fragment_shader_interlock = false, depth_clip_control = false, depth_clip_enable = false, custom_border_color = false;
+    bool depth_bias_control_force_unorm = false;   // VK_EXT_depth_bias_control (depthBiasControl + leastRepresentableValueForceUnormRepresentation)
     bool early_and_late_fragment_tests_amd = false;
     bool attachment_feedback_loop_layout = false;
     bool extended_dynamic_state3 = false, vertex_input_dynamic_state = false;
@@ -143,6 +144,8 @@ struct DeviceFeatures {
     bool low_latency2 = false;            // VK_NV_low_latency2 (NVIDIA Reflex)
     bool anti_lag = false;                // VK_AMD_anti_lag (AMD Anti-Lag 2)
     bool memory_budget = false;           // VK_EXT_memory_budget
+    bool device_fault = false;            // VK_EXT_device_fault
+    bool device_diagnostic_checkpoints = false;   // VK_NV_device_diagnostic_checkpoints
 };
 
 struct DeviceLimitsExt {
@@ -204,6 +207,13 @@ public:
     bool submit_once(const std::function<void(VkCommandBuffer)>& fn);
     void wait_idle();
 
+    // Sticky device-lost state shared across NVN and Renderer. The first VK_ERROR_DEVICE_LOST logs fault info (if VK_EXT_device_fault is enabled).
+    bool device_lost() const;
+    bool note_device_lost(VkResult r, const char* where);
+    std::string query_device_fault() const;
+    void cmd_checkpoint(VkCommandBuffer cb, const char* tag) const;
+    std::string query_checkpoints() const;
+
     void set_name(VkObjectType type, uint64_t handle, const char* name);     // VK_EXT_debug_utils, no-op without it
 
     // Live allocation counters of the allocator (for leak checks).
@@ -224,7 +234,7 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queue_family_ = 0;
     uint32_t timestamp_valid_bits_ = 0;
-    std::mutex queue_mutex_;
+    mutable std::mutex queue_mutex_;
     VmaAllocator vma_ = nullptr;
     VkPhysicalDeviceProperties props_ = {};
     DeviceFeatures features_;
@@ -261,6 +271,10 @@ struct FrameInfo {
     uint32_t image_index = 0;
     uint64_t frame_number = 0;            // counts successful begin_frame calls from 0
     bool hdr_output = false;              // the target is an HDR swapchain image (HDR10 / scRGB): colours are encoded, not sRGB
+    VkImageView scene_depth_view = VK_NULL_HANDLE;        // optional read-only 3D scene depth view for overlay depth occlusion
+    VkImageLayout scene_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool scene_depth_flip_y = false;
+    int scene_depth_mode = 0;             // 0=fwd [0,1], 1=rev [0,1], 2=fwd [-1,1], 3=rev [-1,1]
 };
 
 struct RendererStats {
@@ -306,6 +320,8 @@ public:
     // Called from end_frame, after the caller's drawing, with the image still in COLOR_ATTACHMENT_OPTIMAL: record draws that
     // go on top (the ImGui overlay) with a dynamic-rendering pass that loads the image.
     void set_overlay_hook(std::function<void(const FrameInfo&)> hook);
+    // Optional per-frame read-only 3D scene depth view handed to the overlay hook (cleared after end_frame).
+    void set_scene_depth(VkImageView view, VkImageLayout layout, bool flip_y, int depth_mode);
 
     // Present mode. The request is remembered; the mode in use is the closest the surface supports (Mailbox -> Immediate ->
     // Fifo, Immediate -> Mailbox -> Fifo, FifoRelaxed -> Fifo). Recreates the swapchain; false if recreation failed.

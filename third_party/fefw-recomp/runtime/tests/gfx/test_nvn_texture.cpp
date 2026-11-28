@@ -297,6 +297,29 @@ NXTEST(layout_packaged_block_height_and_rejects) {
     CHECK_EQ(be::compute_texture_layout(lin).storage_size, 2560u);
 }
 
+NXTEST(layout_3d_block_depth_fits_the_slices) {
+    // A 256x128x8 BC4 volume (64 x 32 blocks of 8 bytes): 8 deep blocks, 8 GOBs x 4 GOB rows x 8 slices x 512 bytes.
+    TextureBuilderInfo b = mk(NVN_TEXTURE_TARGET_3D, 256, 128, 8, 1, NVN_FORMAT_RGTC1_UNORM);
+    TexLayout L = be::compute_texture_layout(b);
+    CHECK(L.valid);
+    CHECK_EQ(L.layout.levels[0].gob_blocks_y, 1u);
+    CHECK_EQ(L.layout.levels[0].gob_blocks_z, 8u);
+    CHECK_EQ(L.storage_size, 131072u);
+    // a few slices: the block depth covers them
+    CHECK_EQ(be::compute_texture_layout(mk(NVN_TEXTURE_TARGET_3D, 64, 64, 4, 1, NVN_FORMAT_RGBA8)).layout.levels[0].gob_blocks_z, 4u);
+    CHECK_EQ(be::compute_texture_layout(mk(NVN_TEXTURE_TARGET_3D, 64, 64, 1, 1, NVN_FORMAT_RGBA8)).layout.levels[0].gob_blocks_z, 1u);
+    // 16 slices or more: 16 deep
+    CHECK_EQ(be::compute_texture_layout(mk(NVN_TEXTURE_TARGET_3D, 16, 16, 16, 1, NVN_FORMAT_RGBA8)).layout.levels[0].gob_blocks_z, 16u);
+    CHECK_EQ(be::compute_texture_layout(mk(NVN_TEXTURE_TARGET_3D, 33, 33, 33, 1, NVN_FORMAT_RGBA8)).layout.levels[0].gob_blocks_z, 16u);
+    // a packaged layout wins: byte 0 = block height log2 (low half), block depth log2 (high half)
+    b.has_packaged_layout = true;
+    b.packaged_layout[0] = 0x21;
+    L = be::compute_texture_layout(b);
+    CHECK(L.valid);
+    CHECK_EQ(L.layout.levels[0].gob_blocks_y, 2u);
+    CHECK_EQ(L.layout.levels[0].gob_blocks_z, 4u);
+}
+
 // ================================================================================================================================
 // Layout: an independent GOB formula, the tegra library, and the survey's GPU buffer sizes
 // ================================================================================================================================

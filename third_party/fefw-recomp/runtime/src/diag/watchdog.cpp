@@ -215,15 +215,28 @@ std::mutex g_report_mu;
 std::vector<std::string (*)()> g_reports;
 
 std::string extra_reports() {
+    return diag_extra_reports();
+}
+
+}  // namespace
+
+std::string diag_extra_reports() {
+    static thread_local bool in_extra = false;
+    if (in_extra) return {};
+    in_extra = true;
+    struct Guard { bool& f; ~Guard() { f = false; } } guard{in_extra};
     std::vector<std::string (*)()> fns;
     {
-        std::lock_guard<std::mutex> lk(g_report_mu);
+        std::unique_lock<std::mutex> lk(g_report_mu, std::try_to_lock);
+        if (!lk.owns_lock()) return {};
         fns = g_reports;
     }
     std::string out;
     for (auto fn : fns) out += fn();
     return out;
 }
+
+namespace {
 
 // Header line, then the thread dump. Goes to the log and the report file; returns the full text for on_fire.
 std::string emit_dump(const std::string& report_path, const std::string& header) {

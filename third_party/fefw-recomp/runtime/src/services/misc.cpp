@@ -381,9 +381,26 @@ static std::string aoc_romfs_of_id(uint64_t id) {
     return aoc_romfs_dir() + "/" + name + "/romfs";
 }
 
+static std::filesystem::path aoc_path_from_str(const std::string& p) {
+    if (p.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p.data(), static_cast<int>(p.size()), nullptr, 0);
+    UINT cp = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    if (n <= 0) {
+        cp = CP_ACP;
+        flags = 0;
+        n = MultiByteToWideChar(cp, flags, p.data(), static_cast<int>(p.size()), nullptr, 0);
+    }
+    if (n <= 0) return {};
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(cp, flags, p.data(), static_cast<int>(p.size()), w.data(), n);
+    return std::filesystem::path(std::move(w));
+}
+
 static bool aoc_is_dir(const std::string& p) {
     std::error_code ec;
-    return std::filesystem::is_directory(std::filesystem::u8path(p), ec);
+    const std::filesystem::path path = aoc_path_from_str(p);
+    return !path.empty() && std::filesystem::is_directory(path, ec);
 }
 
 // The folder of the add-on content with list index 'index': <[aoc] dir>/<16-hex data id>/romfs.
@@ -404,24 +421,49 @@ static int aoc_index_of_id(uint64_t id) {
     return -1;
 }
 
+// Returns true for add-on packs whose legacy archive breaks the active title build (issue #43).
+static bool aoc_is_incompatible_pack(uint64_t program_id, uint32_t index) {
+    // XC2 Switch 2 Edition 3.0.1 already merges the v3.0.0 upgrade pack (0100E95004039062, index 98) into base RomFS;
+    // mounting its legacy archive as AOC on 3.0.1 crashes during initialization.
+    return program_id == 0x0100E95004038000ull && index == 98u;
+}
+
 // The add-on contents the player supplied: one index per line in <[aoc] dir>/indices.txt, reported only when its folder is on disk.
 // The guest mounts every entry the list names and aborts when one cannot be opened (HANDOVER 86.21), so a console that has 1 of the
-// 8 answers 1. Read once; a missing file means no add-on content.
+// 8 answers 1. Keyed on (list_enabled, dir, program_id) so runtime stays cached once while tests can swap [aoc] dir cleanly.
 static const std::vector<uint32_t>& aoc_indices() {
-    static const std::vector<uint32_t> idx = [] {
-        std::vector<uint32_t> v;
+    static std::mutex mu;
+    static bool cached_list = false;
+    static std::string cached_dir;
+    static uint64_t cached_pid = 0;
+    static bool has_cache = false;
+    static std::vector<uint32_t> cached_idx;
+
+    const bool list_enabled = config_get_bool("aoc", "list", true);
+    const std::string dir = aoc_romfs_dir();
+    const uint64_t pid = profile().program_id;
+
+    std::lock_guard<std::mutex> lk(mu);
+    if (has_cache && cached_list == list_enabled && cached_dir == dir && cached_pid == pid) {
+        return cached_idx;
+    }
+
+    std::vector<uint32_t> v;
+    if (!list_enabled) {
         // [aoc] list = 0 (NXRT_AOC_LIST): report no add-on content at all, the answer of a console that has none. The NS2 program
         // never calls aoc:u; the 3.0.0 NS1 guest uses this switch to boot without mounting anything (HANDOVER 86).
-        if (!config_get_bool("aoc", "list", true)) {
-            NXLOG_I("aoc", "[aoc] list = 0: reporting no add-on content");
-            return v;
-        }
-        const std::string dir = aoc_romfs_dir();
-        const std::filesystem::path dir_path = std::filesystem::u8path(dir);
+        NXLOG_I("aoc", "[aoc] list = 0: reporting no add-on content");
+    } else {
+        const std::filesystem::path dir_path = aoc_path_from_str(dir);
         std::ifstream f(dir_path / "indices.txt");
         if (f.is_open()) {
             unsigned n = 0;
             while (f >> n) {
+                if (aoc_is_incompatible_pack(pid, n)) {
+                    NXLOG_W("aoc", "skipping incompatible add-on content %016llx (index %u): Switch 2 v3.0.0 upgrade pack is incompatible with 3.0.1",
+                            static_cast<unsigned long long>(pid + kAocBaseIdOffset + n), n);
+                    continue;
+                }
                 const std::string romfs = aoc_content_romfs(n);
                 if (aoc_is_dir(romfs)) {
                     v.push_back(n);
@@ -430,28 +472,38 @@ static const std::vector<uint32_t>& aoc_indices() {
                             romfs.c_str());
                 }
             }
-        } else {
+        } else if (!dir_path.empty()) {
             // No list: read the folder, which is what a package extracts to. Each <16-hex id> whose romfs/ is there
             // becomes one entry, and its index comes from whichever base its name uses.
-            // Use u8string() + path-based is_directory(): path::string() converts through the Windows ANSI code page and throws
-            // system_error on any non-ANSI filename inside the DLC folder (issue #25).
+            // Inspect filename().native() directly without u8string()/string(): those throw system_error on Windows when any
+            // entry inside the DLC folder cannot be mapped between UTF-16 and UTF-8/ANSI (issue #25).
             std::error_code ec;
-            for (const auto& e : std::filesystem::directory_iterator(dir_path, ec)) {
-                if (!e.is_directory(ec)) continue;
-                const auto name_u8 = e.path().filename().u8string();
-                if (name_u8.size() != 16) continue;
+            for (const auto& e : std::filesystem::directory_iterator(dir_path, std::filesystem::directory_options::skip_permission_denied, ec)) {
+                if (ec) { ec.clear(); continue; }
+                std::error_code dec;
+                if (!e.is_directory(dec) || dec) continue;
+                const auto& name = e.path().filename().native();
+                if (name.size() != 16) continue;
                 uint64_t id = 0;
                 bool hex = true;
-                for (const auto ch : name_u8) {
-                    const char c = static_cast<char>(ch);
-                    const int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10
-                                                                                      : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+                for (const auto ch : name) {
+                    const int d = (ch >= L'0' && ch <= L'9') ? static_cast<int>(ch - L'0')
+                                : (ch >= L'a' && ch <= L'f') ? static_cast<int>(ch - L'a' + 10)
+                                : (ch >= L'A' && ch <= L'F') ? static_cast<int>(ch - L'A' + 10)
+                                                             : -1;
                     if (d < 0) { hex = false; break; }
                     id = (id << 4) | static_cast<uint64_t>(d);
                 }
-                if (!hex || !std::filesystem::is_directory(e.path() / "romfs", ec)) continue;
+                std::error_code rdec;
+                if (!hex || !std::filesystem::is_directory(e.path() / "romfs", rdec) || rdec) continue;
                 const int index = aoc_index_of_id(id);
-                if (index >= 0) v.push_back(static_cast<uint32_t>(index));
+                if (index < 0) continue;
+                if (aoc_is_incompatible_pack(pid, static_cast<uint32_t>(index))) {
+                    NXLOG_W("aoc", "skipping incompatible add-on content %016llx (index %d): Switch 2 v3.0.0 upgrade pack is incompatible with 3.0.1",
+                            static_cast<unsigned long long>(id), index);
+                    continue;
+                }
+                v.push_back(static_cast<uint32_t>(index));
             }
             std::sort(v.begin(), v.end());
             v.erase(std::unique(v.begin(), v.end()), v.end());
@@ -459,9 +511,14 @@ static const std::vector<uint32_t>& aoc_indices() {
         std::string list;
         for (uint32_t n : v) list += (list.empty() ? "" : ",") + std::to_string(n);
         NXLOG_I("aoc", "%zu add-on content(s) in %s: %s", v.size(), dir.c_str(), list.empty() ? "none" : list.c_str());
-        return v;
-    }();
-    return idx;
+    }
+
+    cached_list = list_enabled;
+    cached_dir = dir;
+    cached_pid = pid;
+    cached_idx = std::move(v);
+    has_cache = true;
+    return cached_idx;
 }
 
 static int32_t aoc_list(Request& req, size_t n) {

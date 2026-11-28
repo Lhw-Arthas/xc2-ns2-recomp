@@ -16,6 +16,8 @@
 // closed ends the process without running the shutdown path. The same thread logs a summary line every 30 s.
 #include <algorithm>
 #include <array>
+
+#include "nxrt/diag.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -44,7 +46,7 @@ namespace nxrt::nvn::be::gpu {
 namespace {
 
 constexpr const char* kTag = "nvn.prewarm";
-constexpr char kMagic[8] = {'N', 'X', 'P', 'K', 'E', 'Y', 'S', '1'};
+constexpr char kMagic[8] = {'N', 'X', 'P', 'K', 'E', 'Y', 'S', '2'};
 constexpr size_t kStageBytes = sizeof(const ShaderInfo*) * 3;
 constexpr size_t kRestBytes = offsetof(GraphicsKey, tess) - kStageBytes;   // the tessellation stages are not recorded (tessellated keys never are)
 static_assert(offsetof(GraphicsKey, stage) == 0, "the shader pointers come first in GraphicsKey");
@@ -53,6 +55,7 @@ constexpr size_t kMaxRecords = 400000;
 
 struct Rec {
     uint64_t h[3];                          // code hashes of vertex, fragment, geometry (0 = stage absent)
+    uint64_t uint_samplers;                 // fragment refl.bindings bitmask rewritten to usampler (nvn_replay.cpp)
     uint8_t rest[kRestBytes];               // the key after the shader pointers, byte for byte
 };
 
@@ -100,21 +103,23 @@ std::string hex16(uint64_t h) {
     return b;
 }
 
-uint64_t digest_of(const uint64_t h[3], const uint8_t* rest) {
+uint64_t digest_of(const Rec& r) {
     uint64_t d = 1469598103934665603ull;
     auto mix = [&d](uint8_t b) { d = (d ^ b) * 1099511628211ull; };
     for (int i = 0; i < 3; ++i)
-        for (int k = 0; k < 8; ++k) mix(static_cast<uint8_t>(h[i] >> (8 * k)));
-    for (size_t i = 0; i < kRestBytes; ++i) mix(rest[i]);
+        for (int k = 0; k < 8; ++k) mix(static_cast<uint8_t>(r.h[i] >> (8 * k)));
+    for (int k = 0; k < 8; ++k) mix(static_cast<uint8_t>(r.uint_samplers >> (8 * k)));
+    for (size_t i = 0; i < kRestBytes; ++i) mix(r.rest[i]);
     return d;
 }
 
-// The record of a key; false when it cannot be recorded (tessellation, a stage the cache has no hash for).
+// The record of a key; false when it cannot be recorded (tessellation or no shader hash).
 bool rec_of(const GraphicsKey& key, Rec* r) {
     if (key.tess[0] || key.tess[1]) return false;
     std::memset(r, 0, sizeof *r);
     for (int i = 0; i < 3; ++i) r->h[i] = key.stage[i] ? parse_hash(key.stage[i]->hash) : 0;
     if (!r->h[0]) return false;
+    r->uint_samplers = key.uint_samplers;
     std::memcpy(r->rest, reinterpret_cast<const uint8_t*>(&key) + kStageBytes, kRestBytes);
     return true;
 }
@@ -130,6 +135,7 @@ bool stub_key(const Rec& r, GraphicsKey& k, const ProgLayout*& pl) {
         if (!k.stage[i]) return false;
     }
     std::memcpy(reinterpret_cast<uint8_t*>(&k) + kStageBytes, r.rest, kRestBytes);
+    k.uint_samplers = r.uint_samplers;
     const ShaderInfo* st6[6] = {k.stage[0], k.stage[1], k.stage[2], nullptr, nullptr, nullptr};
     pl = prog_layout(st6);
     return pl != nullptr;
@@ -165,7 +171,7 @@ void load_file() {
     }
     Rec r;
     while (g_recs.size() < kMaxRecords && f.read(reinterpret_cast<char*>(&r), sizeof r)) {
-        if (!g_digests.insert(digest_of(r.h, r.rest)).second) continue;
+        if (!g_digests.insert(digest_of(r)).second) continue;
         for (uint64_t h : r.h)
             if (h) g_by_any.emplace(h, g_recs.size());
         g_recs.push_back(r);
@@ -258,9 +264,11 @@ void saver_main() {
     std::unique_lock<std::mutex> lk(g_mu);
     uint64_t logged = 0;
     auto next_summary = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto next_cache_save = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!g_stop) {
         g_cv.wait_for(lk, std::chrono::seconds(2), [] { return g_stop; });
         if (g_stop) break;
+        const auto now_tp = std::chrono::steady_clock::now();
         const uint64_t sig = g_stats.recorded + g_stats.queued * 3 + g_stats.built * 5 + g_stats.taken * 7 + g_stats.waited * 11 + g_stats.claimed * 13 +
                              g_stats.linked_meanwhile * 17 + g_stats.promoted * 19;
         if (sig != logged) {                       // the process may end without a shutdown: say what the prewarm did while it runs
@@ -273,11 +281,14 @@ void saver_main() {
                     static_cast<unsigned long long>(g_stats.linked_meanwhile), static_cast<unsigned long long>(g_stats.claimed));
         }
         gpl_progress_log();
-        if (std::chrono::steady_clock::now() >= next_summary) {
+        if (now_tp >= next_summary) {
             next_summary += std::chrono::seconds(30);
             log_summary_locked();
         }
-        if (pipeline_cache_dirty()) {
+        // Save the pipeline cache periodically (every 30 s when dirty) rather than on every 2 s tick so the exclusive
+        // vkGetPipelineCacheData lock does not stall in-flight shader compiles on the render thread during boot/area loads.
+        if (now_tp >= next_cache_save && pipeline_cache_dirty()) {
+            next_cache_save = now_tp + std::chrono::seconds(30);
             lk.unlock();
             pipeline_cache_save();
             lk.lock();
@@ -307,7 +318,7 @@ void prewarm_init() {
         for (size_t i = 0; i < g_recs.size(); ++i) {
             auto j = std::make_shared<Job>();
             j->rec = g_recs[i];
-            j->digest = digest_of(j->rec.h, j->rec.rest);
+            j->digest = digest_of(j->rec);
             g_rec_jobs[i] = j;
             g_jobs[j->digest].push_back(j);
             if (boot) {
@@ -332,7 +343,7 @@ void prewarm_record(const GraphicsKey& key) {
     if (!rec_of(key, &r)) return;                               // the record has no room for tessellation stages
     std::lock_guard<std::mutex> lk(g_mu);
     if (!g_enabled) return;
-    if (g_recs.size() >= kMaxRecords || !g_digests.insert(digest_of(r.h, r.rest)).second) return;
+    if (g_recs.size() >= kMaxRecords || !g_digests.insert(digest_of(r)).second) return;
     g_recs.push_back(r);
     g_rec_jobs.push_back(nullptr);                              // built or linked at its draw this session
     ++g_stats.recorded;
@@ -373,7 +384,7 @@ size_t prewarm_program(const ShaderInfo* const stages[6]) {
 bool prewarm_take(const GraphicsKey& key, VkPipeline* out, const std::function<bool()>& can_link, std::shared_ptr<PipeUpgrade>* later) {
     Rec want;
     if (!rec_of(key, &want)) return false;
-    const uint64_t digest = digest_of(want.h, want.rest);
+    const uint64_t digest = digest_of(want);
     std::unique_lock<std::mutex> lk(g_mu);
     if (!g_enabled) return false;
     std::shared_ptr<Job> j;
@@ -471,6 +482,25 @@ PrewarmStats prewarm_stats() {
     std::lock_guard<std::mutex> lk(g_mu);
     return g_stats;
 }
+
+// A device loss or a freeze report should say whether the prewarm was still building. #32 lost the device 40 s into a
+// boss fight, right while the workers had 6242 pipeline parts to build, and nothing in the report could show that - it
+// only showed the driver stack. This line goes into both dumps through diag_add_report().
+static std::string prewarm_report() {
+    const PrewarmStats s = prewarm_stats();
+    const uint64_t done = s.built + s.claimed;
+    const uint64_t outstanding = s.queued > done ? s.queued - done : 0;
+    char buf[320];
+    std::snprintf(buf, sizeof buf,
+                  "pipeline prewarm: %llu queued, %llu built ahead (%llu failed), %llu taken by draws, %llu built by the draw,"
+                  " %llu still outstanding%s\n",
+                  static_cast<unsigned long long>(s.queued), static_cast<unsigned long long>(s.built),
+                  static_cast<unsigned long long>(s.failed), static_cast<unsigned long long>(s.taken),
+                  static_cast<unsigned long long>(s.claimed), static_cast<unsigned long long>(outstanding),
+                  outstanding ? " (the workers were still building when this was written)" : "");
+    return buf;
+}
+const bool prewarm_report_registered = (diag_add_report(prewarm_report), true);
 
 // The game set a program's shaders: its recorded pipelines go first in line. Programs with both a vertex and a fragment shader also get
 // their shader parts queued by the pipeline-library side when the key file has nothing for them.

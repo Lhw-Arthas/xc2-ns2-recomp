@@ -30,7 +30,50 @@ struct Hook {
 struct Chain {
     std::vector<std::shared_ptr<Hook>> inl, mid, entry;
 };
-using Snapshot = std::unordered_map<uint64_t, Chain>;
+struct Snapshot {
+    std::unordered_map<uint64_t, Chain> map;
+    struct FastSlot {
+        uint64_t addr = 0;
+        const Chain* chain = nullptr;
+    };
+    static constexpr size_t kFastMask = 511;
+    FastSlot fast[kFastMask + 1] = {};
+    bool fast_ok = false;
+
+    Snapshot() = default;
+    Snapshot(const Snapshot& o) : map(o.map) { rebuild_fast(); }
+
+    static size_t hash_addr(uint64_t a) {
+        a ^= a >> 33;
+        a *= 0xff51afd7ed558ccdull;
+        a ^= a >> 33;
+        return static_cast<size_t>(a);
+    }
+    void rebuild_fast() {
+        for (FastSlot& s : fast) s = {};
+        if (map.size() * 2 > (kFastMask + 1)) { fast_ok = false; return; }
+        for (const auto& kv : map) {
+            for (size_t i = hash_addr(kv.first) & kFastMask;; i = (i + 1) & kFastMask) {
+                if (!fast[i].chain) {
+                    fast[i] = {kv.first, &kv.second};
+                    break;
+                }
+            }
+        }
+        fast_ok = true;
+    }
+    const Chain* find_chain(uint64_t addr) const {
+        if (fast_ok) {
+            for (size_t i = hash_addr(addr) & kFastMask;; i = (i + 1) & kFastMask) {
+                const FastSlot& sl = fast[i];
+                if (!sl.chain) return nullptr;
+                if (sl.addr == addr) return sl.chain;
+            }
+        }
+        auto it = map.find(addr);
+        return it == map.end() ? nullptr : &it->second;
+    }
+};
 
 std::mutex g_write;
 std::atomic<const Snapshot*> g_snap{nullptr};
@@ -43,10 +86,11 @@ std::vector<std::shared_ptr<Hook>>& chain_of(Chain& c, HookKind k) {
     return k == HookKind::Inline ? c.inl : k == HookKind::Mid ? c.mid : c.entry;
 }
 const std::vector<std::shared_ptr<Hook>>& chain_of(const Chain& c, HookKind k) {
-    return k == HookKind::Inline ? c.inl : k == HookKind::Mid ? c.mid : c.entry;
+    return k == HookKind::Inline ? c.inl : k == HookKind::Mid ? c.mid : k == HookKind::Entry ? c.entry : c.entry;
 }
 
 void publish(std::unique_ptr<Snapshot> s) {
+    s->rebuild_fast();
     const Snapshot* raw = s.get();
     g_retired.push_back(std::move(s));
     g_snap.store(raw, std::memory_order_release);
@@ -64,7 +108,7 @@ uint32_t add(HookKind kind, uint64_t addr, InlineHookFn inl, SiteHookFn site, vo
     h->user = user;
     const Snapshot* cur = g_snap.load(std::memory_order_relaxed);
     auto next = cur ? std::make_unique<Snapshot>(*cur) : std::make_unique<Snapshot>();
-    chain_of((*next)[addr], kind).push_back(h);
+    chain_of(next->map[addr], kind).push_back(h);
     publish(std::move(next));
     g_all.push_back(h);
     return h->id;
@@ -84,12 +128,12 @@ bool hook_remove(uint32_t id) {
     if (!victim) return false;
     const Snapshot* cur = g_snap.load(std::memory_order_relaxed);
     auto next = std::make_unique<Snapshot>(*cur);
-    auto it = next->find(victim->addr);
-    if (it != next->end()) {
+    auto it = next->map.find(victim->addr);
+    if (it != next->map.end()) {
         auto& v = chain_of(it->second, victim->kind);
         for (size_t i = 0; i < v.size(); i++)
             if (v[i]->id == id) { v.erase(v.begin() + static_cast<ptrdiff_t>(i)); break; }
-        if (it->second.inl.empty() && it->second.mid.empty() && it->second.entry.empty()) next->erase(it);
+        if (it->second.inl.empty() && it->second.mid.empty() && it->second.entry.empty()) next->map.erase(it);
     }
     publish(std::move(next));
     for (size_t i = 0; i < g_all.size(); i++)
@@ -105,8 +149,8 @@ size_t hook_count() {
 size_t hook_count_at(uint64_t addr, HookKind kind) {
     const Snapshot* s = g_snap.load(std::memory_order_acquire);
     if (!s) return 0;
-    auto it = s->find(addr);
-    return it == s->end() ? 0 : chain_of(it->second, kind).size();
+    const Chain* ch = s->find_chain(addr);
+    return ch ? chain_of(*ch, kind).size() : 0;
 }
 
 uint64_t hook_calls(uint32_t id) {
@@ -134,23 +178,19 @@ void nx_site_inline(Ctx* c, uint64_t addr) {
     nxrt::g_site_calls[0].fetch_add(1, std::memory_order_relaxed);
     const nxrt::Snapshot* s = nxrt::g_snap.load(std::memory_order_acquire);
     if (!s) return;
-    auto it = s->find(addr);
-    if (it == s->end()) return;
-    for (const auto& h : it->second.inl) {
-        h->calls.fetch_add(1, std::memory_order_relaxed);
-        h->inl(c, addr, h->user);
-    }
+    const nxrt::Chain* ch = s->find_chain(addr);
+    if (!ch) return;
+    for (const auto& h : ch->inl) { h->calls.fetch_add(1, std::memory_order_relaxed); h->inl(c, addr, h->user); }
 }
 
 static int run_chain(Ctx* c, uint64_t addr, nxrt::HookKind kind) {
     nxrt::g_site_calls[static_cast<int>(kind)].fetch_add(1, std::memory_order_relaxed);
     const nxrt::Snapshot* s = nxrt::g_snap.load(std::memory_order_acquire);
     if (!s) return 0;
-    auto it = s->find(addr);
-    if (it == s->end()) return 0;
-    for (const auto& h : nxrt::chain_of(it->second, kind)) {
-        h->calls.fetch_add(1, std::memory_order_relaxed);
-        if (h->site(c, addr, h->user)) return 1;
+    const nxrt::Chain* ch = s->find_chain(addr);
+    if (!ch) return 0;
+    for (const auto& h : nxrt::chain_of(*ch, kind)) {
+        h->calls.fetch_add(1, std::memory_order_relaxed); if (h->site(c, addr, h->user)) return 1;
     }
     return 0;
 }

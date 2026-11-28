@@ -25,8 +25,9 @@ hook refuses a commit that breaks them (`pwsh -File tools/ci/install-git-hooks.p
 
 The repository contains tooling, runtime code and documentation only. The game's files, the C++ the lift
 produces from them, the shader cache built from them and any key material stay on the machine that owns the
-game. Builds are not distributed: the build embeds the lifted game code, so it is built locally from the
-player's own dump.
+game. Game-derived builds (`xc2_boot.exe` and lifted module libraries) are not distributed: portable releases
+ship only the launcher, generic runtime, and build toolchain, while anything embedding lifted game code is
+built locally from the player's own dump.
 
 ### Where that rule has an edge: the hook tables
 

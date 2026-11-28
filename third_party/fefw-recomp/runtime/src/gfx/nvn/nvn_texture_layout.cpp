@@ -59,6 +59,13 @@ PackedShape nvn2_packed_shape(const TextureBuilderInfo& b) {
 }
 
 
+// Block depth in GOBs of a 3D texture's level 0 without a packaged layout: the smallest power of two covering the slices, at most 16.
+uint32_t volume_block_depth(uint32_t depth) {
+    uint32_t gz = 1;
+    while (gz < depth && gz < 16) gz <<= 1;
+    return gz;
+}
+
 }  // namespace
 
 // Block height in GOBs of a 2D/array texture's level 0 when the game gives no packaged layout. The game copies TXTR data that was tiled
@@ -213,13 +220,16 @@ TexLayout compute_texture_layout(const TextureBuilderInfo& b) {
         ds.gob_blocks_z = static_cast<uint32_t>(tile[2]);
     } else if (is3d) {
         ds.gob_blocks_y = 1;
-        ds.gob_blocks_z = 16;
+        ds.gob_blocks_z = volume_block_depth(d);
         if (b.has_packaged_layout && ds.gob_switch2) {
             const PackedShape s = nvn2_packed_shape(b);
             if (s.h <= 5 && s.d <= 5) {
                 ds.gob_blocks_y = 1u << s.h;
                 ds.gob_blocks_z = 1u << s.d;
             }
+        } else if (b.has_packaged_layout && (b.packaged_layout[0] & 0xfu) <= 5 && (b.packaged_layout[0] >> 4) <= 5) {
+            ds.gob_blocks_y = 1u << (b.packaged_layout[0] & 0xfu);   // byte 0: block height log2 (low), block depth log2 (high)
+            ds.gob_blocks_z = 1u << (b.packaged_layout[0] >> 4);
         }
     } else {
         uint32_t gy = console_block_height(static_cast<uint32_t>(blocks_y));

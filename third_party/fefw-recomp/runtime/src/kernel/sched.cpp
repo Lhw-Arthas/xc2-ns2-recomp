@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <bit>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -57,6 +58,42 @@ std::vector<uint64_t> cores_fastest_first(uint64_t proc, bool full = false) {
     }
     std::stable_sort(cores.begin(), cores.end(), [](const C& a, const C& b) { return a.eff > b.eff || (a.eff == b.eff && (a.first & (~a.first + 1)) < (b.first & (~b.first + 1))); });
     for (const C& c : cores) out.push_back(c.first);
+    return out;
+}
+
+// On hybrid CPUs (e.g. Intel Alder/Raptor Lake P+E cores), returns the mask of all logical threads belonging to the
+// highest EfficiencyClass physical cores inside `proc`, and sets `phys_count` to the number of such physical cores.
+// Returns 0 on uniform CPUs or when the query fails.
+uint64_t perf_cores_mask(uint64_t proc, size_t* phys_count) {
+    *phys_count = 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (!len) return 0;
+    std::vector<uint8_t> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) return 0;
+    int min_eff = 255, max_eff = -1;
+    struct C { int eff; uint64_t mask; };
+    std::vector<C> cores;
+    for (DWORD off = 0; off < len;) {
+        auto* e = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
+        if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount >= 1 && e->Processor.GroupMask[0].Group == 0) {
+            const uint64_t m = static_cast<uint64_t>(e->Processor.GroupMask[0].Mask) & proc;
+            if (m) {
+                const int eff = e->Processor.EfficiencyClass;
+                min_eff = std::min(min_eff, eff);
+                max_eff = std::max(max_eff, eff);
+                cores.push_back({eff, m});
+            }
+        }
+        off += e->Size;
+    }
+    if (max_eff <= min_eff) return 0;   // uniform CPU: nothing to filter
+    uint64_t out = 0;
+    size_t n = 0;
+    for (const C& c : cores) {
+        if (c.eff == max_eff) { out |= c.mask; ++n; }
+    }
+    *phys_count = n;
     return out;
 }
 
@@ -139,7 +176,7 @@ void log_model() {
     }
     if (g_info.soft)
         NXLOG_I("sched", "console core model ON, affinity soft: ideal processors (as masks)%s for cores 0..%d, every guest thread may run on processors %llx (%d of them)",
-                m.c_str(), g_info.cores - 1, (unsigned long long)g_info.pool, __builtin_popcountll(g_info.pool));
+                m.c_str(), g_info.cores - 1, (unsigned long long)g_info.pool, static_cast<int>(std::popcount(static_cast<unsigned long long>(g_info.pool))));
     else
         NXLOG_I("sched", "console core model ON, affinity strict: host masks%s for cores 0..%d", m.c_str(), g_info.cores - 1);
 }
@@ -170,6 +207,14 @@ void init_locked() {
     } else if (g_info.soft) {                   // soft: leave the physical core of processor 0 (DPCs, interrupts) out when enough remain
         const uint64_t trimmed = usable & ~cpu0_core_mask();
         if (cores_fastest_first(trimmed).size() >= static_cast<size_t>(nc)) usable = trimmed;
+        // On hybrid CPUs (e.g. Intel P+E cores), keep guest threads and nvn-render strictly off slow E-cores when enough P-cores remain.
+        size_t p_phys = 0;
+        const uint64_t p_mask = perf_cores_mask(usable, &p_phys);
+        if (p_mask && p_phys >= static_cast<size_t>(nc)) {
+            usable = p_mask;
+            NXLOG_I("sched", "hybrid CPU: restricting guest pool to %zu performance cores (mask %llx, excluding efficiency cores)", p_phys,
+                    (unsigned long long)usable);
+        }
     }
     g_info.pool = usable;                       // soft: every guest thread's affinity; strict: the widened affinity of a starvation boost
     if (cpus.empty()) {
@@ -268,6 +313,16 @@ int sched_host_priority(int hos_prio) {
 }
 
 void sched_set_process_priority(bool interactive) {
+    // Request 1 ms Windows scheduler timer resolution (matching NS1 xc2-recomp's timer_1ms = 1) for tighter frame pacing and waits.
+    static std::once_flag timer_once;
+    std::call_once(timer_once, [] {
+        if (HMODULE mm = LoadLibraryA("winmm.dll")) {
+            using Fn = UINT(WINAPI*)(UINT);
+            if (auto fn = reinterpret_cast<Fn>(GetProcAddress(mm, "timeBeginPeriod"))) {
+                if (fn(1) == 0) NXLOG_I("sched", "Windows timer resolution set to 1 ms (timeBeginPeriod)");
+            }
+        }
+    });
     std::string v = config_get_str("sched", "priority_class", "auto");
     for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     DWORD cls = 0;

@@ -68,10 +68,20 @@ void place(const ThreadRecord& r, const std::string& how, const SchedInfo& si) {
     const int before = ideal_of(h);
     uint64_t aff = si.pool;
     int ideal = -1;
+    bool dedicated = false;
     if (how == "core5" || how == "apart") {
         const int last = si.cores >= 6 ? 5 : si.cores - 1;
         ideal = low_bit(si.host_masks[last]);
-        if (how == "apart") aff &= ~phys_core_of(low_bit(si.host_masks[0]));
+        if (how == "apart") {
+            aff &= ~phys_core_of(low_bit(si.host_masks[0]));
+            uint64_t used_phys = 0;
+            for (int i = 0; i < si.cores; ++i) used_phys |= phys_core_of(low_bit(si.host_masks[i]));
+            const uint64_t spare = aff & ~used_phys;
+            if (spare) {
+                ideal = low_bit(spare);
+                dedicated = true;
+            }
+        }
     } else {
         const uint64_t m = _strtoui64(how.c_str(), nullptr, 16);
         if (m) aff = m, ideal = low_bit(m);
@@ -85,8 +95,12 @@ void place(const ThreadRecord& r, const std::string& how, const SchedInfo& si) {
     PROCESSOR_NUMBER pn{};
     pn.Number = static_cast<BYTE>(ideal);
     SetThreadIdealProcessorEx(h, &pn, nullptr);
-    NXLOG_I("sched", "render_place = %s: %s (tid %u) ideal processor %d -> %d, affinity %llx", how.c_str(), r.name.c_str(), r.host_tid, before, ideal_of(h),
-            (unsigned long long)aff);
+    if (how == "apart") {
+        SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+        SetThreadPriorityBoost(h, TRUE);
+    }
+    NXLOG_I("sched", "render_place = %s: %s (tid %u) ideal processor %d -> %d, affinity %llx%s", how.c_str(), r.name.c_str(), r.host_tid, before, ideal_of(h),
+            (unsigned long long)aff, dedicated ? " (dedicated core, above_normal)" : "");
     CloseHandle(h);
 }
 

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 
 #include "nxrt/gauge.h"
@@ -27,7 +28,7 @@ struct Entry {
     uint64_t start = 0, end = 0;
 };
 
-std::mutex g_mu;
+std::shared_mutex g_mu;
 std::unordered_map<uint64_t, Entry> g_handles;
 std::map<uint64_t, uint64_t> g_regions;      // start -> handle (regions never overlap among live lists)
 std::atomic<uint64_t> g_next{0x1000};
@@ -51,16 +52,16 @@ void drop_locked(uint64_t handle) {
 struct HandleGauges {
     HandleGauges() {
         nxrt::gauge_register("nvn.handles", [] {
-            std::lock_guard<std::mutex> lk(g_mu);
+            std::shared_lock<std::shared_mutex> lk(g_mu);
             return static_cast<int64_t>(g_handles.size());
         });
         nxrt::gauge_register("nvn.handle_regions", [] {
-            std::lock_guard<std::mutex> lk(g_mu);
+            std::shared_lock<std::shared_mutex> lk(g_mu);
             return static_cast<int64_t>(g_regions.size());
         });
         // live handles whose list is not in the game's command memory (overflow ring or no region); bounded by the rings
         nxrt::gauge_register("nvn.handles_unbacked", [] {
-            std::lock_guard<std::mutex> lk(g_mu);
+            std::shared_lock<std::shared_mutex> lk(g_mu);
             int64_t n = 0;
             for (const auto& [h, e] : g_handles) n += unbacked(e) ? 1 : 0;
             return n;
@@ -80,9 +81,9 @@ HandleGauges g_handle_gauges;
 }  // namespace
 
 uint64_t handle_register(Ref<CmdList> list) {
-    const uint64_t h = g_next.fetch_add(8);
+    const uint64_t h = g_next.fetch_add(8, std::memory_order_relaxed);
     list->handle = h;
-    std::lock_guard<std::mutex> lk(g_mu);
+    std::unique_lock<std::shared_mutex> lk(g_mu);
     if (list->mem_end > list->mem_start) {
         // drop every older list whose region overlaps this one
         auto it = g_regions.lower_bound(list->mem_start);
@@ -105,24 +106,24 @@ uint64_t handle_register(Ref<CmdList> list) {
 }
 
 Ref<CmdList> handle_lookup(uint64_t handle) {
-    std::lock_guard<std::mutex> lk(g_mu);
+    std::shared_lock<std::shared_mutex> lk(g_mu);
     auto it = g_handles.find(handle);
     if (it == g_handles.end()) {
-        g_missing.fetch_add(1);
+        g_missing.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
-    it->second.list->calls.fetch_add(1);
+    it->second.list->calls.fetch_add(1, std::memory_order_relaxed);
     return it->second.list;
 }
 
 void handle_release(uint64_t handle) {
     g_finalized.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lk(g_mu);
+    std::unique_lock<std::shared_mutex> lk(g_mu);
     drop_locked(handle);
 }
 
 void handle_release_unbacked(uint64_t handle) {
-    std::lock_guard<std::mutex> lk(g_mu);
+    std::unique_lock<std::shared_mutex> lk(g_mu);
     auto it = g_handles.find(handle);
     if (it != g_handles.end() && unbacked(it->second)) drop_locked(handle);
 }
@@ -130,7 +131,7 @@ void handle_release_unbacked(uint64_t handle) {
 void handles_release_pool(const MemoryPool* pool) {
     if (!pool || !pool->base) return;
     const uint64_t lo = pool->gpu_base, hi = pool->gpu_base + pool->size;
-    std::lock_guard<std::mutex> lk(g_mu);
+    std::unique_lock<std::shared_mutex> lk(g_mu);
     std::vector<uint64_t> drop;
     for (auto& [h, e] : g_handles)
         if (e.end > e.start && e.start >= lo && e.start < hi) drop.push_back(h);
@@ -216,7 +217,7 @@ const char* op_name(Op op) {
 }
 
 size_t handles_live() {
-    std::lock_guard<std::mutex> lk(g_mu);
+    std::shared_lock<std::shared_mutex> lk(g_mu);
     return g_handles.size();
 }
 

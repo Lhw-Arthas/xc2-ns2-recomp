@@ -24,6 +24,8 @@ import sys
 import time
 from pathlib import Path
 
+import arh_index
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 ARD_INDEX = ROOT / "tools" / "shader" / "cache" / "ard_index.py"
@@ -150,11 +152,17 @@ def main(argv=None) -> int:
     archive_bytes = 0
     ard = romfs / "bf2.ard"
     if not a.no_archive and ard.is_file():
+        arh_by_off: dict[int, str] = {}
+        arh_path = romfs / "bf2.arh"
+        if arh_path.is_file():
+            for ent in arh_index.load_arh_entries(arh_path):
+                arh_by_off.setdefault(ent["offset"], ent["path"])
         ard_index = load_ard_index()
         records, rejected, size = ard_index.scan(str(ard))
         for off, name, unc, comp, checksum in records:
+            full = arh_by_off.get(off, name)
             rows.append({
-                "source": "ard", "path": name, "kind": kind_of(name), "size": comp,
+                "source": "ard", "path": full, "kind": kind_of(full), "size": comp,
                 "unc": unc, "comp": comp, "offset": off, "checksum": checksum, "sha256": "",
             })
         archive_rows = len(records)

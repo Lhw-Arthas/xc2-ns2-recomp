@@ -4,6 +4,7 @@
 // with decode_hdr_capture; against the exact bytes for the SDR copy; against a CPU bilinear upscale for FSR 1. The group also requires zero
 // validation errors and no leaked allocations.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -12,12 +13,14 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_framework.h"
 
 #include "extras/hdr_capture.h"
 #include "extras/hdr_math.h"
+#include "extras/hdr_pattern.h"
 #include "extras/output_pass.h"
 #include "nxrt/gfx.h"
 
@@ -122,7 +125,7 @@ void cpu_hdr10_roundtrip(const float in[3], float out[3]) {
 struct Rig {
     std::unique_ptr<gfx::Device> dev;
     hdr::OutputPass pass;
-    gfx::Image src, dst;
+    gfx::Image src, dst, scene;      // scene: the picture before the UI (only the UI split case makes it)
     gfx::Buffer rb;                  // readback of the destination
     VkFormat dst_fmt = VK_FORMAT_UNDEFINED;
     uint32_t w = 0, h = 0, bpp = 0;  // destination size and bytes per texel
@@ -136,6 +139,7 @@ void teardown(Rig& r) {
     if (r.rb) r.dev->destroy_buffer(r.rb);
     if (r.dst) r.dev->destroy_image(r.dst);
     if (r.src) r.dev->destroy_image(r.src);
+    if (r.scene) r.dev->destroy_image(r.scene);
     const gfx::ValidationStats v = r.dev->validation_stats();
     std::printf("    validation: %llu errors, %llu warnings\n", static_cast<unsigned long long>(v.errors), static_cast<unsigned long long>(v.warnings));
     if (!v.first_error.empty()) std::printf("      first error: %s\n", v.first_error.c_str());
@@ -306,6 +310,63 @@ int run_pass(Rig& r, const hdr::OutputParams& p, std::vector<uint8_t>* out) {
 // Tolerance of the HDR checks: 2 percent relative or 0.01 absolute. The 10-bit PQ code steps are about 0.7 percent of the value at 200 nits
 // and about 1 percent at 1000 nits, so 2 percent leaves margin.
 bool close_to(double got, double want, double rel, double abs_tol) { return std::fabs(got - want) <= std::max(rel * std::fabs(want), abs_tol); }
+
+// 8x8 RGBA8 grey levels: column x has v[x] in all three channels, alpha 255.
+std::vector<uint8_t> grey_columns(const uint8_t v[8]) {
+    std::vector<uint8_t> s(8 * 8 * 4);
+    for (uint32_t y = 0; y < 8; ++y)
+        for (uint32_t x = 0; x < 8; ++x) {
+            const size_t o = (static_cast<size_t>(y) * 8 + x) * 4;
+            s[o + 0] = s[o + 1] = s[o + 2] = v[x];
+            s[o + 3] = 255;
+        }
+    return s;
+}
+
+// The shader's picture controls on one grey channel (the luma of a grey is the grey, so saturation does not move it).
+double cpu_picture(double c, const float adj[4]) {
+    const double b = adj[2];
+    c = b < 0.0 ? (c + b) / (1.0 + b) : b + c * (1.0 - b);
+    c = (c - 0.5) * adj[0] + 0.5;
+    return std::pow(std::max(c, 0.0), 1.0 / adj[3]);
+}
+
+// The shader's HDR path for a grey sRGB byte, in paper-white units before the peak limit: sRGB decode, the picture controls (when adj is
+// set) on rgb^(1/2.2), then the highlight expansion toward ratio.
+double cpu_hdr_grey(uint8_t v, const float* adj, double ratio) {
+    double l = hdr::srgb_eotf(v / 255.0f);
+    if (adj) l = std::pow(cpu_picture(std::pow(l, 1.0 / 2.2), adj), 2.2);
+    if (ratio > 1.001) {
+        const double u = std::clamp((l - 0.25) / 0.75, 0.0, 1.0);
+        l *= 1.0 + (ratio - 1.0) * std::pow(u, 2.2);
+    }
+    return l;
+}
+
+// The UI split's two pictures, both uploaded: the copy before the UI into r.scene, the presented picture into r.src.
+bool upload_scene_and_final(Rig& r, const std::vector<uint8_t>& scene, const std::vector<uint8_t>& fin) {
+    if (!upload_source(r, VK_FORMAT_R8G8B8A8_SRGB, 8, 8, scene)) return false;
+    r.scene = r.src;
+    r.src = gfx::Image();
+    return upload_source(r, VK_FORMAT_R8G8B8A8_SRGB, 8, 8, fin);
+}
+
+// 8x8 white with UI on the right half: the presented picture is white everywhere, the copy before the UI is grey for x >= 4.
+void white_with_ui_on_the_right(std::vector<uint8_t>* scene, std::vector<uint8_t>* fin) {
+    const uint8_t s[8] = {255, 255, 255, 255, 128, 128, 128, 128}, f[8] = {255, 255, 255, 255, 255, 255, 255, 255};
+    *scene = grey_columns(s);
+    *fin = grey_columns(f);
+}
+
+// A new destination (and readback) of size x size, for a case that changes the destination.
+bool remake_dst(Rig& r, VkFormat fmt, uint32_t size, uint32_t bpp) {
+    if (r.rb) r.dev->destroy_buffer(r.rb);
+    if (r.dst) r.dev->destroy_image(r.dst);
+    r.rb = gfx::Buffer();
+    r.dst = gfx::Image();
+    return make_dst(r, fmt, size, size, bpp);
+}
+
 
 }  // namespace
 
@@ -615,4 +676,609 @@ NXTEST(fsr1_hdr_keeps_highlights) {
     std::printf("    fsr1 hdr: columns 5..24 decoded %.4f..%.4f (want 0.2 +-5%%), %zu pixels outside\n", lo_min, lo_max, lo_bad);
     CHECK(hi_bad == 0);
     CHECK(lo_bad == 0);
+}
+
+NXTEST(hdr10_highlight_expansion_lifts_display_white) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    // Columns: x<4 = mid-grey (128 -> ~0.216 linear, <= 0.25 knee, stays ~1x paper white);
+    //          x>=4 = peak sRGB white (255 -> 1.0 linear, expands to peak/paper = 1200/230 = 5.217).
+    std::vector<uint8_t> src(8 * 8 * 4);
+    for (uint32_t y = 0; y < 8; ++y)
+        for (uint32_t x = 0; x < 8; ++x) {
+            const uint8_t v = (x < 4) ? 128 : 255;
+            const size_t o = (static_cast<size_t>(y) * 8 + x) * 4;
+            src[o + 0] = src[o + 1] = src[o + 2] = v;
+            src[o + 3] = 255;
+        }
+    REQUIRE(upload_source(r, VK_FORMAT_R8G8B8A8_SRGB, 8, 8, src));
+    REQUIRE(make_dst(r, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 8, 8, 4));
+    hdr::OutputParams p = base_params(r, 8, 8);
+    p.out = hdr::OutputKind::Hdr10;
+    p.src_linear = true;
+    p.paper_white_nits = 230.0f;
+    p.peak_nits = 1200.0f;
+    p.expand_ratio = 1200.0f / 230.0f;
+    std::vector<uint8_t> got;
+    const int mode = run_pass(r, p, &got);
+    CHECK_EQ(mode, 2);
+
+    std::vector<float> lin;
+    REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, got.data(), 8, 8, 230.0f, &lin, nullptr, nullptr, nullptr));
+    const double mid = lin[(0 * 8 + 1) * 3];
+    const double peak_hi = lin[(0 * 8 + 6) * 3];
+    std::printf("    hdr10 expand: sRGB 128 -> %.4f (expected ~0.216), sRGB 255 -> %.4f (expected ~5.217 = 1200 nits)\n", mid, peak_hi);
+    CHECK(mid > 0.19 && mid < 0.25);
+    CHECK(peak_hi > 5.0 && peak_hi < 5.35);
+}
+
+// The UI split: where the copy before the UI differs from the presented picture, the pixel stays at paper white. Both the plain encode
+// and the FSR 1 path (2x, the copies read at the source size).
+NXTEST(hdr10_highlight_expansion_skips_ui) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    std::vector<uint8_t> scene, fin;
+    white_with_ui_on_the_right(&scene, &fin);
+    REQUIRE(upload_scene_and_final(r, scene, fin));
+    for (const uint32_t scale : {1u, 2u}) {
+        const uint32_t w = 8 * scale;
+        REQUIRE(remake_dst(r, VK_FORMAT_A2B10G10R10_UNORM_PACK32, w, 4));
+        hdr::OutputParams p = base_params(r, 8, 8);
+        p.out = hdr::OutputKind::Hdr10;
+        p.src_linear = true;
+        p.paper_white_nits = 230.0f;
+        p.peak_nits = 1200.0f;
+        p.expand_ratio = 1200.0f / 230.0f;
+        p.scene = r.scene.view;
+        p.fsr1 = scale > 1;
+        std::vector<uint8_t> got;
+        CHECK_EQ(run_pass(r, p, &got), 2);
+        std::vector<float> lin;
+        REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, got.data(), w, w, 230.0f, &lin, nullptr, nullptr, nullptr));
+        const double scene_px = lin[(1 * w + 1 * scale) * 3];
+        const double ui_px = lin[(1 * w + 6 * scale) * 3];
+        std::printf("    scale %u: scene white -> %.4f (expected ~5.217), UI white -> %.4f (expected ~1.0)\n", scale, scene_px, ui_px);
+        CHECK(scene_px > 5.0 && scene_px < 5.35);
+        CHECK(ui_px > 0.95 && ui_px < 1.05);
+    }
+}
+
+// ---- the highlight expansion and the picture controls (CPU reference of the encode shader) --------------------------------------------
+
+
+// The expansion through the FSR 1 path (2x): white still reaches the peak, mid grey stays at its level.
+NXTEST(hdr10_highlight_expansion_through_fsr1) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    const uint8_t v[8] = {128, 128, 128, 128, 255, 255, 255, 255};
+    REQUIRE(upload_source(r, VK_FORMAT_R8G8B8A8_SRGB, 8, 8, grey_columns(v)));
+    REQUIRE(make_dst(r, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 16, 16, 4));
+    hdr::OutputParams p = base_params(r, 8, 8);
+    p.out = hdr::OutputKind::Hdr10;
+    p.src_linear = true;
+    p.paper_white_nits = 230.0f;
+    p.peak_nits = 1200.0f;
+    p.expand_ratio = 1200.0f / 230.0f;
+    p.fsr1 = true;
+    std::vector<uint8_t> got;
+    CHECK_EQ(run_pass(r, p, &got), 2);
+    CHECK_EQ(r.pass.fsr_frames(), 1u);
+    std::vector<float> lin;
+    REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, got.data(), 16, 16, 230.0f, &lin, nullptr, nullptr, nullptr));
+    const double mid = lin[(4 * 16 + 2) * 3], hi = lin[(4 * 16 + 13) * 3];
+    std::printf("    fsr1 expand: sRGB 128 -> %.4f (expected ~0.216), sRGB 255 -> %.4f (expected ~5.217)\n", mid, hi);
+    CHECK(mid > 0.19 && mid < 0.25);
+    CHECK(hi > 5.0 && hi < 5.35);
+}
+
+// The expansion on scRGB: the levels of the formula, limited by the peak.
+NXTEST(scrgb_highlight_expansion) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R16G16B16A16_SFLOAT)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    const uint8_t v[8] = {0, 64, 128, 180, 210, 235, 250, 255};
+    REQUIRE(upload_source(r, VK_FORMAT_R8G8B8A8_SRGB, 8, 8, grey_columns(v)));
+    REQUIRE(make_dst(r, VK_FORMAT_R16G16B16A16_SFLOAT, 8, 8, 8));
+    hdr::OutputParams p = base_params(r, 8, 8);
+    p.out = hdr::OutputKind::ScRgb;
+    p.src_linear = true;
+    p.expand_ratio = 1.0f + 0.4f * (kPeak / kPaper - 1.0f);
+    std::vector<uint8_t> got;
+    CHECK_EQ(run_pass(r, p, &got), 3);
+    std::vector<float> lin;
+    REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::Rgba16F, got.data(), 8, 8, kPaper, &lin, nullptr, nullptr, nullptr));
+    size_t bad = 0;
+    for (uint32_t x = 0; x < 8; ++x) {
+        const double want = std::min(cpu_hdr_grey(v[x], nullptr, p.expand_ratio), static_cast<double>(kPeakRatio));
+        const double g = lin[(3 * 8 + x) * 3];
+        if (!close_to(g, want, 0.01, 0.002)) {
+            ++bad;
+            std::printf("    column %u: got %.4f, expected %.4f\n", x, g, want);
+        }
+    }
+    CHECK_EQ(bad, 0ull);
+}
+
+// The picture controls in the SDR copy mode, against the formula.
+NXTEST(picture_controls_sdr) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    const uint8_t v[8] = {0, 16, 64, 100, 128, 180, 230, 255};
+    REQUIRE(upload_source(r, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, grey_columns(v)));
+    REQUIRE(make_dst(r, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 4));
+    hdr::OutputParams p = base_params(r, 8, 8);
+    p.out = hdr::OutputKind::Sdr8;
+    p.picture = true;
+    const float adj[4] = {1.1f, 1.15f, -0.03f, 1.2f};
+    for (int i = 0; i < 4; ++i) p.pic[i] = adj[i];
+    std::vector<uint8_t> got;
+    CHECK_EQ(run_pass(r, p, &got), 0);
+    size_t bad = 0;
+    for (uint32_t x = 0; x < 8; ++x) {
+        const double want = std::clamp(cpu_picture(v[x] / 255.0, adj), 0.0, 1.0) * 255.0;
+        const int g = got[(3 * 8 + x) * 4];
+        if (std::fabs(g - want) > 1.01) {
+            ++bad;
+            std::printf("    column %u: got %d, expected %.2f\n", x, g, want);
+        }
+    }
+    CHECK_EQ(bad, 0ull);
+}
+
+// The picture controls and the expansion together on HDR10, against the formula.
+NXTEST(picture_controls_hdr10_with_expansion) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    const uint8_t v[8] = {16, 64, 100, 128, 180, 210, 235, 255};
+    REQUIRE(upload_source(r, VK_FORMAT_R8G8B8A8_SRGB, 8, 8, grey_columns(v)));
+    REQUIRE(make_dst(r, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 8, 8, 4));
+    hdr::OutputParams p = base_params(r, 8, 8);
+    p.out = hdr::OutputKind::Hdr10;
+    p.src_linear = true;
+    p.expand_ratio = 1.0f + 0.4f * (kPeak / kPaper - 1.0f);
+    p.picture = true;
+    const float adj[4] = {1.03f, 1.15f, -0.02f, 1.0f};
+    for (int i = 0; i < 4; ++i) p.pic[i] = adj[i];
+    std::vector<uint8_t> got;
+    CHECK_EQ(run_pass(r, p, &got), 2);
+    std::vector<float> lin;
+    REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, got.data(), 8, 8, kPaper, &lin, nullptr, nullptr, nullptr));
+    size_t bad = 0;
+    for (uint32_t x = 0; x < 8; ++x) {
+        const double want = std::min(cpu_hdr_grey(v[x], adj, p.expand_ratio), static_cast<double>(kPeakRatio));
+        const double g = lin[(3 * 8 + x) * 3];
+        if (!close_to(g, want, 0.02, 0.01)) {
+            ++bad;
+            std::printf("    column %u: got %.4f, expected %.4f\n", x, g, want);
+        }
+    }
+    CHECK_EQ(bad, 0ull);
+}
+
+// A copy before the UI that equals the presented picture (no UI drawn) gives exactly the picture of no copy at all, with the picture
+// controls on, in both HDR formats and through FSR 1.
+NXTEST(ui_split_without_ui_changes_nothing) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A2B10G10R10_UNORM_PACK32) ||
+        !formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R16G16B16A16_SFLOAT)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    std::vector<uint8_t> src(8 * 8 * 4);
+    uint32_t s = 777u;
+    for (size_t i = 0; i < src.size(); i += 4) {
+        for (int c = 0; c < 3; ++c) {
+            s = s * 1664525u + 1013904223u;
+            src[i + c] = static_cast<uint8_t>(s >> 24);
+        }
+        src[i + 3] = 255;
+    }
+    REQUIRE(upload_scene_and_final(r, src, src));
+    struct Case {
+        VkFormat fmt;
+        uint32_t bpp;
+        hdr::OutputKind out;
+        uint32_t size;
+    };
+    const Case cases[] = {{VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, hdr::OutputKind::Hdr10, 8},
+                          {VK_FORMAT_R16G16B16A16_SFLOAT, 8, hdr::OutputKind::ScRgb, 8},
+                          {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, hdr::OutputKind::Hdr10, 16}};
+    for (const Case& c : cases) {
+        REQUIRE(remake_dst(r, c.fmt, c.size, c.bpp));
+        hdr::OutputParams p = base_params(r, 8, 8);
+        p.out = c.out;
+        p.src_linear = true;
+        p.expand_ratio = 1.0f + 0.8f * (kPeak / kPaper - 1.0f);
+        p.fsr1 = c.size > 8;
+        p.picture = true;
+        const float adj[4] = {1.1f, 1.15f, -0.03f, 1.0f};
+        for (int i = 0; i < 4; ++i) p.pic[i] = adj[i];
+        std::vector<uint8_t> plain, split;
+        REQUIRE(run_pass(r, p, &plain) >= 0);
+        p.scene = r.scene.view;
+        REQUIRE(run_pass(r, p, &split) >= 0);
+        size_t diff = 0;
+        for (size_t i = 0; i < plain.size(); ++i)
+            if (plain[i] != split[i]) ++diff;
+        std::printf("    format %d, %ux%u: %zu of %zu bytes differ\n", static_cast<int>(c.fmt), c.size, c.size, diff, plain.size());
+        CHECK_EQ(diff, 0ull);
+    }
+}
+
+// The UI brightness: UI pixels go to ui_scale x paper white, scene pixels keep the expansion (or stay at 1 with no expansion). Without
+// a copy before the UI, ui_scale changes nothing.
+NXTEST(hdr10_ui_brightness) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    std::vector<uint8_t> scene, fin;
+    white_with_ui_on_the_right(&scene, &fin);
+    REQUIRE(upload_scene_and_final(r, scene, fin));
+    REQUIRE(make_dst(r, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 8, 8, 4));
+    struct Case {
+        float expand, ui;
+        bool copy;
+        double want_scene, want_ui;
+    };
+    const Case cases[] = {{1200.0f / 230.0f, 0.7f, true, 5.217, 0.7},
+                          {1.0f, 1.5f, true, 1.0, 1.5},
+                          {1.0f, 1.5f, false, 1.0, 1.0},
+                          {1200.0f / 230.0f, 0.7f, false, 5.217, 5.217}};
+    for (const Case& c : cases) {
+        hdr::OutputParams p = base_params(r, 8, 8);
+        p.out = hdr::OutputKind::Hdr10;
+        p.src_linear = true;
+        p.paper_white_nits = 230.0f;
+        p.peak_nits = 1200.0f;
+        p.expand_ratio = c.expand;
+        p.ui_scale = c.ui;
+        p.scene = c.copy ? r.scene.view : VK_NULL_HANDLE;
+        std::vector<uint8_t> got;
+        CHECK_EQ(run_pass(r, p, &got), 2);
+        std::vector<float> lin;
+        REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, got.data(), 8, 8, 230.0f, &lin, nullptr, nullptr, nullptr));
+        const double sp = lin[(1 * 8 + 1) * 3], up = lin[(1 * 8 + 6) * 3];
+        std::printf("    expand %.2f, ui %.2f, copy %d: scene %.4f (want %.3f), UI %.4f (want %.3f)\n", c.expand, c.ui, c.copy ? 1 : 0, sp,
+                    c.want_scene, up, c.want_ui);
+        CHECK(close_to(sp, c.want_scene, 0.03, 0.01));
+        CHECK(close_to(up, c.want_ui, 0.03, 0.01));
+    }
+}
+
+// The game's kept highlights (src_encoded): a float source with display-encoded values above 1 is decoded (sRGB up to 1, a 2.2 power above),
+// the part above paper white is fitted under highlight_ratio; below 1 nothing changes.
+NXTEST(hdr10_kept_highlights) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    const float enc[8] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 4.0f};
+    REQUIRE(upload_source(r, VK_FORMAT_R16G16B16A16_SFLOAT, 8, 8, pack_half_rgba(8, 8, [&](uint32_t x, uint32_t, float* v) {
+                              v[0] = v[1] = v[2] = enc[x];
+                          })));
+    REQUIRE(make_dst(r, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 8, 8, 4));
+    auto srgb = [](double e) { return e <= 0.04045 ? e / 12.92 : std::pow((e + 0.055) / 1.055, 2.4); };
+    struct Case { float ratio; bool clip, deband; };
+    for (const Case c : {Case{3.0f, false, false}, Case{1.0f, false, false}, Case{5.0f, false, false}, Case{5.0f, true, false}, Case{5.0f, false, true}}) {
+        const float ratio = c.ratio;
+        hdr::OutputParams p = base_params(r, 8, 8);
+        p.out = hdr::OutputKind::Hdr10;
+        p.src_linear = true;
+        p.src_encoded = true;
+        p.highlight_ratio = ratio;
+        p.clip_encoded = c.clip;
+        p.deband = c.deband;   // its noise must leave the highlights above white alone
+        p.paper_white_nits = 200.0f;
+        p.peak_nits = 1000.0f;
+        std::vector<uint8_t> got;
+        CHECK_EQ(run_pass(r, p, &got), 2);
+        std::vector<float> lin;
+        REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, got.data(), 8, 8, 200.0f, &lin, nullptr, nullptr, nullptr));
+        for (uint32_t x = 0; x < 8; ++x) {
+            double want = c.clip ? srgb(std::min(enc[x], 1.0f)) : enc[x] <= 1.0f ? srgb(enc[x]) : std::pow(enc[x], 2.2);
+            if (want > 1.0) {
+                const double a = std::max(ratio - 1.0, 1e-4);
+                want = 1.0 + a * (1.0 - std::exp(-(want - 1.0) / a));
+            }
+            const double g = lin[(3 * 8 + x) * 3 + 1];
+            std::printf("    ratio %.1f, clip %d, deband %d, encoded %.2f: %.4f (want %.4f)\n", ratio, c.clip ? 1 : 0, c.deband ? 1 : 0, enc[x], g, want);
+            CHECK(close_to(g, want, 0.02, c.deband ? 0.01 : 0.003));
+        }
+    }
+}
+
+// Debanding: noise of at most one 8-bit step on the sRGB code, averaging to the plain picture; pure black and white exactly as without it.
+NXTEST(hdr10_deband) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    const uint8_t v[8] = {0, 1, 40, 90, 128, 200, 254, 255};
+    REQUIRE(upload_source(r, VK_FORMAT_R8G8B8A8_SRGB, 8, 8, grey_columns(v)));
+    REQUIRE(make_dst(r, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 8, 8, 4));
+    auto run = [&](bool deband, float expand, std::vector<uint8_t>* got) {
+        hdr::OutputParams p = base_params(r, 8, 8);
+        p.out = hdr::OutputKind::Hdr10;
+        p.src_linear = true;
+        p.paper_white_nits = 230.0f;
+        p.peak_nits = 1200.0f;
+        p.expand_ratio = expand;
+        p.deband = deband;
+        return run_pass(r, p, got);
+    };
+    std::vector<uint8_t> off, on;
+    // no expansion: the output decodes back to the source's sRGB code
+    REQUIRE(run(false, 1.0f, &off) == 2);
+    REQUIRE(run(true, 1.0f, &on) == 2);
+    std::vector<float> loff, lon;
+    REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, off.data(), 8, 8, 230.0f, &loff, nullptr, nullptr, nullptr));
+    REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, on.data(), 8, 8, 230.0f, &lon, nullptr, nullptr, nullptr));
+    int changed = 0;
+    for (uint32_t x = 0; x < 8; ++x) {
+        double sum = 0, worst = 0;
+        for (uint32_t y = 0; y < 8; ++y) {
+            const size_t i = (static_cast<size_t>(y) * 8 + x) * 4;
+            const size_t c = (static_cast<size_t>(y) * 8 + x) * 3;
+            if (x == 0 || x == 7) CHECK(std::memcmp(&off[i], &on[i], 4) == 0);   // black and white untouched
+            if (std::memcmp(&off[i], &on[i], 4) != 0) ++changed;
+            const double d = (hdr::srgb_oetf(lon[c]) - hdr::srgb_oetf(loff[c])) * 255.0;
+            sum += d;
+            worst = std::max(worst, std::fabs(d));
+        }
+        std::printf("    column %u (code %u): mean shift %.3f steps, largest %.3f steps\n", x, v[x], sum / 8.0, worst);
+        if (x >= 2 && x <= 6) {
+            CHECK(worst <= 1.3);                  // one step, plus the 10-bit PQ rounding
+            CHECK(std::fabs(sum / 8.0) <= 0.6);   // the noise averages out
+        }
+    }
+    CHECK(changed >= 16);   // the mid greys do get the noise
+    // with the highlight expansion: white still exact
+    REQUIRE(run(false, 1200.0f / 230.0f, &off) == 2);
+    REQUIRE(run(true, 1200.0f / 230.0f, &on) == 2);
+    for (uint32_t y = 0; y < 8; ++y)
+        for (uint32_t x : {0u, 7u}) {
+            const size_t i = (static_cast<size_t>(y) * 8 + x) * 4;
+            CHECK(std::memcmp(&off[i], &on[i], 4) == 0);
+        }
+}
+
+// ---- HDR test patterns (extras/hdr_pattern.h) ----------------------------------------------------------------------------------------
+
+namespace {
+// The shader's tiles at destination pixel (x, y) of a w x h picture: the distance from the tile centre (max norm, 0..0.5) and the tile.
+double pattern_tile(uint32_t x, uint32_t y, uint32_t w, uint32_t h, int* cx, int* cy) {
+    const double tx = (x + 0.5) / w * 8.0, ty = (y + 0.5) / h * 4.5 + 0.25;
+    *cx = static_cast<int>(std::floor(tx));
+    *cy = static_cast<int>(std::floor(ty));
+    return std::max(std::fabs(tx - std::floor(tx) - 0.5), std::fabs(ty - std::floor(ty) - 0.5));
+}
+bool near_edge(double m) { return std::fabs(m - 0.07) < 0.01 || std::fabs(m - 0.13) < 0.01 || std::fabs(m - 0.3) < 0.01; }
+uint32_t red_code(const std::vector<uint8_t>& px, size_t i) {
+    uint32_t v;
+    std::memcpy(&v, &px[i * 4], 4);
+    return v & 1023u;
+}
+}  // namespace
+
+// Peak: 10000 nits around the peak being tried, on black, with no peak limit; black: codes 1..16 through the encode; SDR: no pattern.
+NXTEST(hdr10_test_patterns) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    const uint8_t v[8] = {128, 128, 128, 128, 128, 128, 128, 128};
+    REQUIRE(upload_source(r, VK_FORMAT_R8G8B8A8_SRGB, 8, 8, grey_columns(v)));
+    const uint32_t W = 256, H = 144;
+    REQUIRE(make_dst(r, VK_FORMAT_A2B10G10R10_UNORM_PACK32, W, H, 4));
+    auto params = [&](hdr::HdrPattern kind, float nits) {
+        hdr::OutputParams p = base_params(r, 8, 8);
+        p.keep_aspect = false;
+        p.out = hdr::OutputKind::Hdr10;
+        p.src_linear = true;
+        p.paper_white_nits = 200.0f;
+        p.peak_nits = 1000.0f;
+        p.expand_ratio = 2.6f;
+        p.deband = true;
+        p.pattern.kind = kind;
+        p.pattern.peak_nits = nits;
+        return p;
+    };
+    const uint32_t c10000 = 1023, c0 = 0;
+    for (float tried : {600.0f, 0.0f}) {   // 0: the current peak (1000)
+        std::vector<uint8_t> got;
+        REQUIRE(run_pass(r, params(hdr::HdrPattern::Peak, tried), &got) == 2);
+        const uint32_t cin = static_cast<uint32_t>(std::lround(hdr::pq_oetf(tried > 0 ? tried : 1000.0f) * 1023.0));
+        int bad = 0, inner = 0;
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) {
+                int cx, cy;
+                const double m = pattern_tile(x, y, W, H, &cx, &cy);
+                if (near_edge(m)) continue;
+                const uint32_t want = m < 0.07 ? cin : (m < 0.13 ? c10000 : c0);
+                const uint32_t have = red_code(got, static_cast<size_t>(y) * W + x);
+                inner += m < 0.07;
+                if (have + 1 < want || have > want + 1) ++bad;
+            }
+        int lit = 0;
+        for (size_t i = 0; i < static_cast<size_t>(W) * H; ++i) lit += red_code(got, i) > 0;
+        std::printf("    peak pattern at %.0f nits: inner code %u, %d inner pixels, %d pixels off, %.1f%% of the screen lit\n", tried, cin, inner, bad,
+                    100.0 * lit / (W * H));
+        CHECK(lit * 10 < static_cast<int>(W * H));   // under 10%: the display's peak, not its limit for a large bright area
+        CHECK(inner > 0);
+        CHECK_EQ(bad, 0);
+    }
+    {
+        std::vector<uint8_t> got;
+        REQUIRE(run_pass(r, params(hdr::HdrPattern::Black, 0.0f), &got) == 2);
+        std::vector<float> lin;
+        REQUIRE(hdr::decode_hdr_capture(hdr::CaptureFormat::A2B10G10R10, got.data(), W, H, 200.0f, &lin, nullptr, nullptr, nullptr));
+        const double codes[8] = {1, 2, 3, 4, 6, 8, 12, 16};
+        int bad = 0, black_not_zero = 0;
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) {
+                int cx, cy;
+                const double m = pattern_tile(x, y, W, H, &cx, &cy);
+                if (near_edge(m)) continue;
+                const size_t i = static_cast<size_t>(y) * W + x;
+                if (m >= 0.3) {
+                    black_not_zero += red_code(got, i) != 0;
+                    continue;
+                }
+                const double want = hdr::srgb_eotf(static_cast<float>(codes[(cx + cy * 3) % 8] / 255.0));
+                if (!close_to(lin[i * 3], want, 0.05, 0.0005)) ++bad;   // no expansion, no deband on the pattern
+            }
+        std::printf("    black pattern: %d squares pixels off, %d background pixels not black\n", bad, black_not_zero);
+        CHECK_EQ(bad, 0);
+        CHECK_EQ(black_not_zero, 0);
+    }
+    {   // staircase: 8 bars of 300..1000 nits along the top 7%, black elsewhere
+        std::vector<uint8_t> got;
+        REQUIRE(run_pass(r, params(hdr::HdrPattern::Staircase, 0.0f), &got) == 2);
+        int bad = 0, lit = 0;
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x) {
+                const double lx = (x + 0.5) / W, ly = (y + 0.5) / H, f = lx * 8.0 - std::floor(lx * 8.0);
+                if (std::fabs(ly - 0.07) < 0.01 || std::fabs(f - 0.04) < 0.02 || std::fabs(f - 0.96) < 0.02) continue;
+                const bool on = ly < 0.07 && f > 0.04 && f < 0.96;
+                const uint32_t want = on ? static_cast<uint32_t>(std::lround(hdr::pq_oetf(static_cast<float>(300.0 + 100.0 * std::floor(lx * 8.0))) * 1023.0)) : 0u;
+                const uint32_t have = red_code(got, static_cast<size_t>(y) * W + x);
+                lit += on;
+                if (have + 1 < want || have > want + 1) ++bad;
+            }
+        const size_t row = static_cast<size_t>(2) * W;
+        std::printf("    staircase: %d bar pixels, %d pixels off, codes %u .. %u\n", lit, bad, red_code(got, row + W / 16), red_code(got, row + W - W / 16));
+        CHECK(lit > 0);
+        CHECK_EQ(bad, 0);
+        CHECK(red_code(got, row + W - W / 16) > red_code(got, row + W / 16));   // brighter to the right
+    }
+    {   // no pattern: the picture
+        std::vector<uint8_t> a, b;
+        hdr::OutputParams p = params(hdr::HdrPattern::None, 0.0f);
+        REQUIRE(run_pass(r, p, &a) == 2);
+        p.deband = false;
+        REQUIRE(run_pass(r, p, &b) == 2);
+        const uint32_t code_mid = red_code(b, 0);
+        CHECK(code_mid > 300 && code_mid < 700);   // grey 128, not a pattern
+    }
+}
+
+NXTEST(sdr_ignores_test_patterns) {
+    Rig r;
+    Teardown td{r};
+    if (!make_device(r)) {
+        nxtest::skip("no headless Vulkan device");
+        return;
+    }
+    if (!formats_supported(*r.dev, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM)) {
+        nxtest::skip("needed format not supported");
+        return;
+    }
+    const uint8_t v[8] = {0, 30, 60, 90, 120, 160, 200, 255};
+    REQUIRE(upload_source(r, VK_FORMAT_R8G8B8A8_SRGB, 8, 8, grey_columns(v)));
+    REQUIRE(make_dst(r, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 4));
+    hdr::OutputParams p = base_params(r, 8, 8);
+    p.out = hdr::OutputKind::Sdr8;
+    p.src_linear = true;
+    std::vector<uint8_t> plain, with;
+    REQUIRE(run_pass(r, p, &plain) == 1);
+    p.pattern.kind = hdr::HdrPattern::Peak;
+    p.pattern.peak_nits = 600.0f;
+    REQUIRE(run_pass(r, p, &with) == 1);
+    CHECK(plain == with);
+}
+
+NXTEST(hdr_pattern_lasts_while_asked) {
+    CHECK(hdr::hdr_pattern().kind == hdr::HdrPattern::None);
+    hdr::set_hdr_pattern(hdr::HdrPattern::Peak, 650.0f);
+    hdr::HdrPatternLive l = hdr::hdr_pattern();
+    CHECK(l.kind == hdr::HdrPattern::Peak);
+    CHECK(l.peak_nits == 650.0f);
+    hdr::set_hdr_pattern(hdr::HdrPattern::Black, -5.0f);
+    l = hdr::hdr_pattern();
+    CHECK(l.kind == hdr::HdrPattern::Black);
+    CHECK(l.peak_nits == 0.0f);
+    hdr::set_hdr_pattern(hdr::HdrPattern::Staircase, 0.0f);
+    CHECK(hdr::hdr_pattern().kind == hdr::HdrPattern::Staircase);
+    hdr::set_hdr_pattern(static_cast<hdr::HdrPattern>(7), 0.0f);   // not a pattern
+    CHECK(hdr::hdr_pattern().kind == hdr::HdrPattern::None);
+    hdr::set_hdr_pattern(hdr::HdrPattern::Peak, 650.0f);
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));   // the menu stopped asking
+    CHECK(hdr::hdr_pattern().kind == hdr::HdrPattern::None);
 }

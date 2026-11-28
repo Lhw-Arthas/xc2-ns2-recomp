@@ -38,6 +38,8 @@
 #include "nxrt/nvn_backend.h"
 #include "nxrt/platform.h"
 #include "nxrt/services_api.h"
+#include "extras/framegen.h"
+#include "extras/nav_ribbon.h"
 #include "extras/overlay_composite.h"
 #include "fps_stats.h"
 
@@ -184,9 +186,150 @@ void clear_imgui_input(ImGuiContext* ctx) {
 
 namespace {
 std::atomic<int> g_shader_backlog{0};
+inline ImU32 rgba_to_imu32(uint32_t rgba) {
+    return IM_COL32((rgba >> 24) & 0xFF, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF, rgba & 0xFF);
+}
 }
 void set_shader_backlog(int pending) { g_shader_backlog.store(pending < 0 ? 0 : pending, std::memory_order_relaxed); }
 int shader_backlog() { return g_shader_backlog.load(std::memory_order_relaxed); }
+
+void HudCanvas::rect_filled(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), rgba_to_imu32(rgba), rounding);
+}
+void HudCanvas::rect_filled_hgrad(float x0, float y0, float x1, float y1, uint32_t rgba_left, uint32_t rgba_right) const {
+    if (!draw_list) return;
+    const ImU32 cl = rgba_to_imu32(rgba_left);
+    const ImU32 cr = rgba_to_imu32(rgba_right);
+    static_cast<ImDrawList*>(draw_list)->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x1, y1), cl, cr, cr, cl);
+}
+void HudCanvas::rect(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding, float thickness) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), rgba_to_imu32(rgba), rounding, 0, thickness);
+}
+void HudCanvas::line(float x0, float y0, float x1, float y1, uint32_t rgba, float thickness) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), rgba_to_imu32(rgba), thickness);
+}
+void HudCanvas::triangle_filled(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t rgba) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddTriangleFilled(ImVec2(x0, y0), ImVec2(x1, y1), ImVec2(x2, y2), rgba_to_imu32(rgba));
+}
+void HudCanvas::quad_filled(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddQuadFilled(ImVec2(x0, y0), ImVec2(x1, y1), ImVec2(x2, y2), ImVec2(x3, y3), rgba_to_imu32(rgba));
+}
+void HudCanvas::quad(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba, float thickness) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddQuad(ImVec2(x0, y0), ImVec2(x1, y1), ImVec2(x2, y2), ImVec2(x3, y3), rgba_to_imu32(rgba), thickness);
+}
+void HudCanvas::convex_poly_filled(const float* xy, int count, uint32_t rgba) const {
+    if (!draw_list || !xy || count < 3) return;
+    if (count > 32) count = 32;
+    ImVec2 pts[32];
+    for (int i = 0; i < count; ++i) pts[i] = ImVec2(xy[i * 2], xy[i * 2 + 1]);
+    static_cast<ImDrawList*>(draw_list)->AddConvexPolyFilled(pts, count, rgba_to_imu32(rgba));
+}
+void HudCanvas::convex_poly_hgrad(const float* xy, int count, float x_left, float x_right, uint32_t rgba_left, uint32_t rgba_right) const {
+    if (!draw_list || !xy || count < 3) return;
+    if (count > 32) count = 32;
+    auto* dl = static_cast<ImDrawList*>(draw_list);
+    const float span = (x_right > x_left + 1e-4f) ? (x_right - x_left) : 1.0f;
+    const float lr = static_cast<float>((rgba_left >> 24) & 0xFF);
+    const float lg = static_cast<float>((rgba_left >> 16) & 0xFF);
+    const float lb = static_cast<float>((rgba_left >> 8) & 0xFF);
+    const float la = static_cast<float>(rgba_left & 0xFF);
+    const float rr = static_cast<float>((rgba_right >> 24) & 0xFF);
+    const float rg = static_cast<float>((rgba_right >> 16) & 0xFF);
+    const float rb = static_cast<float>((rgba_right >> 8) & 0xFF);
+    const float ra = static_cast<float>(rgba_right & 0xFF);
+    const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+    const int idx_count = (count - 2) * 3;
+    dl->PrimReserve(idx_count, count);
+    const ImDrawIdx vtx_base = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+    for (int i = 0; i < count; ++i) {
+        const float px = xy[i * 2];
+        const float py = xy[i * 2 + 1];
+        float t = (px - x_left) / span;
+        if (t < 0.f) t = 0.f;
+        if (t > 1.f) t = 1.f;
+        const ImU32 col = IM_COL32(
+            static_cast<int>(lr + (rr - lr) * t + 0.5f),
+            static_cast<int>(lg + (rg - lg) * t + 0.5f),
+            static_cast<int>(lb + (rb - lb) * t + 0.5f),
+            static_cast<int>(la + (ra - la) * t + 0.5f));
+        dl->PrimWriteVtx(ImVec2(px, py), uv, col);
+    }
+    for (int i = 2; i < count; ++i) {
+        dl->PrimWriteIdx(vtx_base);
+        dl->PrimWriteIdx(static_cast<ImDrawIdx>(vtx_base + i - 1));
+        dl->PrimWriteIdx(static_cast<ImDrawIdx>(vtx_base + i));
+    }
+}
+void HudCanvas::polyline(const float* xy, int count, uint32_t rgba, bool closed, float thickness) const {
+    if (!draw_list || !xy || count < 2) return;
+    if (count > 32) count = 32;
+    ImVec2 pts[32];
+    for (int i = 0; i < count; ++i) pts[i] = ImVec2(xy[i * 2], xy[i * 2 + 1]);
+    static_cast<ImDrawList*>(draw_list)->AddPolyline(pts, count, rgba_to_imu32(rgba), closed ? ImDrawFlags_Closed : ImDrawFlags_None, thickness);
+}
+void HudCanvas::circle_filled(float cx, float cy, float r, uint32_t rgba, int segments) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddCircleFilled(ImVec2(cx, cy), r, rgba_to_imu32(rgba), segments);
+}
+void HudCanvas::circle(float cx, float cy, float r, uint32_t rgba, float thickness, int segments) const {
+    if (draw_list) static_cast<ImDrawList*>(draw_list)->AddCircle(ImVec2(cx, cy), r, rgba_to_imu32(rgba), segments, thickness);
+}
+void HudCanvas::text(float x, float y, float size, uint32_t rgba, const char* str) const {
+    if (draw_list && font && str && *str) {
+        static_cast<ImDrawList*>(draw_list)->AddText(static_cast<ImFont*>(font), size, ImVec2(x, y), rgba_to_imu32(rgba), str);
+    }
+}
+void HudCanvas::text_outlined(float x, float y, float size, uint32_t rgba, uint32_t outline_rgba, const char* str) const {
+    if (!draw_list || !font || !str || !*str) return;
+    auto* dl = static_cast<ImDrawList*>(draw_list);
+    auto* f = static_cast<ImFont*>(font);
+    const ImU32 oc = rgba_to_imu32(outline_rgba);
+    dl->AddText(f, size, ImVec2(x - 1.f, y), oc, str);
+    dl->AddText(f, size, ImVec2(x + 1.f, y), oc, str);
+    dl->AddText(f, size, ImVec2(x, y - 1.f), oc, str);
+    dl->AddText(f, size, ImVec2(x, y + 1.f), oc, str);
+    dl->AddText(f, size, ImVec2(x, y), rgba_to_imu32(rgba), str);
+}
+void HudCanvas::measure_text(float size, const char* str, float* out_w, float* out_h) const {
+    if (!font || !str || !*str) {
+        if (out_w) *out_w = 0.f;
+        if (out_h) *out_h = 0.f;
+        return;
+    }
+    const ImVec2 sz = static_cast<ImFont*>(font)->CalcTextSizeA(size, FLT_MAX, 0.0f, str);
+    if (out_w) *out_w = sz.x;
+    if (out_h) *out_h = sz.y;
+}
+void HudCanvas::image(uint64_t tex_id, float x0, float y0, float x1, float y1,
+                      float u0, float v0, float u1, float v1, uint32_t tint_rgba) const {
+    if (!draw_list || !tex_id) return;
+    static_cast<ImDrawList*>(draw_list)->AddImage(
+        static_cast<ImTextureID>(tex_id), ImVec2(x0, y0), ImVec2(x1, y1),
+        ImVec2(u0, v0), ImVec2(u1, v1), rgba_to_imu32(tint_rgba));
+}
+void HudCanvas::image_rounded(uint64_t tex_id, float x0, float y0, float x1, float y1,
+                              float u0, float v0, float u1, float v1,
+                              float rounding, uint32_t tint_rgba) const {
+    if (!draw_list || !tex_id) return;
+    static_cast<ImDrawList*>(draw_list)->AddImageRounded(
+        static_cast<ImTextureID>(tex_id), ImVec2(x0, y0), ImVec2(x1, y1),
+        ImVec2(u0, v0), ImVec2(u1, v1), rgba_to_imu32(tint_rgba), rounding);
+}
+
+namespace {
+struct RibbonSink {
+    std::vector<Ribbon3DVertex> verts;
+    Ribbon3DParams params;
+    bool active = false;
+};
+}  // namespace
+
+void HudCanvas::set_ribbon_3d(const Ribbon3DVertex* verts, uint32_t count, const Ribbon3DParams& params) const {
+    if (!ribbon_sink || !verts || count < 4) return;
+    auto* sink = static_cast<RibbonSink*>(ribbon_sink);
+    sink->verts.assign(verts, verts + count);
+    sink->params = params;
+    sink->active = true;
+}
 
 struct Overlay::Impl {
     Context ctx;
@@ -204,6 +347,29 @@ struct Overlay::Impl {
     struct Panel { std::string title; std::function<void()> fn; };
     std::vector<Panel> panels;
     std::function<void()> menu;           // set_menu: the game's own menu replaces the Diagnostics window and the panels
+    std::mutex hud_mu;
+    std::function<void(const HudCanvas&)> hud_cb;
+    std::atomic<bool> has_hud_cb{false};
+    struct HudTex {
+        gfx::Image img;
+        VkDescriptorSet ds = VK_NULL_HANDLE;
+    };
+    std::mutex hud_tex_mu;
+    VkSampler hud_tex_sampler = VK_NULL_HANDLE;
+    std::vector<HudTex> hud_textures;
+    std::mutex picker_mu;
+    PickerCallbacks picker_cb;
+    std::atomic<bool> picker_open{false};
+    std::atomic<bool> want_picker_close{false};
+    std::atomic<bool> want_picker_clear{false};
+    std::atomic<int> picker_tab_delta{0};
+    bool picker_restore_relative = false;
+    char picker_filter[128] = {};
+    int picker_tab = 0;  // 0=All, 1=Landmarks, 2=NPCs
+    std::vector<PickerItem> picker_items;
+    bool picker_has_pin = false;
+    std::string picker_pin_name;
+    double picker_last_refresh_s = -1e9;
     std::atomic<bool> want_hide{false};   // request_hide: applied at the start of the next draw (the menu runs with mu held)
 
     // The pad for the menu (set_menu_pad, on the thread that polls the pads)
@@ -225,6 +391,9 @@ struct Overlay::Impl {
     VkFormat color_format = VK_FORMAT_UNDEFINED;
     bool hdr = false;                 // HDR swapchain: the overlay is drawn into an RGBA8 target and composited (draw)
     extras::OverlayComposite composite;
+    extras::NavRibbonPass nav_ribbon;
+    bool nav_ribbon_ok = false;
+    RibbonSink ribbon_sink;
 
     // Corner frame-rate counter. set_counter() stores the settings from any thread; the rest is used by the presenting thread only.
     std::atomic<bool> ptr_show{false}, ptr_in_shots{true};
@@ -472,7 +641,7 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
     Impl& s = *o->impl_;
     s.ctx = ctx;
     s.color_format = ctx.renderer->format();
-    if (ctx.renderer->output_kind() != extras::OutputKind::Sdr8) {
+    if (ctx.renderer->output_kind() != extras::OutputKind::Sdr8 || extras::hdr_state().scene_hdr) {
         // HDR swapchain: ImGui draws into an RGBA8 target that the composite maps onto the swapchain (see draw)
         if (s.composite.init(*ctx.device)) {
             s.hdr = true;
@@ -481,6 +650,7 @@ std::unique_ptr<Overlay> Overlay::create(const Context& ctx, std::string* error)
             NXLOG_W(kTag, "HDR overlay composite failed to initialise: the overlay is drawn straight into the HDR swapchain (colours will look wrong)");
         }
     }
+    s.nav_ribbon_ok = s.nav_ribbon.init(*ctx.device);
     const std::string key = config_get_str("gfx", "overlay_key", "F1");
     if (const SDL_Scancode sc = SDL_GetScancodeFromName(key.c_str()); sc != SDL_SCANCODE_UNKNOWN) s.toggle_sc = sc;
     else NXLOG_W(kTag, "unknown [gfx] overlay_key '%s': using F1", key.c_str());
@@ -635,6 +805,19 @@ Overlay::~Overlay() {
     if (!impl_) return;
     impl_->shutdown_perf_hud();
     if (impl_->ctx.device) impl_->ctx.device->wait_idle();
+    {
+        std::lock_guard<std::mutex> tlk(impl_->hud_tex_mu);
+        for (auto& ht : impl_->hud_textures) {
+            if (ht.ds && impl_->backend_ready) ImGui_ImplVulkan_RemoveTexture(ht.ds);
+            if (ht.img && impl_->ctx.device) impl_->ctx.device->destroy_image(ht.img);
+        }
+        impl_->hud_textures.clear();
+        if (impl_->hud_tex_sampler && impl_->ctx.device) {
+            vkDestroySampler(impl_->ctx.device->device(), impl_->hud_tex_sampler, nullptr);
+            impl_->hud_tex_sampler = VK_NULL_HANDLE;
+        }
+    }
+    impl_->nav_ribbon.shutdown();
     impl_->composite.shutdown();
     if (impl_->backend_ready) ImGui_ImplVulkan_Shutdown();
     if (impl_->imgui) ImGui::DestroyContext(impl_->imgui);
@@ -962,7 +1145,7 @@ void Overlay::Impl::draw_keyboard(double now_s) {
 }
 
 bool Overlay::keyboard_open() const { return impl_->kb_poll(); }
-bool Overlay::blocks_game() const { return impl_->visible || impl_->kb_poll(); }
+bool Overlay::blocks_game() const { return impl_->visible || impl_->picker_open.load(std::memory_order_relaxed) || impl_->kb_poll(); }
 void Overlay::set_keyboard_abxy(bool by_label) { impl_->kb_by_label.store(by_label, std::memory_order_relaxed); }
 
 uint64_t Overlay::set_keyboard_pad(uint64_t buttons, int lx, int ly) {
@@ -1020,7 +1203,22 @@ uint64_t Overlay::set_menu_pad(uint64_t b, int lx, int ly) {
     if (dir((s.menu_stick & right) != 0, lx, true)) stick |= right;
     const uint64_t eff = b | stick, eff_prev = s.menu_prev | s.menu_stick;
     s.menu_stick = stick;
-    if (s.visible) {
+    const bool p_open = s.picker_open.load(std::memory_order_relaxed);
+    if (p_open && !s.visible) {
+        // Picker gamepad controls: B closes, L/R cycles tabs, X clears custom pin, D-pad/L-stick/A drive ImGui list.
+        const uint64_t fresh_unmasked = fresh & ~s.menu_mask;
+        if (fresh_unmasked & hid::btn(hid::kBtnB)) {
+            s.want_picker_close.store(true, std::memory_order_relaxed);
+            s.menu_mask |= b;
+        } else if (fresh_unmasked & hid::btn(hid::kBtnL)) {
+            s.picker_tab_delta.fetch_sub(1, std::memory_order_relaxed);
+        } else if (fresh_unmasked & hid::btn(hid::kBtnR)) {
+            s.picker_tab_delta.fetch_add(1, std::memory_order_relaxed);
+        } else if (fresh_unmasked & hid::btn(hid::kBtnX)) {
+            s.want_picker_clear.store(true, std::memory_order_relaxed);
+        }
+    }
+    if (s.visible || p_open) {
         // ImGui's gamepad keys, by the Switch button's meaning: A activates, B goes back (the game's own convention, after the player's
         // mapping); L / R and ZL / ZR are the shoulders (the menu switches its tabs with them). X, Y, + and - are not given to ImGui (Y would
         // be its windowing mode).
@@ -1045,7 +1243,7 @@ uint64_t Overlay::set_menu_pad(uint64_t b, int lx, int ly) {
     }
     s.menu_mask &= b;                // a button leaves the mask once released
     s.menu_prev = b;
-    return s.visible ? ~0ull : s.menu_mask;
+    return (s.visible || p_open) ? ~0ull : s.menu_mask;
 }
 
 bool Overlay::handle_event(const input::Event& e) {
@@ -1057,7 +1255,12 @@ bool Overlay::handle_event(const input::Event& e) {
     }
     const bool kb = s.kb_poll();
     if (kb && (e.type == EventType::KeyDown || e.type == EventType::KeyUp || e.type == EventType::Text)) return s.kb_key_event(e);
-    if (!s.visible && !kb) return false;
+    const bool p_open = s.picker_open.load(std::memory_order_relaxed);
+    if (p_open && e.type == EventType::KeyDown && e.u.key.scancode == SDL_SCANCODE_ESCAPE) {
+        toggle_picker();
+        return true;
+    }
+    if (!s.visible && !p_open && !kb) return false;
     std::lock_guard<std::mutex> lk(s.mu);
     ImGuiContext* prev = ImGui::GetCurrentContext();
     ImGui::SetCurrentContext(s.imgui);
@@ -1099,6 +1302,7 @@ bool Overlay::handle_event(const input::Event& e) {
     ImGui::SetCurrentContext(prev);
     // the on-screen keyboard takes the whole mouse while it is up
     if (kb) consumed = e.type == EventType::MouseMotion || e.type == EventType::MouseButtonDown || e.type == EventType::MouseButtonUp || e.type == EventType::MouseWheel;
+    if (p_open) consumed = true;
     return consumed;
 }
 
@@ -1128,10 +1332,16 @@ void Overlay::Impl::refresh_counter_text(double now_s) {
     text_s = now_s;
     snap = stats.snapshot(now_s);
     const int detail = counter_detail.load(std::memory_order_relaxed);
+    const extras::FramegenTelemetry fg = extras::framegen_telemetry();
+    const bool fg_live = fg.active && fg.shown_fps > 0.5;
     char buf[64];
     counter_n = 0;
-    if (snap.valid) std::snprintf(buf, sizeof buf, "%.0f FPS", snap.fps);
-    else std::snprintf(buf, sizeof buf, "-- FPS");
+    if (snap.valid) {
+        if (fg_live) std::snprintf(buf, sizeof buf, "%.0f -> %.0f FPS (FG)", snap.fps, fg.shown_fps);
+        else std::snprintf(buf, sizeof buf, "%.0f FPS", snap.fps);
+    } else {
+        std::snprintf(buf, sizeof buf, "-- FPS");
+    }
     counter_lines[counter_n++] = buf;
     if (detail >= 1) {
         if (snap.valid) std::snprintf(buf, sizeof buf, "%.1f ms", snap.avg_ms);
@@ -1399,15 +1609,18 @@ void Overlay::Impl::draw_perf_hud(const FrameInfo& f, double now_s) {
     const float graph_h = sz * 3.2f;
     const float margin = sz * 0.9f;
     const float box_w = std::round(sz * 21.5f);
+    const extras::FramegenTelemetry fg = extras::framegen_telemetry();
+    const bool fg_live = fg.active && fg.shown_fps > 0.5;
+    const int disp_rows = fg.requested ? 7 : 6;
 
     // Count sections:
-    // 4 hw rows + 1 fps row + graph + 6 timing rows + 6 display rows + 2 hw name rows
+    // 4 hw rows + 1 fps row + graph + 6 timing rows + 6..7 display rows + 2 hw name rows
     const float box_h = pad_y * 2.f +
                         4.f * line_h +          // GPU, VRAM, CPU, RAM
                         1.f * line_h +          // FPS / avg ms / max ms
                         sec_gap * 0.5f + graph_h + sec_gap +
                         6.f * line_h + sec_gap + // GPU prep/busy, pipeline/shader waits, tex uploads/time
-                        6.f * line_h + sec_gap + // Window, Game image, 3D scene, Scaling, Frame limit, Presentation
+                        static_cast<float>(disp_rows) * line_h + sec_gap + // Window, Game image, 3D scene, Scaling, [Frame gen], Frame limit, Presentation
                         2.f * line_h;            // GPU name, CPU name
 
     const int corner = counter_corner.load(std::memory_order_relaxed);
@@ -1499,7 +1712,8 @@ void Overlay::Impl::draw_perf_hud(const FrameInfo& f, double now_s) {
 
     // Row 5: FPS | avg ms | max ms
     if (snap.valid) {
-        std::snprintf(buf1, sizeof buf1, "%.0f FPS", snap.fps);
+        if (fg_live) std::snprintf(buf1, sizeof buf1, "%.0f -> %.0f FPS", snap.fps, fg.shown_fps);
+        else std::snprintf(buf1, sizeof buf1, "%.0f FPS", snap.fps);
         std::snprintf(buf2, sizeof buf2, "%.1f ms", snap.avg_ms);
         std::snprintf(buf3, sizeof buf3, "max %.1f ms", snap.max_ms);
     } else {
@@ -1507,8 +1721,9 @@ void Overlay::Impl::draw_perf_hud(const FrameInfo& f, double now_s) {
         std::snprintf(buf2, sizeof buf2, "-- ms");
         std::snprintf(buf3, sizeof buf3, "max -- ms");
     }
+    const float w1 = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, buf1).x;
     draw_c(xL, y, cWhite, buf1);
-    draw_c(col1 + sz * 1.1f, y, cWhite, buf2);
+    draw_c(std::max(col1 + sz * 1.1f, xL + w1 + sz * 0.8f), y, cWhite, buf2);
     draw_r(y, cMuted, buf3);
     y += line_h + sec_gap * 0.5f;
 
@@ -1554,7 +1769,7 @@ void Overlay::Impl::draw_perf_hud(const FrameInfo& f, double now_s) {
     draw_kv(y, cAmber, zh ? "纹理上传耗时" : "Texture upload time", buf1); y += line_h + sec_gap;
 
     // Display & Resolution section
-    const nvn::GameViewportInfo gvi = nvn::game_viewport_info();
+    const nvn::GameViewportInfo gvi = nvn::scaled_game_viewport_info();
     const uint32_t game_w = gvi.base_w > 0 ? gvi.base_w : f.extent.width;
     const uint32_t game_h = gvi.base_h > 0 ? gvi.base_h : f.extent.height;
     const uint32_t scn_w = gvi.render_w > 0 ? gvi.render_w : game_w;
@@ -1583,6 +1798,15 @@ void Overlay::Impl::draw_perf_hud(const FrameInfo& f, double now_s) {
         scale_str = "bilinear";
     }
     draw_kv(y, cCyan, zh ? "超分 / 缩放" : "Scaling", scale_str.c_str()); y += line_h;
+
+    if (fg.requested) {
+        const char* fg_kind = fg.mode == 3 ? "FSR 3 FG" : "DLSS FG";
+        if (fg_live) std::snprintf(buf1, sizeof buf1, zh ? "%s (%.0f 帧)" : "%s (%.0f FPS)", fg_kind, fg.shown_fps);
+        else if (fg.active) std::snprintf(buf1, sizeof buf1, zh ? "%s (已开启)" : "%s (On)", fg_kind);
+        else if (fg.available) std::snprintf(buf1, sizeof buf1, zh ? "%s (待机)" : "%s (Standby)", fg_kind);
+        else std::snprintf(buf1, sizeof buf1, zh ? "%s (不可用)" : "%s (Unavailable)", fg_kind);
+        draw_kv(y, cCyan, zh ? "帧生成" : "Frame gen", buf1); y += line_h;
+    }
 
     const double cap = ctx.limiter ? ctx.limiter->target_fps() : 0.0;
     if (cap > 0.5) std::snprintf(buf1, sizeof buf1, "%.0f FPS", std::round(cap));
@@ -1678,13 +1902,16 @@ void Overlay::Impl::draw_note(const FrameInfo& f) {
 void Overlay::draw(const FrameInfo& f) {
     Impl& s = *impl_;
     if (s.want_hide.exchange(false)) set_visible(false);   // the menu asked to close during the last frame (mu is not held here)
+    if (s.want_picker_close.exchange(false) && s.picker_open.load(std::memory_order_relaxed)) toggle_picker();
+    const bool p_open = s.picker_open.load(std::memory_order_relaxed);
     const bool counter_on = s.counter_show.load(std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
     const double now_s = std::chrono::duration<double>(now.time_since_epoch()).count();
     const bool note_on = s.note_visible(now_s) && (s.counter_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
     const bool ptr_on = s.ptr_show.load(std::memory_order_relaxed) && (s.ptr_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
     const bool kb_on = s.kb_poll();
-    if (!s.visible && !counter_on && !note_on && !ptr_on && !kb_on) {
+    const bool hud_on = s.has_hud_cb.load(std::memory_order_relaxed);
+    if (!s.visible && !p_open && !counter_on && !note_on && !ptr_on && !kb_on && !hud_on) {
         s.last_frame = now;
         s.counter_was_on = false;
         return;
@@ -1712,12 +1939,12 @@ void Overlay::draw(const FrameInfo& f) {
     }
     // a screenshot leaves the counter out unless asked for; with the menu hidden there is then nothing to draw
     const bool show_counter = counter_on && (s.counter_in_shots.load(std::memory_order_relaxed) || !s.ctx.renderer->capture_pending());
-    if (!s.visible && !show_counter && !note_on && !ptr_on && !kb_on) {
+    if (!s.visible && !p_open && !show_counter && !note_on && !ptr_on && !kb_on && !hud_on) {
         s.last_frame = now;
         return;
     }
-    const bool hdr_frame = s.hdr && f.hdr_output;
-    if (s.hdr && !f.hdr_output) return;      // the display left HDR mode: the RGBA8 overlay pipeline does not match the SDR swapchain, so no overlay until the next start
+    // made for HDR: the overlay always goes through the RGBA8 target, and the composite writes it as HDR or, after a switch to SDR, as SDR
+    const bool hdr_frame = s.hdr;
     if (hdr_frame && !s.composite.ensure_target(f.extent)) return;
     std::lock_guard<std::mutex> lk(s.mu);
     ImGuiContext* prev = ImGui::GetCurrentContext();
@@ -1732,6 +1959,127 @@ void Overlay::draw(const FrameInfo& f) {
     ImGui::NewFrame();
     if (s.visible && !kb_on) s.build_ui();    // the keyboard is modal: the menu comes back once it is answered
     if (kb_on) s.draw_keyboard(now_s);
+    if (p_open && !kb_on) {
+        PickerCallbacks pcb;
+        { std::lock_guard<std::mutex> plk(s.picker_mu); pcb = s.picker_cb; }
+        const int td = s.picker_tab_delta.exchange(0, std::memory_order_relaxed);
+        if (td != 0) s.picker_tab = ((s.picker_tab + td) % 3 + 3) % 3;
+        if (s.want_picker_clear.exchange(false, std::memory_order_relaxed) && s.picker_has_pin) {
+            if (pcb.clear) pcb.clear();
+            s.picker_has_pin = false;
+            s.picker_pin_name.clear();
+            s.want_picker_close.store(true);
+        }
+        if (pcb.query && (now_s - s.picker_last_refresh_s > 0.35 || s.picker_items.empty())) {
+            s.picker_items.clear();
+            pcb.query(s.picker_items, s.picker_has_pin, s.picker_pin_name);
+            s.picker_last_refresh_s = now_s;
+        }
+        const float W = static_cast<float>(f.extent.width);
+        const float H = static_cast<float>(f.extent.height);
+        const float win_w = std::clamp(W * 0.38f, 460.f, 720.f);
+        const float win_h = std::clamp(H * 0.62f, 440.f, 760.f);
+        ImGui::SetNextWindowPos(ImVec2((W - win_w) * 0.5f, (H - win_h) * 0.5f), ImGuiCond_Appearing);
+        ImGui::SetNextWindowSize(ImVec2(win_w, win_h), ImGuiCond_Appearing);
+        // XC2 native obsidian-navy glass + launcher sky-blue (#56C8FA) accent styling
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.025f, 0.065f, 0.115f, 0.93f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.337f, 0.784f, 0.980f, 0.78f));
+        ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.045f, 0.115f, 0.190f, 0.96f));
+        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.055f, 0.155f, 0.255f, 0.98f));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.18f, 0.55f, 0.80f, 0.42f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.337f, 0.784f, 0.980f, 0.35f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.337f, 0.784f, 0.980f, 0.55f));
+        bool open_flag = true;
+        if (ImGui::Begin("3D 导航目标选择  [F4 / ZL+R3]", &open_flag, ImGuiWindowFlags_NoCollapse)) {
+            if (s.picker_has_pin) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.88f, 1.0f, 1.0f));
+                ImGui::Text("◆ 当前自定义导航：%s", s.picker_pin_name.c_str());
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+                if (ImGui::SmallButton("[X] 恢复自动追踪任务")) {
+                    if (pcb.clear) pcb.clear();
+                    s.picker_has_pin = false;
+                    s.picker_pin_name.clear();
+                    s.want_picker_close.store(true);
+                }
+                ImGui::Separator();
+            }
+            ImGui::SetNextItemWidth(-1.f);
+            ImGui::InputTextWithHint("##nav_filter", "输入关键词搜索地标 / 传送点 / NPC...", s.picker_filter, sizeof s.picker_filter);
+            auto tab_btn = [&](const char* label, int idx) {
+                const bool sel = (s.picker_tab == idx);
+                if (sel) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.62f, 0.88f, 0.85f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.337f, 0.784f, 0.980f, 0.95f));
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.08f, 0.16f, 0.24f, 0.75f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.14f, 0.28f, 0.42f, 0.85f));
+                }
+                if (ImGui::Button(label)) s.picker_tab = idx;
+                ImGui::PopStyleColor(2);
+            };
+            tab_btn("全部", 0);
+            ImGui::SameLine();
+            tab_btn("地标 / 传送点", 1);
+            ImGui::SameLine();
+            tab_btn("NPC", 2);
+            ImGui::SameLine();
+            ImGui::TextDisabled("  [L / R 切换]");
+            ImGui::Separator();
+
+            std::string flt = s.picker_filter;
+            for (char& ch : flt) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            const float footer_h = ImGui::GetFrameHeightWithSpacing() + 4.f;
+            if (ImGui::BeginChild("##nav_list", ImVec2(0, -footer_h), false)) {
+                int shown = 0;
+                for (const auto& it : s.picker_items) {
+                    if (s.picker_tab == 1 && it.group != 0) continue;
+                    if (s.picker_tab == 2 && it.group != 1) continue;
+                    if (!flt.empty()) {
+                        std::string nl = it.name;
+                        for (char& ch : nl) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        if (nl.find(flt) == std::string::npos) continue;
+                    }
+                    ++shown;
+                    ImGui::PushID(static_cast<int>(it.id & 0x7FFFFFFFu));
+                    const char* badge = (it.group == 0) ? "◆ " : "● ";
+                    const std::string row_label = std::string(badge) + it.name;
+                    if (ImGui::Selectable(row_label.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        if (pcb.select) pcb.select(it.id);
+                        s.want_picker_close.store(true);
+                    }
+                    if (!it.detail.empty()) {
+                        const float dw = ImGui::CalcTextSize(it.detail.c_str()).x;
+                        ImGui::SameLine(std::max(10.f, ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - dw - 8.f));
+                        ImGui::TextDisabled("%s", it.detail.c_str());
+                    }
+                    ImGui::PopID();
+                }
+                if (shown == 0) ImGui::TextDisabled("当前地图没有匹配的地标或 NPC");
+            }
+            ImGui::EndChild();
+            ImGui::Separator();
+            ImGui::TextDisabled("[A/Enter] 导航   [L/R] 切换分类   [X] 清除自定义   [B/Esc/ZL+R3] 关闭");
+        }
+        ImGui::End();
+        ImGui::PopStyleColor(7);
+        if (!open_flag) s.want_picker_close.store(true);
+    }
+    s.ribbon_sink.active = false;
+    s.ribbon_sink.verts.clear();
+    if (hud_on && !kb_on) {
+        std::function<void(const HudCanvas&)> cb;
+        { std::lock_guard<std::mutex> hlk(s.hud_mu); cb = s.hud_cb; }
+        if (cb) {
+            HudCanvas canvas;
+            canvas.width = f.extent.width;
+            canvas.height = f.extent.height;
+            canvas.draw_list = ImGui::GetForegroundDrawList();
+            canvas.font = ImGui::GetFont();
+            canvas.ribbon_sink = &s.ribbon_sink;
+            cb(canvas);
+        }
+    }
     if (show_counter) s.draw_counter(f, now_s);
     if (note_on) s.draw_note(f);
     if (ptr_on) {   // a plain arrow, white with a dark outline, sized with the frame height
@@ -1746,8 +2094,8 @@ void Overlay::draw(const FrameInfo& f) {
     }
     ImGui::Render();
 
-    // one dynamic-rendering pass that draws the ImGui draw data into view
-    auto render_into = [&](VkImageView view, VkAttachmentLoadOp load) {
+    // one dynamic-rendering pass that draws the 3D nav ribbon (with scene depth occlusion) and ImGui draw data into view
+    auto render_into = [&](VkImageView view, VkFormat target_fmt, VkAttachmentLoadOp load) {
         VkRenderingAttachmentInfo att = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         att.imageView = view;
         att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1760,6 +2108,16 @@ void Overlay::draw(const FrameInfo& f) {
         ri.colorAttachmentCount = 1;
         ri.pColorAttachments = &att;
         vkCmdBeginRendering(f.cmd, &ri);
+        if (s.nav_ribbon_ok && s.ribbon_sink.active && s.ribbon_sink.verts.size() >= 4) {
+            extras::NavRibbonDepth rd;
+            rd.view = f.scene_depth_view;
+            rd.layout = f.scene_depth_layout;
+            rd.flip_y = f.scene_depth_flip_y;
+            rd.depth_mode = f.scene_depth_mode;
+            s.nav_ribbon.record(f.cmd, target_fmt, f.extent, f.slot,
+                                s.ribbon_sink.verts.data(), static_cast<uint32_t>(s.ribbon_sink.verts.size()),
+                                s.ribbon_sink.params, rd);
+        }
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), f.cmd);
         vkCmdEndRendering(f.cmd);
     };
@@ -1767,10 +2125,11 @@ void Overlay::draw(const FrameInfo& f) {
         // HDR: the overlay goes into the cleared RGBA8 target, then the composite maps it onto the swapchain image (UI white = paper white)
         const extras::HdrState hs = extras::hdr_state();
         s.composite.begin_overlay(f.cmd);
-        render_into(s.composite.target_view(), VK_ATTACHMENT_LOAD_OP_CLEAR);
-        s.composite.composite(f.cmd, f.view, f.format, f.extent, s.ctx.renderer->output_kind(), hs.paper_white_nits, hs.peak_nits);
+        render_into(s.composite.target_view(), VK_FORMAT_R8G8B8A8_UNORM, VK_ATTACHMENT_LOAD_OP_CLEAR);
+        s.composite.composite(f.cmd, f.view, f.format, f.extent, f.hdr_output ? s.ctx.renderer->output_kind() : extras::OutputKind::Sdr8,
+                              hs.paper_white_nits, hs.peak_nits);
     } else {
-        render_into(f.view, VK_ATTACHMENT_LOAD_OP_LOAD);
+        render_into(f.view, f.format, VK_ATTACHMENT_LOAD_OP_LOAD);
     }
     s.drawn++;
     ImGui::SetCurrentContext(prev);
@@ -1778,6 +2137,126 @@ void Overlay::draw(const FrameInfo& f) {
 
 void Overlay::install_on_renderer() {
     impl_->ctx.renderer->set_overlay_hook([this](const FrameInfo& f) { draw(f); });
+}
+
+void Overlay::set_hud_callback(std::function<void(const HudCanvas&)> fn) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->hud_mu);
+    impl_->hud_cb = std::move(fn);
+    impl_->has_hud_cb.store(static_cast<bool>(impl_->hud_cb), std::memory_order_relaxed);
+}
+
+void Overlay::set_picker(PickerCallbacks cb) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->picker_mu);
+    impl_->picker_cb = std::move(cb);
+}
+
+void Overlay::toggle_picker() {
+    if (!impl_) return;
+    Impl& s = *impl_;
+    const bool now_open = !s.picker_open.load(std::memory_order_relaxed);
+    s.picker_open.store(now_open, std::memory_order_relaxed);
+    if (now_open) {
+        s.picker_last_refresh_s = -1e9;
+        s.picker_restore_relative = platform::has_window() && platform::relative_mouse();
+        if (s.picker_restore_relative) platform::set_relative_mouse(false);
+        if (platform::has_window()) platform::set_text_input(true);
+    } else {
+        if (platform::has_window()) platform::set_text_input(false);
+        if (s.picker_restore_relative && platform::has_window()) platform::set_relative_mouse(true);
+        s.picker_restore_relative = false;
+        std::lock_guard<std::mutex> lk(s.mu);
+        clear_imgui_input(s.imgui);
+    }
+    NXLOG_I(kTag, "nav picker %s", now_open ? "shown" : "hidden");
+}
+
+bool Overlay::picker_open() const {
+    return impl_ && impl_->picker_open.load(std::memory_order_relaxed);
+}
+
+uint64_t Overlay::create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes) {
+    if (!impl_ || !impl_->backend_ready || !impl_->ctx.device || !bc3_linear || w < 4 || h < 4) return 0;
+    const size_t expected = static_cast<size_t>((w + 3u) / 4u) * static_cast<size_t>((h + 3u) / 4u) * 16ull;
+    if (bytes < expected) return 0;
+
+    Impl& s = *impl_;
+    Device& dev = *s.ctx.device;
+    std::lock_guard<std::mutex> tlk(s.hud_tex_mu);
+
+    if (!s.hud_tex_sampler) {
+        VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = VK_FILTER_LINEAR;
+        sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 0.0f;
+        if (vkCreateSampler(dev.device(), &sci, nullptr, &s.hud_tex_sampler) != VK_SUCCESS) {
+            return 0;
+        }
+    }
+
+    gfx::ImageDesc id;
+    id.format = VK_FORMAT_BC3_UNORM_BLOCK;
+    id.width = w;
+    id.height = h;
+    id.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    id.name = "hud_bc3_atlas";
+    gfx::Image img;
+    if (dev.create_image(id, &img) != VK_SUCCESS) return 0;
+
+    gfx::Buffer staging;
+    if (dev.create_buffer(expected, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, gfx::MemoryUse::Upload, &staging, "hud_bc3_stage") != VK_SUCCESS) {
+        dev.destroy_image(img);
+        return 0;
+    }
+    if (!staging.mapped) {
+        dev.destroy_buffer(staging);
+        dev.destroy_image(img);
+        return 0;
+    }
+    std::memcpy(staging.mapped, bc3_linear, expected);
+    dev.flush_buffer(staging);
+
+    dev.submit_once([&](VkCommandBuffer cb) {
+        VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1;
+        di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cb, &di);
+
+        VkBufferImageCopy reg = {};
+        reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        reg.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cb, staging.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+
+        b.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier2(cb, &di);
+    });
+    dev.destroy_buffer(staging);
+
+    VkDescriptorSet ds = ImGui_ImplVulkan_AddTexture(s.hud_tex_sampler, img.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (!ds) {
+        dev.destroy_image(img);
+        return 0;
+    }
+    s.hud_textures.push_back({img, ds});
+    NXLOG_I(kTag, "uploaded HUD BC3 texture %ux%u (%zu KiB)", w, h, expected / 1024u);
+    return reinterpret_cast<uint64_t>(ds);
 }
 
 }  // namespace nxrt::gfx

@@ -81,10 +81,10 @@ bool spirv_gs_input_topology(const std::vector<uint32_t>& in, uint32_t vk_topolo
 // Moves the fragment output at Location 1 to Location 0, Index 1. False (out untouched) when the module has no such output.
 bool spirv_dual_source_output(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);
 
-// A fragment shader of a pass without colour attachments: every Location output becomes a private variable (the decorations go, and
-// the entry point's interface loses them before SPIR-V 1.4). False (out untouched) when no Location output exists or a built-in output
-// (FragDepth, SampleMask) does.
-bool spirv_outputs_to_private(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);
+// A fragment shader of a pass without colour attachments (keep_mask == 0), or with fewer bound colour attachments than declared:
+// every Location output whose bit is not in `keep_mask` becomes a private variable (the Location/Index/Component decorations go, and
+// the entry point's interface loses it before SPIR-V 1.4). Built-in outputs (FragDepth, SampleMask) are preserved.
+bool spirv_outputs_to_private(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, uint32_t keep_mask = 0);
 
 // spirv_add_early_fragment_tests: a fragment shader that writes a storage image gets EarlyFragmentTests, so the depth / stencil test
 // runs before it - the console's order. Without it a driver may run the shader for fragments the test rejects, and their image writes
@@ -102,6 +102,15 @@ bool spirv_init_outputs(const std::vector<uint32_t>& in, std::vector<uint32_t>& 
 bool spirv_outputs_to_uint(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);
 // Why the last call refused, or "" (diagnostic only, thread local).
 const char* spirv_outputs_to_uint_reason();
+
+// A fragment sampler binding that the shader declared as float (sampler2D) but the draw feeds with an unsigned integer
+// texture (R8_UINT / R16_UINT / R32_UINT). Rewrites those (set, binding) variables to usampler and bitcasts the sampled/fetched
+// uint bits back to the shader's float type so floatBitsToInt(...) reads the console's raw bits legally in Vulkan.
+struct SpvSamplerSlot {
+    uint32_t set = 0;
+    uint32_t binding = 0;
+};
+bool spirv_uint_samplers(const std::vector<uint32_t>& in, const std::vector<SpvSamplerSlot>& slots, std::vector<uint32_t>& out);
 
 struct SpvXfbOutput {
     uint32_t location, components, offset;   // offset in bytes inside a captured vertex

@@ -22,7 +22,9 @@ param(
     # each other. Relative paths resolve against the directory you run the script from.
     [string]$LiftDir = '',
     [string]$ObjDir = '',
-    [string]$LibDir = ''
+    [string]$LibDir = '',
+    [string]$ModsDir = '',
+    [string]$IniPath = ''
 )
 $ErrorActionPreference = 'Stop'
 $root = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'xc2'   # tools\build -> the checkout's xc2
@@ -69,6 +71,19 @@ Write-Host ("python: " + $py)
 # against the directory the caller used.
 if (-not [System.IO.Path]::IsPathRooted($Exefs)) { $Exefs = Join-Path (Get-Location).Path $Exefs }
 
+if ($ModsDir -and (Test-Path $ModsDir)) {
+    $patchedDir = Join-Path $build 'exefs-patched'
+    $patchScript = Join-Path $root '..\tools\mods\exefs_patch.py'
+    $pArgs = @($patchScript, '--exefs', $Exefs, '--mods', $ModsDir, '--out', $patchedDir)
+    if ($IniPath -and (Test-Path $IniPath)) { $pArgs += @('--ini', $IniPath) }
+    $outJson = & $py @pArgs
+    if ($LASTEXITCODE -ne 0) { throw 'M3 ExeFS code patching failed' }
+    if ((Test-Path (Join-Path $patchedDir 'm3_state.json')) -and (Test-Path (Join-Path $patchedDir 'main'))) {
+        $Exefs = $patchedDir
+        Write-Host "m3: using patched ExeFS copy at $Exefs"
+    }
+}
+
 if ($Clean) { Remove-Item -Recurse -Force (Join-Path $build 'obj'), (Join-Path $build 'bin') -ErrorAction SilentlyContinue }
 
 $mods = $Modules | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }
@@ -89,11 +104,6 @@ if (-not $SkipLift) {
             $base = $bases[$m]
             $out = Join-Path $liftDir $m
             $stampFile = Join-Path $out '.base'
-            $fresh = (Test-Path $out) -and (Get-ChildItem $out -Filter 'module_*.cpp' -ErrorAction SilentlyContinue) -and
-                     ((Get-Item (Get-ChildItem $out -Filter 'module_*.cpp' | Select-Object -First 1).FullName).LastWriteTime -gt (Get-Item $src).LastWriteTime) -and
-                     ((Test-Path $stampFile) -and ((Get-Content $stampFile -Raw).Trim() -eq $base))
-            if ($fresh) { Write-Host "lift $m : up to date (base $base)"; continue }
-            $t = [Diagnostics.Stopwatch]::StartNew()
             # Site list (entry/mid hooks compiled into the lifted code). build\sites-<module>.txt wins if it exists, so a
             # local experiment can add hooks without touching the repository; otherwise the shipped xc2\sites\ copy is
             # used. Without --sites the lifter emits no nx_hook_entry, and every hook_add_entry in xc2_boot.cpp silently
@@ -115,6 +125,13 @@ if (-not $SkipLift) {
             }
             if (-not $useSites -and (Test-Path $shipped)) { $useSites = $shipped }
             if ($useSites) { $sitesArg = @('--sites', $useSites) }
+            $firstMod = Get-ChildItem $out -Filter 'module_*.cpp' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $fresh = (Test-Path $out) -and $firstMod -and
+                     ($firstMod.LastWriteTime -gt (Get-Item $src).LastWriteTime) -and
+                     (-not $useSites -or ($firstMod.LastWriteTime -gt (Get-Item -LiteralPath $useSites).LastWriteTime)) -and
+                     ((Test-Path $stampFile) -and ((Get-Content $stampFile -Raw).Trim() -eq $base))
+            if ($fresh) { Write-Host "lift $m : up to date (base $base)"; continue }
+            $t = [Diagnostics.Stopwatch]::StartNew()
             # No frame-counter instrumentation, deliberately. The retail 3.0.1 main paces itself by real time, not
             # by a fixed 1/30 s a frame: measured 2026-11-17, at 59.1 fps with the counters effectively off (45 of the
             # 46 were dropped, the list having been scanned from the 4-module dev dump) the game ran at the right

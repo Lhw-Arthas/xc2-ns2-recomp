@@ -49,8 +49,8 @@ junction, so no script has to know about a second copy:
 | `launcher\` | the launcher sources; its built exe is what `make-package.ps1` copies |
 | `config\` | the machine-readable settings table (`keys.tsv`) and the undocumented backlog |
 | `docs\`, `licenses\`, `third_party\` | reference, licences, upstream code |
-| `work\` → `E:\XC2\dev\work` | logs, screenshots, scratch |
-| `xc2\game\` → `E:\XC2\data\exefs` | the user's own dump; `xc2\build\boot\game\*` likewise for romfs and DLC |
+| `work\` → external `work` dir (junction) | logs, screenshots, scratch |
+| `xc2\game\` → external `exefs` dir (junction) | the user's own dump; `xc2\build\boot\game\*` likewise for romfs and DLC |
 
 `python tools/ci/check_invariants.py` fails when a new top-level entry appears, so the shape above is a rule and not
 a habit. The rules that go with it:
@@ -58,7 +58,7 @@ a habit. The rules that go with it:
 1. **One entry point per intent**: `tools/build/build*.ps1`, `tools/run/play*.cmd`, `tools/build/make-package.ps1`.
    A new script is a subcommand of one of them, not a new name at the root.
 2. **Directory names carry no date and no version.** Versions go in arguments, file names or `build.json`.
-3. **One-off scripts never go in `tools\`.** They live in `E:\XC2\archive\`; `tools\` is for what the next person uses.
+3. **One-off scripts never go in `tools\`.** Keep them outside the repository (e.g. an external archive directory); `tools\` is for what the next person uses.
 4. **Data has one physical copy.** The junctions above are the only second names for it.
 5. **Build outputs stay out of the checkout**: `xc2\build\` holds `boot` (runtime cwd and shader cache), `301`,
    `census`, `release` — four directories, nothing else.
@@ -104,15 +104,28 @@ The second one also runs as a git hook (`pwsh -File tools/ci/install-git-hooks.p
 If you change a file under `third_party/fefw-recomp/`, add the change to that directory's `MODIFICATIONS.md`
 — GPL-3.0 requires a modification notice.
 
-## If you have the maintainer's local tree
+## If you have the maintainer's local tree (`docs/internal/`)
 
-This repository is developed alongside git-ignored notes: `docs/internal/` holds the working state, the
-decision log and the round-by-round history, and `work/` holds logs and scratch. If `docs/internal/` exists in
-your checkout, start with:
+This repository is developed alongside git-ignored local notes: `docs/internal/` holds the working state, the
+decision log, and round-by-round history, while `work/` holds logs and scratch.
+
+**Mandatory cross-session protocol (applies to every harness/agent, even if started mid-conversation without an onboarding prompt):**
+
+1. **At session start**: read `docs/internal/AGENTS.md` and `docs/internal/STATE.md` (and any parent workspace onboarding card reported below), then run:
 
 ```powershell
 pwsh -File tools/agent-brief.ps1
 ```
 
-That prints the current state, the decisions that are already settled, and the recent history — enough to be
-useful without reading the 85 MB of notes. `docs/internal/AGENTS.md` is the full protocol.
+   Do **not** scan all of `docs/internal/handover/` upfront — grep only inside `docs/internal/handover/` when needed. Full maintainer rules live in `docs/internal/AGENTS.md`.
+
+2. **Before finishing any code/doc task**: follow the closeout checklist in `docs/internal/AGENTS.md`:
+   - Overwrite `docs/internal/STATE.md` (current status, verified facts, next steps)
+   - Append newly settled decisions with `§` numbers to `docs/internal/DECISIONS.md`
+   - Write `docs/internal/handover/NN-<date>-<topic>.md` and update `docs/internal/handover/_index.json`
+   - Update any external onboarding card (keeping its hardlink to the maintenance copy intact if used) and run external maintenance sync if configured
+   - Run the closeout verification & commit tracked files cleanly by path:
+
+```powershell
+pwsh -File tools/agent-brief.ps1 -VerifyCloseout
+```

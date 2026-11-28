@@ -44,12 +44,10 @@ if (-not $LiftDir) {
 
 # The bundled Zig is what makes this build need no MSVC and no Windows SDK: it carries its own headers and CRT.
 if (-not $Zig) {
-    foreach ($cand in @($env:XC2_ZIG, (Join-Path $repo 'third_party\fefw-recomp\game-build\release\zig\zig.exe'), 'E:\Tools\dev\zig\zig.exe')) {
+    $zigBundled = Join-Path $repo 'third_party\fefw-recomp\game-build\release\zig\zig.exe'
+    $onPath = Get-Command zig.exe -ErrorAction SilentlyContinue
+    foreach ($cand in @($env:XC2_ZIG, $zigBundled, $(if ($onPath) { $onPath.Source } else { '' }))) {
         if ($cand -and (Test-Path $cand)) { $Zig = $cand; break }
-    }
-    if (-not $Zig) {
-        $onPath = Get-Command zig.exe -ErrorAction SilentlyContinue
-        if ($onPath) { $Zig = $onPath.Source }
     }
 }
 if (-not $Zig -or -not (Test-Path $Zig)) { throw 'no zig.exe: pass -Zig, set $env:XC2_ZIG, or put it on PATH' }
@@ -70,7 +68,7 @@ if (-not $SkipDll) {
     # libvpx (BSD-3): the host VP9/VP8 decoders. Static from a vcpkg install, which CMake finds by itself only on a
     # fresh configure - a cached build keeps its first NXRT_LIBVPX_LIB-NOTFOUND answer, and the runtime then says
     # "built without libvpx" and leaves VP9 movies out (measured 2026-11-18).
-    foreach ($vcpkg in @($env:VCPKG_ROOT, 'E:\Tools\dev\vcpkg', 'C:\vcpkg')) {
+    foreach ($vcpkg in @($env:VCPKG_ROOT, 'C:\vcpkg')) {
         if (-not $vcpkg) { continue }
         $vpx = Join-Path $vcpkg 'installed\x64-windows-static\lib\vpx.lib'
         if (Test-Path $vpx) {
@@ -82,7 +80,8 @@ if (-not $SkipDll) {
     # says "built without FFmpeg" and every 4K opening runs on the CPU - measured 2026-11-21 on the packaged DLL, which had
     # [media] hwdec on and no FFmpeg at all, so the option did nothing. The DLLs travel in the package next to xc2_boot.exe.
     $ffmpeg = ''
-    foreach ($ff in @($env:NXRT_FFMPEG_DIR, 'E:\XC2\lan\ffmpeg\ffmpeg-master-latest-win64-gpl-shared')) {
+    $wsFFmpeg = Join-Path (Split-Path -Parent $repo) 'lan\ffmpeg\ffmpeg-master-latest-win64-gpl-shared'
+    foreach ($ff in @($env:NXRT_FFMPEG_DIR, $wsFFmpeg)) {
         if ($ff -and (Test-Path (Join-Path $ff 'lib\avcodec.lib'))) { $ffmpeg = $ff; break }
     }
     if ($ffmpeg) { $cfg += '-DNXRT_FFMPEG_DIR=' + $ffmpeg.Replace('\', '/') }
@@ -241,6 +240,21 @@ $o = & $Zig c++ -target x86_64-windows-gnu -O1 -w -fno-exceptions -fno-rtti -DXC
 if ($LASTEXITCODE -ne 0) {
     ($o -split "`n") | Where-Object { $_ -match 'error|undefined' } | Select-Object -First 10 | ForEach-Object { Write-Host ('  ' + $_.Trim()) }
     throw 'the exe did not link'
+}
+# Clear HIGH_ENTROPY_VA (0x20) from DllCharacteristics: Zig/LLD leaves high-entropy ASLR enabled by default, which can
+# place bottom-up Windows host allocations inside the guest's [0x2000000000, 0x4000000000) alias window (issue #25).
+$peBytes = [System.IO.File]::ReadAllBytes($exe)
+$peOff = [BitConverter]::ToInt32($peBytes, 0x3C)
+if ($peBytes[$peOff + 24] -eq 0x0B -and $peBytes[$peOff + 25] -eq 0x02) {
+    $dcOff = $peOff + 24 + 70
+    $dc = [BitConverter]::ToUInt16($peBytes, $dcOff)
+    if ($dc -band 0x0020) {
+        $dc = $dc -band (-bnot 0x0020)
+        $dcBytes = [BitConverter]::GetBytes([uint16]$dc)
+        $peBytes[$dcOff] = $dcBytes[0]
+        $peBytes[$dcOff + 1] = $dcBytes[1]
+        [System.IO.File]::WriteAllBytes($exe, $peBytes)
+    }
 }
 Copy-Item -LiteralPath $dll -Destination $OutDir -Force
 Write-Host ("exe: {0:N1} MB + xc2_rt.dll, linked in {1:N0} s -> {2}" -f ((Get-Item $exe).Length / 1MB), $t.Elapsed.TotalSeconds, $OutDir)

@@ -107,6 +107,7 @@ bool pick_word(const std::string& k, const std::string& v, const std::vector<con
 // The words the file uses for the display extras enums, indexed by the enum value (the first word of each list is the default's).
 const std::vector<const char*> kHdrModeWords = {"off", "auto", "on", "native"};
 const std::vector<const char*> kHdrFormatWords = {"auto", "hdr10", "scrgb"};
+const std::vector<const char*> kHdrStyleWords = {"accurate", "vivid"};
 const std::vector<const char*> kUpscaleWords = {"off", "fsr1", "fsr3", "dlss", "xess", "nis", "dlaa"};
 const std::vector<const char*> kUpscaleQualityWords = {"native", "quality", "balanced", "performance", "ultra_performance", "custom"};
 const std::vector<const char*> kLatencyWords = {"off", "auto", "on", "boost"};
@@ -322,7 +323,17 @@ bool apply_fixed(Sec sec, const std::string& k, const std::string& v, Settings* 
             }
             if (k == "invert_y") return set_bool(&s->mouse.invert_y);
             if (k == "invert_x") return set_bool(&s->mouse.invert_x);
+            if (k == "camera_capture") return set_bool(&s->mouse.camera_capture);
             if (k == "menu_cursor") return set_bool(&s->mouse.menu_cursor);
+            if (k == "stick_scale") {
+                double x = 8.0;
+                if (!set_num(&x) || x < 1.0 || x > 200.0) {
+                    *msg = "stick_scale must be 1..200 (mouse counts for a full stick)";
+                    return false;
+                }
+                s->mouse.stick_scale = x;
+                return true;
+            }
             if (k == "menu_touch") return true;   // legacy key, dead since it never did anything: accepted and ignored
             if (k == key_wheel_cycles()) return set_bool(&s->mouse.wheel_cycles);
             break;
@@ -350,6 +361,10 @@ bool apply_fixed(Sec sec, const std::string& k, const std::string& v, Settings* 
         case Sec::Pad:
             if (k == "label_abxy") return set_bool(&s->pad.label_abxy);
             if (k == "deadzone") return set_real(0.0, 0.5, &s->pad.stick_deadzone);
+            if (k == "ls_center_x") return set_int(-32767, 32767, &s->pad.ls_center_x);
+            if (k == "ls_center_y") return set_int(-32767, 32767, &s->pad.ls_center_y);
+            if (k == "rs_center_x") return set_int(-32767, 32767, &s->pad.rs_center_x);
+            if (k == "rs_center_y") return set_int(-32767, 32767, &s->pad.rs_center_y);
             if (k == "right_deadzone") return set_real(0.0, 0.5, &s->pad.right_deadzone);
             if (k == "stick_max") return set_real(0.5, 1.0, &s->pad.stick_max);
             if (k == "invert_y") return set_bool(&s->pad.invert_y);
@@ -518,6 +533,14 @@ bool apply_fixed(Sec sec, const std::string& k, const std::string& v, Settings* 
             if (k == "peak_nits") return set_zero_or_real(200.0, 10000.0, &h.peak_nits);
             if (k == "paper_white_nits") return set_zero_or_real(80.0, 500.0, &h.paper_white_nits);
             if (k == "highlight_boost") return set_real(0.0, 2.0, &h.highlight_boost);
+            if (k == "ui_white_nits") return set_zero_or_real(80.0, 500.0, &h.ui_white_nits);
+            if (k == "deband") return set_bool(&h.deband);
+            if (k == "style") {
+                int i = 0;
+                if (!pick_word(k, v, kHdrStyleWords, &i, msg)) return false;
+                h.style = static_cast<extras::HdrStyle>(i);
+                return true;
+            }
             break;
         }
         case Sec::Upscale: {
@@ -898,7 +921,9 @@ std::string format_settings(const Settings& s) {
     if (s.mouse.alt_pitch_rad != s.mouse.alt_yaw_rad) kv(key_alt_pitch(), num(s.mouse.alt_pitch_rad));   // a vertical of its own, after the pair
     kv("invert_y", flag(s.mouse.invert_y));
     kv("invert_x", flag(s.mouse.invert_x));
+    kv("camera_capture", flag(s.mouse.camera_capture));
     kv("menu_cursor", flag(s.mouse.menu_cursor));
+    kv("stick_scale", num(s.mouse.stick_scale));
     kv(key_wheel_cycles(), flag(s.mouse.wheel_cycles));
 
     o += "\n[aim]\n";
@@ -913,6 +938,10 @@ std::string format_settings(const Settings& s) {
     o += "\n[pad]\n";
     kv("label_abxy", flag(s.pad.label_abxy));
     kv("deadzone", num(s.pad.stick_deadzone));
+    if (s.pad.ls_center_x != 0) kv("ls_center_x", std::to_string(s.pad.ls_center_x));
+    if (s.pad.ls_center_y != 0) kv("ls_center_y", std::to_string(s.pad.ls_center_y));
+    if (s.pad.rs_center_x != 0) kv("rs_center_x", std::to_string(s.pad.rs_center_x));
+    if (s.pad.rs_center_y != 0) kv("rs_center_y", std::to_string(s.pad.rs_center_y));
     kv("right_deadzone", num(s.pad.right_deadzone));
     kv("invert_y", flag(s.pad.invert_y));
     kv("look_sens", num(s.pad.look_sens));
@@ -973,6 +1002,9 @@ std::string format_settings(const Settings& s) {
     kv("peak_nits", num_exact(s.extras.hdr.peak_nits));
     kv("paper_white_nits", num_exact(s.extras.hdr.paper_white_nits));
     kv("highlight_boost", num_exact(s.extras.hdr.highlight_boost));
+    kv("ui_white_nits", num_exact(s.extras.hdr.ui_white_nits));
+    kv("deband", flag(s.extras.hdr.deband));
+    kv("style", kHdrStyleWords[static_cast<int>(s.extras.hdr.style)]);
 
     o += "\n[upscale]\n";
     kv("mode", kUpscaleWords[static_cast<int>(s.extras.upscale.mode)]);

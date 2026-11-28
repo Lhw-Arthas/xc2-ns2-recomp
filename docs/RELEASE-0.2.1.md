@@ -4,10 +4,10 @@ This maintenance & community-PR update integrates **PR #30** (@UrsineBear) and *
 
 ## Which file do I download?
 
-| file | what it is | do I need it? |
-|---|---|---|
-| `XC2-package-dist-0.2.1.zip` | player package: launcher, runtime, lifter and shader tools | **yes** — play from this one |
-| `xc2-launcher-0.2.1-src.zip` | launcher source code | no |
+| file | what it is | do I need it? | SHA-256 |
+|---|---|---|---|
+| `XC2-package-dist-0.2.1.zip` | player package: launcher, runtime, lifter and shader tools | **yes** — play from this one | `038a8c2da19ffbbc77d14411b22b94e182ac65f263d310d196fe195f7b235e5a` |
+| `xc2-launcher-0.2.1-src.zip` | launcher source code | no | `5f16bcbe67cd1cb2569a5d94cc09e1209ca85401884bd85840f6fdf536160fb1` |
 
 ## What's new
 
@@ -63,10 +63,10 @@ Upstream: **fefw-recomp**, **nxrecomp**, **nxnative**, AMD **FidelityFX**, NVIDI
 
 ## 我该下哪个文件？
 
-| 文件 | 是什么 | 需要吗 |
-|---|---|---|
-| `XC2-package-dist-0.2.1.zip` | 玩家包：启动器、运行时、提升工具与着色器工具 | **要** —— 直接用它玩 |
-| `xc2-launcher-0.2.1-src.zip` | 启动器源码 | 不用 |
+| 文件 | 是什么 | 需要吗 | SHA-256 |
+|---|---|---|---|
+| `XC2-package-dist-0.2.1.zip` | 玩家包：启动器、运行时、提升工具与着色器工具 | **要** —— 直接用它玩 | `038a8c2da19ffbbc77d14411b22b94e182ac65f263d310d196fe195f7b235e5a` |
+| `xc2-launcher-0.2.1-src.zip` | 启动器源码 | 不用 | `5f16bcbe67cd1cb2569a5d94cc09e1209ca85401884bd85840f6fdf536160fb1` |
 
 ## 本版变化
 

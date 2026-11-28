@@ -2,9 +2,9 @@
 #
 # A route is the input of one run, written down by the runtime (XC2_ROUTE_OUT) and replayed by it (XC2_ROUTE):
 #
-#     pwsh -File tools\run\route.ps1 -Record E:\XC2\dev\work\routes\opening.txt -Seconds 120
+#     pwsh -File tools\run\route.ps1 -Record work\routes\opening.txt -Seconds 120
 #         play; every button and stick change is written with its millisecond
-#     pwsh -File tools\run\route.ps1 -Play E:\XC2\dev\work\routes\opening.txt -Seconds 60
+#     pwsh -File tools\run\route.ps1 -Play work\routes\opening.txt -Seconds 60
 #         the same run again, from the file
 #     pwsh -File tools\run\route.ps1 -Ab opening.txt -A NXRT_NVN_PUSH_UNIFORMS=1 -B NXRT_NVN_PUSH_UNIFORMS=0
 #         both configurations on the same route, compared window by window
@@ -68,7 +68,7 @@ function Median([double[]]$v) {
     return ($s[$n / 2 - 1] + $s[$n / 2]) / 2
 }
 
-$work = 'E:\XC2\dev\work\routes'
+$work = Join-Path $root 'work\routes'
 if (-not (Test-Path $work)) { New-Item -ItemType Directory -Path $work -Force | Out-Null }
 
 if ($Record) {

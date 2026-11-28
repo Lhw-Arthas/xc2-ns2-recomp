@@ -1,8 +1,8 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+﻿# SPDX-License-Identifier: GPL-3.0-or-later
 # Check a package tree, or an install made from it, against the layout the release promises.
 #
-#   pwsh tools\build\verify-package.ps1 -Path E:\XC2-package-0.1.3
-#   pwsh tools\build\verify-package.ps1 -Path E:\XC2-test\XC2-package-dist-0.1.3 -ExpectedSpirv 12137
+#   pwsh tools\build\verify-package.ps1 -Path D:\dist\xc2-package-0.1.3
+#   pwsh tools\build\verify-package.ps1 -Path D:\dist\xc2-test\XC2-package-dist-0.1.3 -ExpectedSpirv 12137
 #
 # Exit 0 when every check passes, 1 when one fails. make-package.ps1 runs it on the tree it just wrote;
 # run it again on the folder a player ends up with, which is where debug leftovers accumulate.

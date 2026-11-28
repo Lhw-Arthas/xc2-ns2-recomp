@@ -118,6 +118,12 @@ bool early_fragment_tests_patched(const std::string& fs_hash);
 
 // All commands before, all commands after, all memory (used after passes, dispatches, copies and fills).
 void memory_barrier(VkCommandBuffer cb);
+// Vulkan-spec-legal in-pass memory barrier (graphics stages only + BY_REGION_BIT): keeps dynamic rendering pass open.
+void memory_barrier_in_pass(VkCommandBuffer cb);
+// Narrow transfer barriers for vkCmdUpdateBuffer (do_write_memory) to avoid full ALL_COMMANDS->ALL_COMMANDS stalls.
+void transfer_pre_barrier(VkCommandBuffer cb);
+void transfer_post_barrier(VkCommandBuffer cb);
+uint64_t staging_overflow_count();
 // [nvn] pass_barriers = tracked (S38): image_barrier derives its stage and access masks from the two layouts instead of all commands and
 // all memory. Set by the replay for each submission; any thread may record image barriers, so it is an atomic.
 void set_narrow_barriers(bool on);
@@ -128,6 +134,7 @@ struct BufRef {
     VkDeviceSize offset = 0;
     VkDeviceSize avail = 0;       // bytes from offset to the end of the pool buffer
     bool ok = false;
+    bool snapped = false;
 };
 // The buffer and offset of `size` bytes at a GPU address. When the address is in no pool (or size runs past the pool), ok is
 // false and the buffer is the dummy buffer (a zeroed 64 KiB buffer) so the draw can go on; this is logged once per address.
@@ -145,7 +152,7 @@ void pool_shutdown();             // destroys every imported pool still alive an
 // and mirror_begin_submit before anything else of a submission (it records the copies of the pages draws wanted; on = this submission may
 // read copies).
 bool mirror_enabled();
-enum ReadUse { kReadVertex = 0, kReadIndex = 1, kReadUniform = 2 };
+enum ReadUse { kReadVertex = 0, kReadIndex = 1, kReadUniform = 2, kReadVertexInst = 3 };
 enum WriteUse { kWriteStorage = 0, kWriteXfb = 1, kWriteImageCopy = 2, kWriteUpdate = 3, kWriteFill = 4, kWriteCopy = 5 };
 BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use);
 // The device-local copy of [gpu_address, +size) for the compute shadows (nvn_replay.cpp): its chunk and offset (buf null: no copy for it, or the
@@ -166,13 +173,15 @@ void mirror_end_submit();   // [nvn] mirror_cpu_snapshot: no submission is recor
 void mirror_destroy(PoolGpu* p);
 // [nvn] mirror_capture (nvn_gpu_pool.cpp): every GPU access to a mirrored pool goes through its copy, filled from submit-time captures
 bool mirror_capture_on();
-BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write);
+BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write, bool gfx_no_wb = false, bool is_vertex = false);
 void mirror_capture_update(VkCommandBuffer cb, uint64_t gpu_address, const void* data, uint32_t size);
 void mirror_capture_begin(Frame& f);
 std::shared_ptr<void> mirror_capture_take();          // game thread, in the submit call (null: no submit-time capture)
 void mirror_capture_set(std::shared_ptr<void> cap);   // render thread: the capture of the submission about to start
 void mirror_capture_end(VkCommandBuffer cb);
+uint64_t mirror_capture_no_chunk_escapes();           // render thread: cumulative kEscNoChunk escape counter
 void vram_log_periodic();                             // thread-safe: periodic VRAM + pool copy usage log line
+uint64_t staging_overflow_count();                    // render thread: upload overflow allocations since start
 
 // ---- compute results held in the pool copy (nvn_gpu_pool.cpp, "compute out") ----------------------------------------------------
 // A dispatch that binds the pool copy directly (nvn_replay.cpp, compute shadows) writes its result there: the range is "out" until the
@@ -247,6 +256,12 @@ bool tex_gpu_rendered(Texture* t);
 TexGpu* tex_gpu_attachment(Texture* t);
 TexGpu* tex_gpu_scaled(Texture* t, float scale);
 float render_scale();                                   // [gfx] render_scale (1 until known)
+float render_scale_live();                              // active scene-side scale (1 until known)
+float output_scale_live();                              // active output-side scale (1 until known)
+uint32_t quality_output_height_live();                  // [upscale] render_quality output height (0 if unset/console)
+// Pure helper shared by attachment_scale() and unit tests to decide the resolution scale of a target texture.
+float compute_attachment_scale(int width, int height, int target, int flags, bool compressed, int block_w, int block_h,
+                               float scene, float out, int out_min, int min_w, bool quality_set, int quality_out_h);
 float tex_scale(Texture* t);                            // the image size over the NVN size (1 for most textures)
 VkExtent3D tex_image_extent(Texture* t, uint32_t level = 0);   // the image's own size (tex_extent times tex_scale)
 // The scale a render target should have: its own when it was brought back to 1 for good, else the render scale when it qualifies.
@@ -254,6 +269,8 @@ float tex_scale_wanted(Texture* t);
 // Remakes the image at scale `to`, content blitted over (a render target made unscaled, storage use, a pass mixing scales). Going to 1 is
 // for good. No render pass open.
 bool tex_rescale(Texture* t, Frame& f, float to, const char* why);
+// Remakes an 8-bit RGBA UNORM render target as float16 (content blitted over), so it keeps HDR highlights above 1. No render pass open.
+bool tex_promote_float(Texture* t, Frame& f, const char* why);
 // Records an upload when the texture's memory was not yet uploaded or the CPU wrote it since (and the GPU did not render it).
 // Must be called with no render pass open on `f.cb`. Leaves the image in SHADER_READ_ONLY_OPTIMAL after an upload.
 void tex_ensure_current(Texture* t, Frame& f);
@@ -276,6 +293,7 @@ VkExtent3D tex_extent(Texture* t, uint32_t level = 0);
 uint32_t tex_levels(Texture* t);
 uint32_t tex_layers(Texture* t);
 bool tex_is_depth(Texture* t);
+bool tex_copy_source_ok(Texture* t);   // the image exists, holds content, is single-sampled and can be a copy source
 // Sampled image view for a binding (cached). Null when impossible (the caller binds the dummy view).
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req);
 // Single-level, single-layer (or all layers when layer_count > 1) view for use as an attachment.
@@ -353,6 +371,7 @@ int depth_mode();
 gfx::Renderer* renderer();
 FrameLimiter* limiter();
 PresentPass* present_pass();
+Ref<Texture> take_scene_depth(int* out_depth_mode);
 extras::OutputPass* output_pass();
 bool keep_aspect();
 

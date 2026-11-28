@@ -30,8 +30,8 @@ The generated C++ compiles into ~537 translation units and links into a **144.5 
 
 ## The runtime
 
-`third_party/fefw-recomp` (a fork of Goldoire's Fire Emblem runtime, see its
-[MODIFICATIONS.md](../third_party/fefw-recomp/MODIFICATIONS.md)) provides everything the console would:
+`third_party/fefw-recomp` (a self-contained vendored fork of the removed `Goldoire/fefw-recomp` Switch runtime, see its
+[MODIFICATIONS.md](../third_party/fefw-recomp/MODIFICATIONS.md) and [UPSTREAM.md](../third_party/fefw-recomp/UPSTREAM.md)) provides everything the console would:
 
 - **kernel**: SVCs, memory (the 39-bit address space with the Switch 2 128 GiB alias region), threads, handles.
 - **services**: `fsp-srv` (romfs, saves), `am`/`vi` (display), `hid` (input), `aud`/`hwopus`, `aoc`, `time`.

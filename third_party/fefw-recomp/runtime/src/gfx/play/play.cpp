@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "nxrt/audio_sink.h"
+#include "nxrt/cheats.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/game.h"
 #include "play_display.h"
@@ -70,6 +71,10 @@ namespace {
 // more without one, and Windows then calls the window "Not Responding". busy_pump runs before every SVC (svc_set_busy_hook); on the
 // thread that owns the window it pumps the events when the last pump is 100 ms old. Elsewhere it costs a thread-id compare.
 std::atomic<DWORD> g_pump_tid{0};
+// Set by an external input source that drives the pointer itself (xc2_boot's LiveInput, which turns the counts into
+// right-stick camera movement). While on, play mode neither captures nor releases the mouse and its aim path leaves
+// the deltas alone - otherwise the two would toggle the capture against each other every frame.
+std::atomic<bool> g_external_mouse{false};
 std::atomic<uint64_t> g_last_pump_ms{0};
 void keyboard_service();
 void busy_pump() {
@@ -274,7 +279,12 @@ struct G {
     std::atomic<bool> pad_cfg_label_abxy{false};
     std::atomic<float> pad_cfg_ls_dz{0.10f};
     std::atomic<float> pad_cfg_rs_dz{0.10f};
+    std::atomic<float> pad_cfg_stick_max{1.0f};
     std::atomic<float> pad_cfg_look_sens{1.0f};
+    std::atomic<float> mouse_cfg_stick_scale{8.0f};
+    std::atomic<bool> mouse_cfg_camera_capture{true};
+    std::atomic<int> pad_cfg_ls_cx{0}, pad_cfg_ls_cy{0}, pad_cfg_rs_cx{0}, pad_cfg_rs_cy{0};
+    std::atomic<float> pad_raw_ls_x{0.0f}, pad_raw_ls_y{0.0f}, pad_raw_rs_x{0.0f}, pad_raw_rs_y{0.0f};
     std::atomic<bool> pad_cfg_invert_y{false};
     std::atomic<bool> pad_cfg_rumble{true};
     std::atomic<float> pad_cfg_rumble_scale{1.0f};
@@ -343,10 +353,21 @@ void publish_live_pad_config(const PadSettings& p) {
     st.pad_cfg_label_abxy.store(p.label_abxy, std::memory_order_relaxed);
     st.pad_cfg_ls_dz.store(static_cast<float>(std::clamp(p.stick_deadzone, 0.0, 0.5)), std::memory_order_relaxed);
     st.pad_cfg_rs_dz.store(static_cast<float>(std::clamp(p.right_deadzone, 0.0, 0.5)), std::memory_order_relaxed);
+    st.pad_cfg_stick_max.store(static_cast<float>(std::clamp(p.stick_max, 0.5, 1.0)), std::memory_order_relaxed);
     st.pad_cfg_look_sens.store(static_cast<float>(std::clamp(p.look_sens, 0.25, 3.0)), std::memory_order_relaxed);
     st.pad_cfg_invert_y.store(p.invert_y, std::memory_order_relaxed);
     st.pad_cfg_rumble.store(p.rumble, std::memory_order_relaxed);
     st.pad_cfg_rumble_scale.store(static_cast<float>(std::clamp(p.rumble_scale, 0.0, 1.0)), std::memory_order_relaxed);
+    st.pad_cfg_ls_cx.store(std::clamp(p.ls_center_x, -32767, 32767), std::memory_order_relaxed);
+    st.pad_cfg_ls_cy.store(std::clamp(p.ls_center_y, -32767, 32767), std::memory_order_relaxed);
+    st.pad_cfg_rs_cx.store(std::clamp(p.rs_center_x, -32767, 32767), std::memory_order_relaxed);
+    st.pad_cfg_rs_cy.store(std::clamp(p.rs_center_y, -32767, 32767), std::memory_order_relaxed);
+}
+
+void publish_live_mouse_config(const MouseSettings& m) {
+    G& st = g();
+    st.mouse_cfg_stick_scale.store(static_cast<float>(std::clamp(m.stick_scale, 1.0, 200.0)), std::memory_order_relaxed);
+    st.mouse_cfg_camera_capture.store(m.camera_capture, std::memory_order_relaxed);
 }
 
 // The F1 render quality: the upscaler's input as a share of the output height (table in nxrt/render_quality.h).
@@ -365,7 +386,7 @@ namespace {
 Game3dSettings hydrate_game3d_from_config() {
     Game3dSettings r;
     const std::string q = config_get_str("upscale", "render_quality", "");
-    r.res_preset = kRenderQualityCount - 1;   // console default
+    r.res_preset = 0;   // native (100%) default when [upscale] render_quality is unset
     for (int i = 0; i < kRenderQualityCount; ++i)
         if (q == kRenderQuality[i].key) r.res_preset = i;
     if (q.empty() && config_get_bool("upscale", "lock_render_size", false)) {   // set by hand: the nearest quality to the ini's scales
@@ -379,7 +400,7 @@ Game3dSettings hydrate_game3d_from_config() {
         }
     }
 
-    std::string up = config_get_str("dlss", "upscaler", "fsr3");
+    std::string up = config_get_str("dlss", "upscaler", "taau");
     for (char& c : up) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (up == "auto") up = extras::temporal_dlss_started() ? "dlss" : "fsr3";
     if (up != "dlss" && up != "fsr3" && up != "taau" && up != "bilinear") up = up == "fsr" ? "fsr3" : "taau";
@@ -731,7 +752,7 @@ void handle_event(const input::Event& e, uint64_t now) {
             if (st.quit_on_close) quit_now("window closed");
             break;
         case EventType::KeyDown:
-            if (e.u.key.scancode == SDL_SCANCODE_F11 ||
+            if ((e.u.key.scancode == SDL_SCANCODE_F11 && !(e.mods & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_SHIFT))) ||
                 ((e.u.key.scancode == SDL_SCANCODE_RETURN || e.u.key.scancode == SDL_SCANCODE_KP_ENTER) && (e.mods & SDL_KMOD_ALT))) {
                 if (!(e.flags & input::kFlagRepeat)) toggle_fullscreen();
                 return;
@@ -904,6 +925,7 @@ void apply_pending_settings(uint64_t now) {
     lk.unlock();
     if (st.engine) st.engine->set_settings(s, now);
     publish_live_pad_config(s.pad);
+    publish_live_mouse_config(s.mouse);
     apply_frame_cap(s);
     display_tuning(s.display);
     nvn::set_keep_aspect(s.display.keep_aspect);
@@ -1040,7 +1062,8 @@ int update_hook(::Ctx*, uint64_t, void*) {
     if (st.window) {
         platform::set_text_input(st.overlay && st.overlay->keyboard_open());   // typed text for the on-screen keyboard only
         const bool want = st.capture_mouse && platform::focused() && !platform::minimized() && !overlay_visible && playing &&
-                          st.capture_state.load() == 0 && !hid::jc2_mouse_wants_pointer();
+                          st.capture_state.load() == 0 && !hid::jc2_mouse_wants_pointer() &&
+                          !g_external_mouse.load(std::memory_order_relaxed);
         if (want != platform::relative_mouse()) {
             platform::set_relative_mouse(want);
             if (want) input::mouse_delta_take();      // nothing that piled up before the capture
@@ -1389,6 +1412,9 @@ extras::Settings merge_env(const extras::Settings& from_file) {
     if (config_has("hdr", "peak_nits")) r.hdr.peak_nits = env.hdr.peak_nits;
     if (config_has("hdr", "paper_white_nits")) r.hdr.paper_white_nits = env.hdr.paper_white_nits;
     if (config_has("hdr", "highlight_boost")) r.hdr.highlight_boost = env.hdr.highlight_boost;
+    if (config_has("hdr", "ui_white_nits")) r.hdr.ui_white_nits = env.hdr.ui_white_nits;
+    if (config_has("hdr", "deband")) r.hdr.deband = env.hdr.deband;
+    if (config_has("hdr", "style")) r.hdr.style = env.hdr.style;
     if (config_has("upscale", "mode")) r.upscale.mode = env.upscale.mode;
     if (config_has("upscale", "sharpness")) r.upscale.sharpness = env.upscale.sharpness;
     if (config_has("upscale", "quality")) r.upscale.quality = env.upscale.quality;
@@ -1441,6 +1467,7 @@ bool load() {
     st.settings.extras = merge_env(st.settings.extras);
     st.settings.game3d = hydrate_game3d_from_config();
     publish_live_pad_config(st.settings.pad);
+    publish_live_mouse_config(st.settings.mouse);
     extras::set_settings(st.settings.extras);
     // S38 GPU paths: the file's choice becomes [nvn] pool_mirror / pass_barriers unless mpr.ini or the environment set them. The replay
     // reads both once, at its first pool and its first submission, after this.
@@ -1576,6 +1603,7 @@ bool start(const StartOptions& opt) {
     if (gp && gp->frame_update) st.hook_update = hook_add_entry(st.base + gp->frame_update, &update_hook);
     else NXLOG_W(kTag, "the game (%s) names no frame update: play mode is not pumped", game::info().id);
     if (gp && gp->install) gp->install(st.base, &g_game_host, st.settings);
+    nxrt::cheats::init_from_config(st.base);
     st.started = true;
     NXLOG_I(kTag, "play mode started (%s, overlay %s, base 0x%llx, game %s, frame hook %u)", st.window ? "window" : "no window", st.overlay ? "on" : "off",
             static_cast<unsigned long long>(st.base), game::info().id, st.hook_update);
@@ -1585,6 +1613,11 @@ bool start(const StartOptions& opt) {
 void stop() {
     G& st = g();
     if (!st.started) return;
+    if (st.overlay) {
+        st.overlay->set_hud_callback({});
+        st.overlay->set_picker({});
+    }
+    nxrt::cheats::clear();
     vpad_shutdown();      // a virtual pad from a test script does not outlive play mode
     if (const GamePlay* gp = game_play(); gp && gp->remove) gp->remove();
     kernel::set_blocked_hook(0, nullptr);
@@ -1607,13 +1640,74 @@ bool overlay_blocks_game() {
     return st.started && st.overlay && st.overlay->blocks_game();
 }
 
+void set_hud_callback(std::function<void(const gfx::HudCanvas&)> fn) {
+    G& st = g();
+    if (st.overlay) st.overlay->set_hud_callback(std::move(fn));
+}
+
+void set_picker(gfx::PickerCallbacks cb) {
+    G& st = g();
+    if (st.overlay) st.overlay->set_picker(std::move(cb));
+}
+
+void toggle_picker() {
+    G& st = g();
+    if (st.overlay) st.overlay->toggle_picker();
+}
+
+uint64_t create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes) {
+    G& st = g();
+    return st.overlay ? st.overlay->create_hud_texture_bc3(w, h, bc3_linear, bytes) : 0;
+}
+
+void set_external_mouse_capture(bool on) {
+    const bool was = g_external_mouse.exchange(on, std::memory_order_relaxed);
+    // Hand the pointer back cleanly on the way out: the caller captures it again on its own terms.
+    if (was && !on && platform::relative_mouse()) platform::set_relative_mouse(false);
+}
+
+void publish_raw_right_stick(float x, float y) {
+    G& st = g();
+    st.pad_raw_rs_x.store(x, std::memory_order_relaxed);
+    st.pad_raw_rs_y.store(y, std::memory_order_relaxed);
+}
+
+void publish_raw_left_stick(float x, float y) {
+    G& st = g();
+    st.pad_raw_ls_x.store(x, std::memory_order_relaxed);
+    st.pad_raw_ls_y.store(y, std::memory_order_relaxed);
+}
+
+bool binding_output(uint64_t now_ns, uint64_t* buttons, float* lx, float* ly, float* rx, float* ry) {
+    const G& st = g();
+    if (!st.started || !st.engine) return false;
+    const EngineOut o = st.engine->output(now_ns);
+    if (buttons) *buttons = o.buttons;
+    if (lx) *lx = o.lx;
+    if (ly) *ly = o.ly;
+    if (rx) *rx = o.rx;
+    if (ry) *ry = o.ry;
+    return true;
+}
+
 LivePadConfig live_pad_config() {
     const G& st = g();
     LivePadConfig c;
     c.label_abxy = st.pad_cfg_label_abxy.load(std::memory_order_relaxed);
     c.stick_deadzone = st.pad_cfg_ls_dz.load(std::memory_order_relaxed);
     c.right_deadzone = st.pad_cfg_rs_dz.load(std::memory_order_relaxed);
+    c.stick_max = st.pad_cfg_stick_max.load(std::memory_order_relaxed);
     c.look_sens = st.pad_cfg_look_sens.load(std::memory_order_relaxed);
+    c.mouse_stick_scale = st.mouse_cfg_stick_scale.load(std::memory_order_relaxed);
+    c.mouse_camera_capture = st.mouse_cfg_camera_capture.load(std::memory_order_relaxed);
+    c.ls_center_x = st.pad_cfg_ls_cx.load(std::memory_order_relaxed);
+    c.ls_center_y = st.pad_cfg_ls_cy.load(std::memory_order_relaxed);
+    c.raw_ls_x = st.pad_raw_ls_x.load(std::memory_order_relaxed);
+    c.raw_ls_y = st.pad_raw_ls_y.load(std::memory_order_relaxed);
+    c.rs_center_x = st.pad_cfg_rs_cx.load(std::memory_order_relaxed);
+    c.rs_center_y = st.pad_cfg_rs_cy.load(std::memory_order_relaxed);
+    c.raw_rs_x = st.pad_raw_rs_x.load(std::memory_order_relaxed);
+    c.raw_rs_y = st.pad_raw_rs_y.load(std::memory_order_relaxed);
     c.invert_y = st.pad_cfg_invert_y.load(std::memory_order_relaxed);
     c.rumble = st.pad_cfg_rumble.load(std::memory_order_relaxed);
     c.rumble_scale = st.pad_cfg_rumble_scale.load(std::memory_order_relaxed);

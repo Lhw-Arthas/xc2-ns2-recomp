@@ -91,10 +91,35 @@ struct State {
     FfxFgFrame ffx;                     // FSR 3: this frame's inputs, used at the present
     VkImage ffx_hudless = VK_NULL_HANDLE;
     uint64_t last_present_ns = 0, ffx_count0 = 0;
+    uint64_t hud_t0 = 0, hud_ffx0 = 0;
+    uint32_t hud_n_game = 0, hud_n_shown = 0;
 };
 State& st() {
     static State s;
     return s;
+}
+struct TelemetryAtomic {
+    std::atomic<bool> available{false};
+    std::atomic<bool> active{false};
+    std::atomic<double> game_fps{0.0};
+    std::atomic<double> shown_fps{0.0};
+};
+TelemetryAtomic& tel() {
+    static TelemetryAtomic t;
+    return t;
+}
+void publish_hud_state(bool available, bool active) {
+    TelemetryAtomic& t = tel();
+    t.available.store(available, std::memory_order_relaxed);
+    t.active.store(active, std::memory_order_relaxed);
+}
+void reset_fg_windows(State& s) {
+    s.t0 = 0;
+    s.ffx_count0 = 0;
+    s.n_game = s.n_shown = s.n_on = s.n_extra_inputs = s.n_extra_sr = 0;
+    s.hud_t0 = 0;
+    s.hud_ffx0 = 0;
+    s.hud_n_game = s.hud_n_shown = 0;
 }
 std::atomic<int> g_api_error{0};
 
@@ -276,6 +301,7 @@ void set_mode(State& s, bool on) {
     }
     if (on != s.on) NXLOG_I(kTag, "frame generation %s at frame %u", on ? "on" : "off", s.index);
     s.on = on;
+    publish_hud_state(s.fg, s.on);
 }
 
 void report(State& s) {
@@ -311,6 +337,17 @@ int framegen_mode() { return fg_setting(); }
 bool framegen_requested() { return fg_setting() != 0; }
 bool framegen_dlss() { return dlss_fg(); }
 bool framegen_running() { return fg_setting() == 3 ? ffx_fg_present_count() > 0 || st().fg : st().fg; }
+FramegenTelemetry framegen_telemetry() {
+    const TelemetryAtomic& a = tel();
+    FramegenTelemetry r;
+    r.mode = fg_setting();
+    r.requested = r.mode != 0;
+    r.available = a.available.load(std::memory_order_relaxed);
+    r.active = a.active.load(std::memory_order_relaxed);
+    r.game_fps = a.game_fps.load(std::memory_order_relaxed);
+    r.shown_fps = a.shown_fps.load(std::memory_order_relaxed);
+    return r;
+}
 
 void* sl_frame_token() {
     if (!temporal_dlss_started() || !base_init()) return nullptr;
@@ -465,9 +502,13 @@ void ffx_present_begin(State& s, VkCommandBuffer cb, VkExtent2D backbuffer, cons
     f.hudless = s.ffx_hudless;
     f.bb = backbuffer;
     std::copy(rect, rect + 4, f.rect);
-    if (!ffx_fg_frame(cb, f)) return;
+    if (!ffx_fg_frame(cb, f)) {
+        publish_hud_state(false, false);
+        return;
+    }
     if (f.enable != s.on) NXLOG_I(kTag, "FSR 3 frame generation %s at frame %u", f.enable ? "on" : "off", s.index);
     s.on = f.enable;
+    publish_hud_state(true, s.on);
 }
 }  // namespace
 
@@ -512,21 +553,42 @@ void framegen_present_end() {
     State& s = st();
     if (fg_setting() == 3) {
         if (!ffx_fg_wanted()) return;
-        ++s.n_game;
-        s.n_on += s.on ? 1 : 0;
         const uint64_t now = FrameLimiter::now_ns();
-        if (!s.t0) {
-            s.t0 = now;
-            s.ffx_count0 = ffx_fg_present_count();
-        } else if (now - s.t0 >= 2000000000ull) {
-            const double sec = static_cast<double>(now - s.t0) * 1e-9;
-            const uint64_t c = ffx_fg_present_count();
-            NXLOG_I(kTag, "FSR 3: %.1f game fps, %.1f shown fps (swapchain presents), generation on %u of %u frames%s", s.n_game / sec,
-                    static_cast<double>(c - s.ffx_count0) / sec, s.n_on, s.n_game,
-                    s.n_extra_inputs ? ", some frames had more than one DLSS evaluation" : "");
+        const uint64_t c = ffx_fg_present_count();
+        publish_hud_state(c > 0 || s.on, s.on);
+        if (!s.t0 || c < s.ffx_count0) {
+            // Baseline starts here (or resets cleanly if swapchain recreation restarted ffx_fg_present_count() from 0).
             s.t0 = now;
             s.ffx_count0 = c;
             s.n_game = s.n_on = s.n_extra_inputs = 0;
+        } else {
+            ++s.n_game;
+            s.n_on += s.on ? 1 : 0;
+            if (now - s.t0 >= 2000000000ull) {
+                const double sec = static_cast<double>(now - s.t0) * 1e-9;
+                NXLOG_I(kTag, "FSR 3: %.1f game fps, %.1f shown fps (swapchain presents), generation on %u of %u frames%s", s.n_game / sec,
+                        static_cast<double>(c - s.ffx_count0) / sec, s.n_on, s.n_game,
+                        s.n_extra_inputs ? ", some frames had more than one DLSS evaluation" : "");
+                s.t0 = now;
+                s.ffx_count0 = c;
+                s.n_game = s.n_on = s.n_extra_inputs = 0;
+            }
+        }
+        if (!s.hud_t0 || c < s.hud_ffx0) {
+            s.hud_t0 = now;
+            s.hud_ffx0 = c;
+            s.hud_n_game = 0;
+        } else {
+            ++s.hud_n_game;
+            if (now - s.hud_t0 >= 500000000ull) {
+                const double sec = static_cast<double>(now - s.hud_t0) * 1e-9;
+                TelemetryAtomic& t = tel();
+                t.game_fps.store(s.hud_n_game / sec, std::memory_order_relaxed);
+                t.shown_fps.store(static_cast<double>(c - s.hud_ffx0) / sec, std::memory_order_relaxed);
+                s.hud_t0 = now;
+                s.hud_ffx0 = c;
+                s.hud_n_game = 0;
+            }
         }
     } else {
         if (!temporal_dlss_started() || !base_init()) return;
@@ -538,6 +600,23 @@ void framegen_present_end() {
         if (s.f.fg_get(sl::ViewportHandle(0u), gs, nullptr) == sl::Result::eOk) {
             shown = gs.numFramesActuallyPresented;   // report measured presents, never invent a frame
             s.status = static_cast<uint32_t>(gs.status);
+        }
+        publish_hud_state(true, s.on);
+        const uint64_t now = FrameLimiter::now_ns();
+        if (!s.hud_t0) {
+            s.hud_t0 = now;
+            s.hud_n_game = s.hud_n_shown = 0;
+        } else {
+            ++s.hud_n_game;
+            s.hud_n_shown += shown;
+            if (now - s.hud_t0 >= 500000000ull) {
+                const double sec = static_cast<double>(now - s.hud_t0) * 1e-9;
+                TelemetryAtomic& t = tel();
+                t.game_fps.store(s.hud_n_game / sec, std::memory_order_relaxed);
+                t.shown_fps.store(s.hud_n_shown / sec, std::memory_order_relaxed);
+                s.hud_t0 = now;
+                s.hud_n_game = s.hud_n_shown = 0;
+            }
         }
         s.n_on += s.on ? 1 : 0;
         ++s.n_game;
@@ -575,7 +654,10 @@ void framegen_swapchain_reset() {
     }
     s.streak = 0;
     s.inputs = false;
+    s.on = false;
     s.bb = {};
+    reset_fg_windows(s);
+    publish_hud_state(tel().available.load(std::memory_order_relaxed), false);
 }
 
 void framegen_shutdown(void* gfx_device) {
@@ -588,6 +670,9 @@ void framegen_shutdown(void* gfx_device) {
     }
     for (auto& p : s.retired) s.dev->destroy_image(p.second);
     s = State();
+    publish_hud_state(false, false);
+    tel().game_fps.store(0.0, std::memory_order_relaxed);
+    tel().shown_fps.store(0.0, std::memory_order_relaxed);
 }
 
 }  // namespace nxrt::extras

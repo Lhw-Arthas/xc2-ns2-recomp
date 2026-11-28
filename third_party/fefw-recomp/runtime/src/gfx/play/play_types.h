@@ -118,6 +118,8 @@ struct MouseSettings {
     bool alt_camera = true;                        // the mouse and the right stick turn the alternate body's camera (mpr: the morph ball camera)
     bool invert_y = false;                         // false: mouse up looks up
     bool invert_x = false;
+    double stick_scale = 8.0;                      // keyboard/mouse camera: mouse counts for a fully deflected right stick (smaller turns faster)
+    bool camera_capture = true;                    // capture pointer (relative mode) for mouse camera while focused (issue #78)
     bool menu_cursor = true;                       // in menus the mouse is a pointer: cursor, hover, click, right click, wheel
     bool wheel_cycles = true;                       // the wheel cycles set A (mpr: the beams; the SetANext / SetAPrev bindings stay either way)
 };
@@ -140,6 +142,11 @@ struct PadSettings {
     uint64_t remap[kPadSrcCount] = {kPadDefault, kPadDefault, kPadDefault, kPadDefault, kPadDefault, kPadDefault, kPadDefault, kPadDefault,
                                     kPadDefault, kPadDefault, kPadDefault, kPadDefault, kPadDefault, kPadDefault, kPadDefault, kPadDefault};
     bool label_abxy = false;       // false: by position (the bottom button is the bottom prompt on every pad); true: by the printed label (Xbox A = Switch A, which answers the wrong Arts slot on a pad, issue 14)
+    // Left-stick centre measured by the F1 calibration, in raw axis units (-32767..32767). A worn stick rests off zero,
+    // and a radial dead zone cannot fix that: it removes the small signal but the axis still leans one way, which is why
+    // "push back" turns into a slow walk (issue #76). Subtracted before the dead zone, so the game sees a centred stick.
+    int ls_center_x = 0, ls_center_y = 0;
+    int rs_center_x = 0, rs_center_y = 0;   // same, right stick: a drift there creeps the camera instead
     double stick_deadzone = 0.10;  // left stick, radial, 0..0.5, applied before the game's own dead zone
     double right_deadzone = 0.10;  // right stick (looking), same rule
     double stick_max = 1.0;        // left stick, 0.5..1: the fraction of the travel that counts as full deflection (1 = off). A pad whose stick tops out below 1 reaches full speed with this lowered
@@ -163,7 +170,7 @@ struct DisplaySettings {
     bool vsync = false;            // false: no forced vsync (immediate / mailbox, VRR friendly) with the frame cap below
     // [display] fps_limit (older name fps_cap): 0 = unlimited (with vsync on: mailbox presents), -1 = auto (the display's refresh rate),
     // else the cap; with vsync on, a cap only applies when it is below the refresh rate
-    int fps_cap = 60;
+    int fps_cap = -1;
     int width = 0, height = 0;        // windowed client size: 0 = follow display (capped at 1440p), otherwise explicit
     bool keep_aspect = true;       // letterbox instead of stretching
     // ---- S10 display options (play_display.h). The first four only apply at the next start: the game builds its render targets once.
@@ -235,9 +242,9 @@ inline constexpr int kRenderQualityCount = nxrt::kRenderQualityModeCount;
 int render_output_height();   // [am] resolution's height (the output the share is of), else 1080
 
 struct Game3dSettings {
-    // Index into kRenderQuality: 0 native (DLAA) .. 4 Ultra Performance, 5 console. Saved as [upscale] render_quality; restart.
-    int res_preset = 5;
-    std::string upscaler = "fsr3";      // "dlss" | "fsr3" | "taau" | "bilinear"
+    // Index into kRenderQuality: 0 native (100% / DLAA) .. 4 Ultra Performance, 5 console. Saved as [upscale] render_quality; restart.
+    int res_preset = 0;
+    std::string upscaler = "taau";      // "dlss" | "fsr3" | "taau" | "bilinear"
     std::string fsr_version = "3.1";    // "3.1" | "4.1" | "2.3"
     double sharpness = 0.5;             // [dlss] sharpness (0.0..1.0)
     std::string dlss_preset = "default";   // [dlss] preset: "default" | "J" | "K" | "L" | "M" (live)
@@ -364,7 +371,7 @@ const char* key_alt_sens();
 //              dynamic_resolution anisotropy lod_bias bloom chromatic_aberration fast_gpu_memory fewer_gpu_waits shader_prewarm astc_quality (fast high uncompressed)
 //              monitor (auto or the display's number, 1 = the first)
 //   [hdr]      mode (off auto on) format (auto hdr10 scrgb) peak_nits (0 = auto, else 200..10000) paper_white_nits (0 = auto, else
-//              80..500) highlight_boost (0..2)
+//              80..500) highlight_boost (0..2) ui_white_nits (0 = paper white, else 80..500) deband (1/0) style (accurate vivid)
 //   [upscale]  mode (off fsr1 nis, and fsr3 dlss xess kept but not used; spatial = fsr1) sharpness (0..1) fsr_dll dlss_dll xess_dll (paths, kept verbatim)
 //              frame_generation (1/0)
 //   [latency]  mode (off auto on boost) log_timings (1/0)

@@ -139,8 +139,8 @@
   "generated_artifacts": [
     {
       "name": "shader patches",
-      "note": "The cache holds hand-built modules for a handful of shaders (fog, uv, the stencil-plane samplers, the light list). A clean build has none of them, so its picture is NOT the maintainer's picture. tools/shader/patch_ds_samplers.py regenerates one family from the player's own cache; the rest are still manual.",
-      "action": "keep this list in step with xc2/game/shader-patch/, and make each one reproducible from the player's cache"
+      "note": "Authoritative shader patch inventory and manual/open status live in tools/shader/PATCHES.md. A clean build gets no pre-patched game modules; tools/shader/patch_ds_samplers.py reproduces the stencil-plane sampler family from the player's own cache.",
+      "action": "keep tools/shader/PATCHES.md aligned with xc2/game/shader-patch/, and automate any remaining items there rather than duplicating lists here"
     },
     {
       "name": "spirv.preload.pack",

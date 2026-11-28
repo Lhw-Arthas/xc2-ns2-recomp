@@ -20,6 +20,7 @@
 #include "imgui_internal.h"
 #include "nxrt/audio_sink.h"
 #include "nxrt/extras.h"
+#include "extras/hdr_pattern.h"
 #include "extras/temporal.h"
 #include "nxrt/frame_limiter.h"
 #include "nxrt/input_source.h"
@@ -27,8 +28,10 @@
 #include "nxrt/nvn_backend.h"
 #include "nvn/nvn_mirror_cap.h"
 #include "nxrt/overlay.h"
+#include "nxrt/play.h"
 #include "nxrt/platform.h"
 #include "play_game.h"
+#include "play_hints.h"
 
 namespace nxrt::play {
 
@@ -101,7 +104,14 @@ constexpr int kFpsDetailCount = 4;
 constexpr const char* kHdrModeZh[] = {"关闭 (SDR)", "自动", "强制开启", "Switch 2 原生 HDR"};
 constexpr const char* kHdrModeEn[] = {"Off (SDR)", "Auto", "On", "Native HDR"};
 
+constexpr const char* kHdrPatternZh[] = {"关闭", "峰值亮度", "亮度阶梯", "黑位"};
+constexpr const char* kHdrPatternEn[] = {"Off", "Peak brightness", "Brightness staircase", "Black level"};
+constexpr extras::HdrPattern kHdrPatternKinds[] = {extras::HdrPattern::None, extras::HdrPattern::Peak, extras::HdrPattern::Staircase,
+                                                   extras::HdrPattern::Black};
+
 constexpr const char* kHdrFmtZh[] = {"自动", "HDR10", "scRGB"};
+constexpr const char* kHdrStyleZh[] = {"准确", "鲜艳"};
+constexpr const char* kHdrStyleEn[] = {"Accurate", "Vivid"};
 constexpr const char* kHdrFmtEn[] = {"Auto", "HDR10", "scRGB"};
 
 constexpr const char* kLatencyZh[] = {"关闭", "自动", "开启", "增强 (Boost)"};
@@ -214,7 +224,29 @@ struct Page {
 
 void mark(Page& p) { p.dirty = true; }
 const char* cstr(const char* s) { return s ? s : ""; }
-const char* act_label(Act a) { return a == Act::None ? tr("无 (禁用)", "none") : act_info(a).name; }
+const char* act_label(Act a) {
+    if (a == Act::None) return tr("无 (禁用)", "none");
+    // The game may give a readable name for a slot; act_info(a).name is the settings-file key ("btn_a") and stays that way.
+    if (const GameVocabulary* v = game_vocabulary()) {
+        for (unsigned i = 0; i < v->label_count; ++i)
+            if (v->labels[i].act == a && v->labels[i].label) return v->labels[i].label;
+    }
+    return act_info(a).name;
+}
+
+// "Mouse3" and "WheelUp" read badly next to key names in the generated reference card.
+std::string pretty_input(const InputId& id) {
+    if (id.kind == InKind::Mouse) {
+        switch (id.code) {
+            case 1: return tr("鼠标左键", "Mouse left");
+            case 2: return tr("鼠标中键", "Mouse middle");
+            case 3: return tr("鼠标右键", "Mouse right");
+            default: return tr("鼠标侧键", "Mouse side");
+        }
+    }
+    if (id.kind == InKind::Wheel) return id.code > 0 ? tr("滚轮上", "Wheel up") : tr("滚轮下", "Wheel down");
+    return input_name(id);
+}
 float px(float v) { return v * ImGui::GetFontSize() / 18.0f; }
 
 void stop_rebind(UiHost& host, Page& p) {
@@ -258,6 +290,7 @@ void sanitize(Settings& s) {
     h.peak_nits = h.peak_nits <= 0 ? 0 : std::clamp(h.peak_nits, 200.0, 10000.0);
     h.paper_white_nits = h.paper_white_nits <= 0 ? 0 : std::clamp(h.paper_white_nits, 80.0, 500.0);
     h.highlight_boost = std::clamp(h.highlight_boost, 0.0, 2.0);
+    h.ui_white_nits = h.ui_white_nits <= 0 ? 0 : std::clamp(h.ui_white_nits, 80.0, 500.0);
     s.extras.upscale.sharpness = std::clamp(s.extras.upscale.sharpness, 0.0, 1.0);
     s.extras.picture = extras::picture_clamped(s.extras.picture);
     s.audio.volume = std::clamp(s.audio.volume, 0.0, 1.0);
@@ -327,18 +360,34 @@ void poll_capture(UiHost& host, Page& p) {
                 host.begin_capture();
                 return;
             }
-            p.edit.bindings[static_cast<std::size_t>(p.rebind)].in = id;
+            const std::size_t row = static_cast<std::size_t>(p.rebind);
+            const Ctx ctx = p.edit.bindings[row].ctx;
+            p.edit.bindings[row].in = id;
             mark(p);
-            const std::vector<int> other = conflicts_of(p, p.rebind);
-            if (other.empty()) {
+            // One input drives one action: whatever else was on this input is unbound rather than left to fight it.
+            std::string unbound;
+            for (int i = static_cast<int>(p.edit.bindings.size()) - 1; i >= 0; --i) {
+                if (i == p.rebind) continue;
+                const Binding& o = p.edit.bindings[static_cast<std::size_t>(i)];
+                if (!(o.in == id) || o.ctx != ctx) continue;
+                if (!unbound.empty()) unbound += " / ";
+                unbound += act_label(o.act);
+                p.edit.bindings.erase(p.edit.bindings.begin() + i);
+            }
+            if (unbound.empty()) {
                 set_notice(p, std::string(tr("已绑定 ", "Bound ")) + name, false);
             } else {
-                const Binding& o = p.edit.bindings[static_cast<std::size_t>(other[0])];
-                set_notice(p, name + tr(" 与以下操作冲突：", " conflicts with: ") + act_label(o.act), true);
+                set_notice(p, std::string(tr("已绑定 ", "Bound ")) + name + tr("，并解绑了 ", "; unbound ") + unbound, false);
             }
         }
         p.rebind = -1;
     } else if ((p.rebind >= 0 || p.fps_capture) && !host.capturing()) {
+        // A row added for "bind another key" carries no input yet: drop it when the capture is cancelled.
+        if (p.rebind >= 0) {
+            p.edit.bindings.erase(std::remove_if(p.edit.bindings.begin(), p.edit.bindings.end(),
+                                                 [](const Binding& b) { return b.in.kind == InKind::None; }),
+                                  p.edit.bindings.end());
+        }
         p.rebind = -1;
         p.fps_capture = false;
         set_notice(p, tr("已取消按键捕获", "Capture cancelled"), false);
@@ -393,9 +442,55 @@ struct PaneState {
     float bottom_reserve = 0.0f;
     bool held = false;
     bool focus_first = false;
+    bool focus_last = false;
+    bool focus_header = false;
+    bool focus_footer = false;
+    bool rows_focused = false;
+    bool header_focused = false;
+    bool footer_focused = false;
+    ImGuiID rows_step_owner = 0;
+    ImGuiID first_card_id = 0;
+    ImGuiID last_card_id = 0;
+    ImGuiID prev_first_card_id = 0;
+    ImGuiID prev_last_card_id = 0;
+    ImGuiID header_focus_id = 0;
+    ImGuiID footer_focus_id = 0;
 };
 
 PaneState g_pane;
+
+constexpr ImGuiKey kCardStepKeys[] = {
+    ImGuiKey_LeftArrow, ImGuiKey_RightArrow,
+    ImGuiKey_GamepadDpadLeft, ImGuiKey_GamepadDpadRight,
+    ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadLStickRight,
+};
+
+bool any_dir_pressed(bool up) {
+    return up ? (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false) ||
+                 ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp, false) ||
+                 ImGui::IsKeyPressed(ImGuiKey_GamepadLStickUp, false))
+              : (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false) ||
+                 ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown, false) ||
+                 ImGui::IsKeyPressed(ImGuiKey_GamepadLStickDown, false));
+}
+
+void focus_widget(ImGuiID id, ImGuiWindow* win) {
+    if (!id || !win) return;
+    ImGui::FocusWindow(win);
+    ImGui::SetFocusID(id, win);
+    if (ImGuiContext* ctx = ImGui::GetCurrentContext()) {
+        ctx->NavCursorVisible = true;
+        ctx->NavInitRequest = false;
+        ctx->NavInitResult.ID = 0;
+    }
+}
+
+void lock_rows_step_keys(ImGuiID owner_id) {
+    if (owner_id == 0) return;
+    for (ImGuiKey k : kCardStepKeys) {
+        ImGui::SetKeyOwner(k, owner_id, ImGuiInputFlags_LockThisFrame);
+    }
+}
 
 void record_desc(const char* title, const char* body, bool restart, bool live, bool hov, bool foc) {
     DescInfo d;
@@ -414,14 +509,30 @@ void pane_begin(const char* id, float bottom_reserve) {
     g_pane.hover.valid = false;
     g_pane.focus.valid = false;
     g_pane.first.valid = false;
+    g_pane.rows_focused = false;
+    g_pane.prev_first_card_id = g_pane.first_card_id;
+    g_pane.prev_last_card_id = g_pane.last_card_id;
+    g_pane.first_card_id = 0;
+    g_pane.last_card_id = 0;
     ImVec2 avail = ImGui::GetContentRegionAvail();
     avail.y = std::max(px(120.0f), avail.y - bottom_reserve);
     ImGui::PushID(id);
-    ImGui::BeginChild("##rows_pane", ImVec2(avail.x * 0.59f, avail.y), ImGuiChildFlags_NavFlattened);
+    g_pane.rows_step_owner = ImGui::GetID("##rows_step_owner");
+    // Isolate ##rows_pane as its own nav child window with a fixed scrollbar width so D-pad Up/Down/Left/Right
+    // stays inside the option cards and frame-0 scrollbar spawn never invalidates NavRectRel (#50).
+    ImGui::BeginChild("##rows_pane", ImVec2(avail.x * 0.59f, avail.y), 0, ImGuiWindowFlags_AlwaysVerticalScrollbar);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, px(7.0f)));
 }
 
 void pane_end(const LiveStatus& live) {
+    if (g_pane.focus_last && g_pane.last_card_id) {
+        focus_widget(g_pane.last_card_id, ImGui::GetCurrentWindow());
+        ImGui::SetScrollHereY(1.0f);
+        g_pane.focus_last = false;
+        g_pane.rows_focused = true;
+    } else if (g_pane.focus_last) {
+        g_pane.focus_last = false;
+    }
     ImGui::PopStyleVar();
     ImGui::EndChild();
 
@@ -555,15 +666,20 @@ int draw_card_raw(const char* id, const char* label, const char* value, const ch
     const ImVec2 p = ImGui::GetCursorScreenPos();
 
     ImGui::PushID(id);
-    const bool clicked = ImGui::InvisibleButton("##card", ImVec2(w, h));
+    const bool clicked = ImGui::InvisibleButton("##card", ImVec2(w, h), ImGuiButtonFlags_EnableNav);
     const ImGuiID item_id = ImGui::GetItemID();
     const bool hov = ImGui::IsItemHovered();
     bool foc = ImGui::IsItemFocused();
     ImGui::PopID();
 
+    if (!disabled) {
+        if (!g_pane.first_card_id) g_pane.first_card_id = item_id;
+        g_pane.last_card_id = item_id;
+    }
+
     if (g_pane.focus_first && !disabled) {
-        ImGui::SetFocusID(item_id, ImGui::GetCurrentWindow());
-        if (ImGuiContext* ctx = ImGui::GetCurrentContext()) ctx->NavCursorVisible = true;
+        focus_widget(item_id, ImGui::GetCurrentWindow());
+        ImGui::SetScrollHereY(0.0f);
         g_pane.focus_first = false;
         foc = true;
     } else if (clicked && !disabled) {
@@ -573,18 +689,33 @@ int draw_card_raw(const char* id, const char* label, const char* value, const ch
 
     int step = (clicked && !disabled) ? 2 : 0;
     g_pane.held = false;
-    if (foc && !disabled) {
-        static const ImGuiKey kStepKeys[] = {ImGuiKey_LeftArrow, ImGuiKey_RightArrow, ImGuiKey_GamepadDpadLeft, ImGuiKey_GamepadDpadRight};
-        for (ImGuiKey k : kStepKeys) {
-            ImGui::SetKeyOwner(k, item_id, ImGuiInputFlags_LockThisFrame);
-            if (ImGui::GetKeyData(k)->DownDuration > 0.7f) g_pane.held = true;
+    if (foc) {
+        g_pane.rows_focused = true;
+        const ImGuiID owner_id = g_pane.rows_step_owner ? g_pane.rows_step_owner : item_id;
+        lock_rows_step_keys(owner_id);
+        if (!disabled) {
+            for (ImGuiKey k : kCardStepKeys) {
+                if (ImGui::GetKeyData(k)->DownDuration > 0.7f) g_pane.held = true;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, ImGuiInputFlags_Repeat, owner_id) ||
+                ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, ImGuiInputFlags_Repeat, owner_id) ||
+                ImGui::IsKeyPressed(ImGuiKey_GamepadLStickLeft, ImGuiInputFlags_Repeat, owner_id))
+                step = -1;
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, ImGuiInputFlags_Repeat, owner_id) ||
+                ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, ImGuiInputFlags_Repeat, owner_id) ||
+                ImGui::IsKeyPressed(ImGuiKey_GamepadLStickRight, ImGuiInputFlags_Repeat, owner_id))
+                step = 1;
+            if (step == -1 || step == 1) ImGui::NavMoveRequestCancel();
         }
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, ImGuiInputFlags_Repeat, item_id) ||
-            ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, ImGuiInputFlags_Repeat, item_id))
-            step = -1;
-        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, ImGuiInputFlags_Repeat, item_id) ||
-            ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, ImGuiInputFlags_Repeat, item_id))
-            step = 1;
+        if (step == 0 && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup)) {
+            if (item_id == g_pane.prev_first_card_id && any_dir_pressed(true)) {
+                g_pane.focus_header = true;
+                ImGui::NavMoveRequestCancel();
+            } else if (item_id == g_pane.prev_last_card_id && any_dir_pressed(false)) {
+                g_pane.focus_footer = true;
+                ImGui::NavMoveRequestCancel();
+            }
+        }
     }
 
     record_desc(label, desc, restart, live, hov, foc);
@@ -705,9 +836,10 @@ bool card_choice_vec(const char* id, const char* lzh, const char* len, const cha
 
 bool card_slider_f(const char* id, const char* lzh, const char* len, const char* dzh, const char* den,
                    double* val, double lo, double hi, double step, const char* fmt,
-                   bool restart = false, bool live = false) {
-    char buf[64];
+                   bool restart = false, bool live = false, const char* tag = nullptr) {
+    char buf[128];
     std::snprintf(buf, sizeof buf, fmt, *val);
+    if (tag && *tag) std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), "  (%s)", tag);
     const float prog = (hi > lo) ? static_cast<float>((*val - lo) / (hi - lo)) : 0.0f;
     const int s = draw_card_raw(id, tr(lzh, len), buf, tr(dzh, den), true, restart, live, false, false, prog);
     if (s == -1 || s == 1 || s == 2) {
@@ -726,10 +858,12 @@ bool card_slider_f(const char* id, const char* lzh, const char* len, const char*
 
 bool card_slider_i(const char* id, const char* lzh, const char* len, const char* dzh, const char* den,
                    int* val, int lo, int hi, int step, const char* fmt,
-                   bool restart = false, bool live = false, const char* special_zero = nullptr, int min_nonzero = 0) {
-    char buf[64];
+                   bool restart = false, bool live = false, const char* special_zero = nullptr, int min_nonzero = 0,
+                   const char* tag = nullptr) {
+    char buf[128];
     if (special_zero && *val <= 0) std::snprintf(buf, sizeof buf, "%s", special_zero);
     else std::snprintf(buf, sizeof buf, fmt, *val);
+    if (tag && *tag) std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), "  (%s)", tag);
     const float prog = (hi > lo) ? static_cast<float>(std::max(0, *val - lo)) / static_cast<float>(hi - lo) : 0.0f;
     const int s = draw_card_raw(id, tr(lzh, len), buf, tr(dzh, den), true, restart, live, false, false, prog);
     if (s == -1 || s == 1 || s == 2) {
@@ -748,6 +882,11 @@ bool card_slider_i(const char* id, const char* lzh, const char* len, const char*
     }
     return false;
 }
+
+const char* hint_tag(const SliderHint& h) { return tr(h.tag_zh, h.tag_en); }
+
+int g_hdr_pattern = 0;   // the HDR test pattern chosen on the Graphics page, an index into kHdrPatternKinds (not saved)
+extras::HdrPattern chosen_pattern() { return kHdrPatternKinds[std::clamp(g_hdr_pattern, 0, 3)]; }
 
 bool card_button(const char* id, const char* lzh, const char* len, const char* dzh, const char* den,
                  const char* right_text = "", bool disabled = false) {
@@ -990,37 +1129,46 @@ void tab_graphics(const LiveStatus& live, Page& p, float bottom_h) {
     }
     if (card_button("pic_vivid", "鲜艳通透预设", "Preset: Vivid",
                     "适度提升通透度：对比度 1.10、饱和度 1.15、黑位 -0.03，可有效消除画面灰蒙感，实时生效。",
-                    "Modest boost: contrast 1.10, saturation 1.15, black level -0.03. Live preview.")) {
+                    "Modest boost: contrast 1.10, saturation 1.15, black level -0.03. Live preview.",
+                    pic.vivid() ? tr("当前", "Active") : "")) {
         if (extras::picture_preset("vivid", &pic)) {
             extras::set_picture_live(pic);
             mark(p);
         }
     }
+    const SliderHint h_pic_con = hint_contrast(pic.contrast);
     if (card_slider_f("pic_con", "对比度", "Contrast",
-                      "拉大明暗反差。1.00 为游戏原版默认值，修改时画面实时变化。",
-                      "Spreads tones from mid-grey; 1.00 is untouched. Applies live.",
-                      &pic.contrast, 0.50, 1.50, 0.02, "%.2f", false, true)) {
+                      "拉大明暗反差。1.00 为游戏原版默认值，修改时画面实时变化。\n\n调高直到画面不再发平；如果阴影变成死黑，就调低。",
+                      "Spreads tones from mid-grey; 1.00 is untouched. Applies live.\n\n"
+                      "Raise it until the picture stops looking flat. Lower it if shadows turn solid black.",
+                      &pic.contrast, 0.50, 1.50, 0.02, "%.2f", false, true, hint_tag(h_pic_con))) {
         extras::set_picture_live(pic);
         mark(p);
     }
+    const SliderHint h_pic_sat = hint_saturation(pic.saturation);
     if (card_slider_f("pic_sat", "饱和度", "Saturation",
-                      "调整画面色彩鲜艳程度。0.00 为黑白，1.00 为原版，推荐 1.00~1.20。",
-                      "Colour intensity; 1.00 is untouched. Applies live.",
-                      &pic.saturation, 0.00, 2.00, 0.05, "%.2f", false, true)) {
+                      "调整画面色彩鲜艳程度。0.00 为黑白，1.00 为原版，推荐 1.00~1.20。\n\n调高直到颜色显得鲜活；如果皮肤或草地开始不自然，就调低。",
+                      "Colour intensity; 1.00 is untouched. Applies live.\n\n"
+                      "Raise it until colours look lively. Lower it if skin or grass starts to look unnatural.",
+                      &pic.saturation, 0.00, 2.00, 0.05, "%.2f", false, true, hint_tag(h_pic_sat))) {
         extras::set_picture_live(pic);
         mark(p);
     }
+    const SliderHint h_pic_blk = hint_black(pic.black);
     if (card_slider_f("pic_blk", "黑位调整", "Black level",
-                      "设为负值（如 -0.03）可压暗发灰的暗部，让夜景和阴影更通透；0.00 为原版。",
-                      "Negative pulls hazy shadows toward pure black; 0.00 is untouched.",
-                      &pic.black, -0.25, 0.25, 0.01, "%+.2f", false, true)) {
+                      "设为负值（如 -0.03）可压暗发灰的暗部，让夜景和阴影更通透；0.00 为原版。\n\n把 HDR 测试图设为「黑位」，然后调整此项，直到最暗的方块刚好勉强可见。",
+                      "Negative pulls hazy shadows toward pure black; 0.00 is untouched.\n\n"
+                      "Set HDR test pattern to Black level, then adjust this until the darkest squares are only just visible.",
+                      &pic.black, -0.25, 0.25, 0.01, "%+.2f", false, true, hint_tag(h_pic_blk))) {
         extras::set_picture_live(pic);
         mark(p);
     }
+    const SliderHint h_pic_gam = hint_gamma(pic.gamma);
     if (card_slider_f("pic_gam", "伽马亮度", "Gamma",
-                      "调整中间调亮度：大于 1.00 画面更亮，小于 1.00 更暗，不影响纯黑和纯白。",
-                      "Mid-tone brightness; 1.00 is untouched.",
-                      &pic.gamma, 0.50, 2.00, 0.05, "%.2f", false, true)) {
+                      "调整中间调亮度：大于 1.00 画面更亮，小于 1.00 更暗，不影响纯黑和纯白。\n\n如果人脸和场景太暗就调高，显得发白就调低。",
+                      "Mid-tone brightness; 1.00 is untouched.\n\n"
+                      "Raise it if faces and scenery look too dark. Lower it if they look washed out.",
+                      &pic.gamma, 0.50, 2.00, 0.05, "%.2f", false, true, hint_tag(h_pic_gam))) {
         extras::set_picture_live(pic);
         mark(p);
     }
@@ -1094,44 +1242,87 @@ void tab_graphics(const LiveStatus& live, Page& p, float bottom_h) {
     }
 
     card_group("HDR 高动态范围输出", "HDR Output");
+    // Native uses the HDR levels a game declares (nn::vi / NVN window metadata); offered only when the running game declares them
+    const extras::HdrState hst = extras::hdr_state();
+    const bool game_levels = hst.game_standard_nits >= 80.0f || hst.game_max_cll > 0.0f;
+    // started in HDR: mode and format switch live; started with HDR off: turning it on needs a restart
+    const bool hdr_live = hst.scene_hdr;
     int hmode = static_cast<int>(hdr.mode);
     if (card_choice("hdr_mode", "HDR 模式", "HDR mode",
-                    "开启需显示器及 Windows 系统均开启 HDR。「Switch 2 原生 HDR」使用游戏原版 HDR 色调映射参数。",
-                    "Requires an HDR display with Windows HDR enabled.",
-                    &hmode, kHdrModeZh, kHdrModeEn, 4, true)) {
+                    "需要显示器和 Windows 都开启 HDR。游戏以 HDR 启动时可随时切换；以「关闭」启动时，开启 HDR 需要重启游戏。\n\n选「自动」，Windows 开启 HDR 时就会使用 HDR。",
+                    "Needs an HDR display with Windows HDR turned on. Switches right away when the game started with HDR; if it started with HDR off, "
+                    "turning HDR on needs a restart.\n\nChoose Auto to use HDR whenever Windows has HDR on.",
+                    &hmode, kHdrModeZh, kHdrModeEn, game_levels || hmode == 3 ? 4 : 3, !hdr_live, hdr_live)) {
         hdr.mode = static_cast<extras::HdrMode>(hmode);
+        mark(p);
+    }
+    int hstyle = static_cast<int>(hdr.style);
+    if (card_choice("hdr_style", "HDR 风格", "HDR style",
+                    "「准确」保留游戏原本的画面，只加上游戏里真实存在的高光亮度。「鲜艳」把画面拉伸得更亮、更有冲击力。\n\n想看到美术设计的原貌就选「准确」；想要更亮的画面就选「鲜艳」，再用「HDR 高光增强」调整。",
+                    "Accurate keeps the game's own picture and adds only the brightness its highlights really have. Vivid stretches the picture for a brighter, punchier look.\n\n"
+                    "Choose Accurate to see the game as its artists made it. Choose Vivid for a brighter look, then adjust it with HDR highlight boost.",
+                    &hstyle, kHdrStyleZh, kHdrStyleEn, 2, false, true)) {
+        hdr.style = static_cast<extras::HdrStyle>(hstyle);
         mark(p);
     }
     int hfmt = static_cast<int>(hdr.format);
     if (card_choice("hdr_fmt", "HDR 信号格式", "HDR format",
-                    "发送给显示器的信号格式：HDR10 或 scRGB，自动会优先选用显示器原生支持的 HDR10。",
-                    "Signal format sent to display (HDR10 or scRGB).",
-                    &hfmt, kHdrFmtZh, kHdrFmtEn, 3, true)) {
+                    "发送给显示器的信号格式：HDR10 或 scRGB，自动会优先选用显示器原生支持的 HDR10。\n\n保持「自动」。只有显示器或录制软件需要 scRGB 时才修改。",
+                    "Signal format sent to display (HDR10 or scRGB).\n\n"
+                    "Leave this on Auto. Only change it if your display or recording software needs scRGB.",
+                    &hfmt, kHdrFmtZh, kHdrFmtEn, 3, !hdr_live, hdr_live)) {
         hdr.format = static_cast<extras::HdrFormat>(hfmt);
         mark(p);
     }
     int peak = static_cast<int>(std::lround(hdr.peak_nits));
+    const SliderHint h_peak = hint_peak(peak);
     if (card_slider_i("hdr_peak", "HDR 峰值亮度", "HDR peak brightness",
-                      "高光能达到的最大亮度（尼特），设为自动则直接读取显示器上报的峰值亮度。",
-                      "Maximum highlight brightness in nits (Auto reads display capability).",
-                      &peak, 0, 2000, 50, "%d nits", false, false, tr("自动", "Auto"), 200)) {
+                      "高光能达到的最大亮度（尼特），设为自动则直接读取显示器上报的峰值亮度。\n\n把 HDR 测试图设为「峰值亮度」，然后调高此项，直到小方块消失。拿不准时，使用显示器规格中的最高亮度。",
+                      "Maximum highlight brightness in nits (Auto reads display capability).\n\n"
+                      "Set HDR test pattern to Peak brightness, then raise this until the small squares disappear. If you can't tell, use the maximum brightness from your display's specs.",
+                      &peak, 0, 2000, 50, "%d nits", false, false, tr("自动", "Auto"), 200, hint_tag(h_peak))) {
         hdr.peak_nits = peak;
         mark(p);
     }
     int paper = static_cast<int>(std::lround(hdr.paper_white_nits));
+    const SliderHint h_paper = hint_paper_white(paper);
     if (card_slider_i("hdr_paper", "HDR 纸白亮度", "HDR paper white",
-                      "普通白色与 UI 的亮度（尼特），自动会跟随 Windows SDR 内容亮度设置。",
-                      "Standard white & UI luminance in nits.",
-                      &paper, 0, 500, 10, "%d nits", false, false, tr("自动", "Auto"), 80)) {
+                      "普通白色的亮度（尼特），自动会跟随 Windows SDR 内容亮度设置。「HDR 界面亮度」为自动时，界面也使用此亮度。\n\n调整此项，直到云和雪等白色的东西明亮干净，看起来又不累眼。",
+                      "Standard white luminance in nits. The UI uses it too while HDR UI brightness is on Auto.\n\n"
+                      "Adjust this until white things like clouds and snow look bright and clean, but comfortable to look at.",
+                      &paper, 0, 500, 10, "%d nits", false, false, tr("自动", "Auto"), 80, hint_tag(h_paper))) {
         hdr.paper_white_nits = paper;
         mark(p);
     }
-    if (card_slider_f("hdr_boost", "HDR 高光增强", "HDR highlight boost",
-                      "控制高光向峰值亮度扩展的幅度，0.00 接近 SDR，1.00 标准 HDR。",
-                      "Expands highlights toward peak brightness.",
-                      &hdr.highlight_boost, 0.0, 2.0, 0.10, "%.2f")) {
+    const SliderHint h_boost = hint_boost(hdr.highlight_boost);
+    if (hdr.style == extras::HdrStyle::Vivid && card_slider_f("hdr_boost", "HDR 高光增强", "HDR highlight boost",
+                      "控制高光向峰值亮度扩展的幅度，0.00 接近 SDR，1.00 标准 HDR。\n\n调高直到太阳和反光闪耀；如果明亮的天空变成一片白，就调低。",
+                      "Expands highlights toward peak brightness.\n\n"
+                      "Raise it until the sun and reflections sparkle. Lower it if bright skies turn into plain white.",
+                      &hdr.highlight_boost, 0.0, 2.0, 0.10, "%.2f", false, true, hint_tag(h_boost))) {
         mark(p);
     }
+    int ui_white = static_cast<int>(std::lround(hdr.ui_white_nits));
+    const SliderHint h_ui = hint_ui_white(ui_white, hdr.paper_white_nits);
+    if (card_slider_i("hdr_ui", "HDR 界面亮度", "HDR UI brightness",
+                      "游戏菜单、HUD 与字幕的亮度（尼特），与画面其余部分分开调整。「自动」与纸白相同。\n\n调整此项，直到菜单和字幕清晰易读又不刺眼。",
+                      "Brightness of the game's menus, HUD and subtitles in nits, separate from the rest of the picture. Auto matches paper white.\n\n"
+                      "Adjust this until menus and subtitles are easy to read without glaring.",
+                      &ui_white, 0, 500, 10, "%d nits", false, false, tr("自动", "Auto"), 80, hint_tag(h_ui))) {
+        hdr.ui_white_nits = ui_white;
+        mark(p);
+    }
+    if (card_toggle("hdr_deband", "HDR 去色带", "HDR debanding",
+                    "用细微的噪点消除 HDR 拉伸后天空、雾气和光晕中出现的色带。\n\n保持开启。只有在画面中看到颗粒感时才关闭。",
+                    "Hides the colour banding HDR can show in skies, fog and glows, using a very fine noise.\n\n"
+                    "Leave this on. Turn it off only if you notice grain in the picture.", &hdr.deband, false, true)) {
+        mark(p);
+    }
+    card_choice("hdr_pattern", "HDR 测试图", "HDR test pattern",
+                "选择一张测试图，然后：\n- 峰值亮度：调高「HDR 峰值亮度」，直到小方块消失。\n- 亮度阶梯：把「HDR 峰值亮度」设为最后一格仍比左边更亮的那一格的亮度（从左到右 300 至 1000 尼特）。\n- 黑位：调整「黑位」，直到最暗的方块刚好勉强可见。",
+                "Pick a test pattern, then:\n- Peak brightness: raise HDR peak brightness until the small squares disappear.\n- Brightness staircase: set HDR peak brightness to the last bar that is still brighter than the one to its left (bars go 300 to 1000 nits, left to right).\n- Black level: adjust Black level until the darkest squares are only just visible.",
+                &g_hdr_pattern, kHdrPatternZh, kHdrPatternEn, 4, false, true);
+    if (chosen_pattern() != extras::HdrPattern::None) extras::set_hdr_pattern(chosen_pattern(), static_cast<float>(hdr.peak_nits));
 
     // ---- Experimental: options of this PC version, not of the game, each with what it costs ----
     card_group("实验性功能", "Experimental");
@@ -1231,14 +1422,74 @@ void tab_controls(UiHost& host, const LiveStatus& live, Page& p, float bottom_h)
                       "Filters minor left-stick drift near centre.", &pad.stick_deadzone, 0.0, 0.50, 0.02, "%.2f", false, true)) {
         mark(p);
     }
+    if (card_slider_f("ls_max", "左摇杆满推量程", "Left stick outer range",
+                      "达到满速奔跑所需的推杆幅度（0.50 ~ 1.00，实时生效）。如果摇杆推到底只报 0.90 导致人物只能慢走，调低此项即可。",
+                      "Stick travel that counts as full deflection (0.50 - 1.00, live). Lower this if full tilt only reaches ~0.9 and makes the character walk.",
+                      &pad.stick_max, 0.50, 1.00, 0.02, "%.2f", false, true)) {
+        mark(p);
+    }
     if (card_slider_f("rs_dz", "右摇杆死区", "Right stick dead zone",
                       "过滤右摇杆（旋转视角）中心轻微漂移。",
                       "Filters minor right-stick drift near centre.", &pad.right_deadzone, 0.0, 0.50, 0.02, "%.2f", false, true)) {
         mark(p);
     }
+    {   // Stick calibration (issue #76): a stick that rests off zero cannot be fixed by a dead zone - the dead zone
+        // removes the small signal, but the axis still leans, so one direction walks slowly (left) or the camera
+        // creeps (right). The measured rest position is subtracted from the raw axis before the dead zone.
+        const nxrt::play::LivePadConfig lp = nxrt::play::live_pad_config();
+        auto stick_calibration = [&](const char* id, const char* zh, const char* en, float rawX, float rawY, int* cx, int* cy) {
+            ImGui::PushID(id);
+            ImGui::TextColored(kDimText, "%s  x %+.2f  y %+.2f", tr(zh, en), rawX, rawY);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(tr("以此为中位", "Set centre here"))) {
+                *cx = static_cast<int>(std::lround(static_cast<double>(rawX) * 32767.0));
+                *cy = static_cast<int>(std::lround(static_cast<double>(rawY) * 32767.0));
+                mark(p);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(tr("清除校准", "Clear"))) {
+                *cx = *cy = 0;
+                mark(p);
+            }
+            double dx = static_cast<double>(*cx), dy = static_cast<double>(*cy);
+            const std::string sid_x = std::string(id) + "_x", sid_y = std::string(id) + "_y";
+            if (card_slider_f(sid_x.c_str(), "中位 X", "Centre X",
+                              "静止时摇杆报出的 X 值（原始单位）。手柄用久了会偏向一侧，把静止位置设成中位即可抵消。",
+                              "The X the stick reports at rest, in raw units. A worn stick leans one way and that direction then walks slowly.",
+                              &dx, -8000.0, 8000.0, 25.0, "%.0f", false, true)) {
+                *cx = static_cast<int>(std::lround(dx));
+                mark(p);
+            }
+            if (card_slider_f(sid_y.c_str(), "中位 Y", "Centre Y",
+                              "同上，Y 轴。先按住不动，看上面的原始值稳定后点「以此为中位」。",
+                              "Same for Y. Hold the stick still, watch the raw value settle, then press Set centre here.",
+                              &dy, -8000.0, 8000.0, 25.0, "%.0f", false, true)) {
+                *cy = static_cast<int>(std::lround(dy));
+                mark(p);
+            }
+            ImGui::PopID();
+        };
+        stick_calibration("ls_cal", "左摇杆原始值:", "Left stick, raw:", lp.raw_ls_x, lp.raw_ls_y,
+                          &p.edit.pad.ls_center_x, &p.edit.pad.ls_center_y);
+        stick_calibration("rs_cal", "右摇杆原始值:", "Right stick, raw:", lp.raw_rs_x, lp.raw_rs_y,
+                          &p.edit.pad.rs_center_x, &p.edit.pad.rs_center_y);
+    }
     if (card_slider_f("look_s", "右摇杆视角灵敏度", "Right-stick look sensitivity",
                       "控制手柄右摇杆旋转镜头的速度倍率（0.25x ~ 3.00x，实时生效）。",
                       "Multiplier for right-stick camera rotation speed (0.25x - 3.00x).", &pad.look_sens, 0.25, 3.00, 0.05, "%.2fx", false, true)) {
+        mark(p);
+    }
+    card_group("鼠标 (应用后实时生效)", "Mouse (Live)");
+    if (card_toggle("mouse_cap", "鼠标锁定视角", "Mouse camera capture",
+                    "开启：游戏聚焦时锁定指针并旋转视角。关闭：释放鼠标指针，适合纯手柄或窗口多任务（实时生效）。",
+                    "On: capture pointer for mouse camera while focused. Off: leave the cursor free (applies live).",
+                    &p.edit.mouse.camera_capture, false, true)) {
+        mark(p);
+    }
+    if (card_slider_f("mouse_scale", "鼠标灵敏度", "Mouse sensitivity",
+                      "鼠标移动多少计数让右摇杆满偏：数值越小转得越快（1 ~ 60）。",
+                      "Mouse counts for a fully deflected right stick: smaller turns faster (1 - 60).",
+                      &p.edit.mouse.stick_scale, 1.0, 60.0, 1.0, "%.0f", false, true)) {
         mark(p);
     }
     if (card_toggle("pad_invy", "反转手柄垂直视角", "Invert right-stick Y",
@@ -1258,6 +1509,7 @@ void tab_controls(UiHost& host, const LiveStatus& live, Page& p, float bottom_h)
     }
 
     ImGui::Spacing();
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
     if (ImGui::CollapsingHeader(tr("实时手柄 / 键盘输入状态测试", "Live Switch Pad Monitor"), ImGuiTreeNodeFlags_DefaultOpen)) {
         for (int i = 0; i < kSwitchButtonCount; ++i) {
             const bool on = (live.out.buttons & hid::btn(kSwitchButtons[i].bit)) != 0;
@@ -1270,23 +1522,75 @@ void tab_controls(UiHost& host, const LiveStatus& live, Page& p, float bottom_h)
         }
         ImGui::Text("LS (%.2f, %.2f)   RS (%.2f, %.2f)", live.out.lx, live.out.ly, live.out.rx, live.out.ry);
     }
+    ImGui::PopItemFlag();
 
-    card_group("当前键位速查表 (实时映射)", "Active Controls Reference");
-    card_button("kb_move", "角色移动 (左摇杆)", "Move (Left Stick)",
-                "键盘 WASD 或方向键控制左摇杆移动；连接手柄后直接用左摇杆。",
-                "Keyboard WASD or Arrow keys control Left Stick.", "WASD / 方向键");
-    card_button("kb_cam", "旋转视角 (右摇杆)", "Camera (Right Stick)",
-                "键盘 I / J / K / L 控制视角转动；连接手柄后直接用右摇杆。",
-                "Keyboard I / J / K / L control Right Stick camera.", "I / J / K / L");
-    card_button("kb_abxy", "确认 / 取消 / 功用键 (A B X Y)", "Face Buttons (A B X Y)",
-                "空格或回车 = A（确认），退格或 Esc = B（取消），U = X（快传/菜单），O = Y。",
-                "Space/Enter = A, Backspace/Esc = B, U = X, O = Y.", "Space / Back / U / O");
-    card_button("kb_shld", "肩键与扳机 (L / R / ZL / ZR)", "Shoulders & Triggers",
-                "Q = L，E = R，数字键 1 = ZL，数字键 2 = ZR。",
-                "Q = L, E = R, 1 = ZL, 2 = ZR.", "Q / E / 1 / 2");
-    card_button("kb_sys", "菜单 / 地图 / 摇杆下压", "PLUS / MINUS / L3 / R3",
-                "Tab 或 + = PLUS（主菜单），- = MINUS，Shift = 左摇杆按下，Ctrl = 右摇杆按下；手柄同时按 - 与 + 可呼出本 F1 菜单。",
-                "Tab/+ = PLUS, - = MINUS, Shift/Ctrl = L3/R3. Gamepad MINUS + PLUS toggles F1 menu.", "Tab / - / Shift / Ctrl");
+    // Generated from the bindings that are actually loaded, and editable in place: a key chip starts a capture for
+    // that row, "x" removes it, "+" adds another key to the action. Conflicts unbind the other action (see
+    // poll_capture), so one input never drives two things.
+    card_group("按键绑定（点按键重新绑定 · × 移除 · + 增加）", "Key bindings (click a key to rebind · × remove · + add)");
+    // Resetting the keys is its own action: the footer's Defaults button reloads every setting, which is a heavy way
+    // to undo one bad rebind.
+    if (ImGui::SmallButton(tr("恢复默认按键", "Reset keys"))) {
+        p.edit.bindings = host.factory().bindings;
+        mark(p);
+        set_notice(p, tr("按键已恢复默认，点「应用并保存」生效", "Keys back to the factory set; Apply & Save to keep it"), false);
+    }
+    {
+        static const Act kOrder[] = {
+            Act::MoveForward, Act::MoveBack, Act::MoveLeft, Act::MoveRight,
+            Act::LookUp, Act::LookDown, Act::LookLeft, Act::LookRight,
+            Act::BtnA, Act::BtnB, Act::BtnX, Act::BtnY,
+            Act::BtnL, Act::BtnR, Act::BtnZL, Act::BtnZR,
+            Act::DpadUp, Act::DpadDown, Act::DpadLeft, Act::DpadRight,
+            Act::BtnPlus, Act::BtnMinus, Act::BtnLStick, Act::BtnRStick,
+        };
+        int shown = 0;
+        int erase_at = -1;
+        for (Act a : kOrder) {
+            std::vector<int> rows;
+            for (int i = 0; i < static_cast<int>(p.edit.bindings.size()); ++i) {
+                const Binding& b = p.edit.bindings[static_cast<std::size_t>(i)];
+                if (b.act != a || b.in.kind == InKind::None) continue;
+                if (b.ctx != Ctx::All && b.ctx != Ctx::Menu) continue;   // the layers that apply while the game runs
+                rows.push_back(i);
+            }
+            ++shown;
+            ImGui::TextUnformatted(act_label(a));
+            ImGui::SameLine(230.0f);
+            if (rows.empty()) {
+                ImGui::TextColored(kDimText, "%s", tr("（未绑定）", "(unbound)"));
+                ImGui::SameLine();
+            }
+            for (int idx : rows) {
+                ImGui::PushID(idx);
+                const std::string nm = pretty_input(p.edit.bindings[static_cast<std::size_t>(idx)].in);
+                if (ImGui::SmallButton(nm.c_str())) {
+                    p.rebind = idx;
+                    host.begin_capture();
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("×")) erase_at = idx;
+                ImGui::PopID();
+                ImGui::SameLine();
+            }
+            ImGui::PushID(1000 + static_cast<int>(a));
+            if (ImGui::SmallButton("+")) {
+                p.edit.bindings.push_back(Binding{InputId{}, Ctx::All, a, Trig::Press, 0});
+                p.rebind = static_cast<int>(p.edit.bindings.size()) - 1;
+                mark(p);
+                host.begin_capture();
+            }
+            ImGui::PopID();
+        }
+        if (shown == 0) ImGui::TextColored(kDimText, "%s", tr("（没有任何绑定）", "(no bindings)"));
+        if (erase_at >= 0) {
+            p.edit.bindings.erase(p.edit.bindings.begin() + erase_at);
+            mark(p);
+            set_notice(p, tr("已删除该按键绑定", "Binding removed"), false);
+        }
+    }
+    ImGui::TextColored(kDimText, "%s", tr("鼠标灵敏度在「鼠标」分组里调；按 F1（或手柄同时按 - 与 +）呼出本菜单。",
+                                         "Mouse sensitivity is in the Mouse group above; gamepad MINUS + PLUS opens this menu."));
 
     pane_end(live);
 }
@@ -1479,17 +1783,36 @@ void draw_settings_page(UiHost& host) {
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0.0f, px(3.0f)));
 
-    if (p.dirty) {
+    const bool was_dirty = p.dirty;
+    if (was_dirty) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.50f, 0.46f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.64f, 0.58f, 1.0f));
     }
-    if (ImGui::Button(tr("应用并保存", "Apply & Save"), ImVec2(px(138.0f), px(34.0f)))) apply_now(host, p);
-    if (p.dirty) ImGui::PopStyleColor(2);
+    if (ImGui::Button(tr("应用并保存", "Apply & Save"), ImVec2(px(138.0f), px(34.0f))) ||
+        (!host.capturing() && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup) && ImGui::IsKeyPressed(ImGuiKey_GamepadR2, false)))
+        apply_now(host, p);
+    const ImGuiID apply_id = ImGui::GetItemID();
+    const bool apply_foc = ImGui::IsItemFocused();
+    if (was_dirty) ImGui::PopStyleColor(2);
 
     ImGui::SameLine();
     if (ImGui::Button(tr("放弃修改", "Revert"), ImVec2(px(108.0f), px(34.0f)))) revert_to_saved(host, p);
+    const bool revert_foc = ImGui::IsItemFocused();
     ImGui::SameLine();
     if (ImGui::Button(tr("恢复默认", "Defaults"), ImVec2(px(108.0f), px(34.0f)))) load_factory(host, p);
+    const bool defaults_foc = ImGui::IsItemFocused();
+    bool ftr_foc = apply_foc || revert_foc || defaults_foc;
+    if (g_pane.focus_footer && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup)) {
+        focus_widget(apply_id, ImGui::GetCurrentWindow());
+        g_pane.focus_footer = false;
+        g_pane.rows_focused = false;
+        ftr_foc = true;
+    }
+    g_pane.footer_focused = ftr_foc;
+    if (ftr_foc && !host.capturing() && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup) && any_dir_pressed(true)) {
+        g_pane.focus_last = true;
+        ImGui::NavMoveRequestCancel();
+    }
 
     ImGui::SameLine(0.0f, px(16.0f));
     if (host.capturing()) {
@@ -1497,13 +1820,13 @@ void draw_settings_page(UiHost& host) {
         ImGui::TextColored(kGold, "%s", tr("请按下要绑定的按键，按 Esc 取消...", "Press a key to bind, Esc to cancel..."));
     } else if (p.dirty) {
         ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(kOrange, "%s", tr("● 有未保存的修改", "● Unsaved changes"));
+        ImGui::TextColored(kOrange, "%s", tr("● 有未保存的修改（点「应用并保存」保存）", "● Unsaved changes (click Apply & Save)"));
     } else if (!p.notice.empty()) {
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(p.notice_warn ? kOrange : kEmerald, "%s", p.notice.c_str());
     } else {
         ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(kDimText, "%s", tr("提示：方向键或悬停选择条目，左右微调，右侧查看说明", "Tip: D-pad or hover to select, Left/Right to adjust"));
+        ImGui::TextColored(kDimText, "%s", tr("提示：鼠标点左侧标签换页、点条目修改，滑块可以直接拖；手柄方向键与 L/R 同样可用。", "Tip: click a tab on the left and a row to edit, drag a slider; the gamepad d-pad and L/R also work."));
     }
 }
 
@@ -1517,13 +1840,30 @@ void draw_settings_menu(UiHost& host, gfx::Overlay& ov) {
     const int frame = ImGui::GetFrameCount();
     const bool opened = frame != last_frame + 1;
     last_frame = frame;
+    if (opened) {
+        g_pane.rows_focused = false;
+        g_pane.focus_header = false;
+        g_pane.focus_footer = false;
+        g_pane.header_focused = false;
+        g_pane.footer_focused = false;
+        g_pane.prev_first_card_id = 0;
+        g_pane.prev_last_card_id = 0;
+    } else if (g_pane.rows_focused && !g_pane.focus_header && !g_pane.header_focused && !g_pane.footer_focused &&
+               !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup)) {
+        // Keep Left/Right/Stick-X adjusting left-pane option cards instead of triggering horizontal ImGui nav moves.
+        lock_rows_step_keys(g_pane.rows_step_owner);
+        if (ImGuiContext* ctx = ImGui::GetCurrentContext()) {
+            if (ctx->NavMoveDir == ImGuiDir_Left || ctx->NavMoveDir == ImGuiDir_Right) ImGui::NavMoveRequestCancel();
+        }
+    }
     if (!opened && !host.capturing() && !ImGui::IsAnyItemActive() && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup) &&
         (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))) {
         ov.request_hide();
     }
 
     const ImVec2 disp = ImGui::GetIO().DisplaySize;
-    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0.0f, 0.0f), disp, IM_COL32(3, 8, 16, 155));
+    if (extras::hdr_pattern().kind == extras::HdrPattern::None)   // a test pattern is shown undimmed
+        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0.0f, 0.0f), disp, IM_COL32(3, 8, 16, 155));
 
     const float em = ImGui::GetFontSize();
     const float w = std::min(disp.x - 2.5f * em, std::max(54.0f * em, disp.x * 0.74f));
@@ -1549,6 +1889,8 @@ void draw_settings_menu(UiHost& host, gfx::Overlay& ov) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.46f, 0.14f, 0.16f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.62f, 0.20f, 0.22f, 1.0f));
         if (ImGui::Button(tr("退出游戏", "Quit game"), ImVec2(quit_w, 0.0f))) ImGui::OpenPopup("##quit_confirm");
+        const ImGuiID quit_id = ImGui::GetItemID();
+        const bool quit_foc = ImGui::IsItemFocused();
         ImGui::PopStyleColor(2);
         if (ImGui::BeginPopupModal("##quit_confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
             ImGui::TextUnformatted(tr("退出游戏？上次存档之后的进度将会丢失。", "Quit the game? Progress since your last save is lost."));
@@ -1577,8 +1919,22 @@ void draw_settings_menu(UiHost& host, gfx::Overlay& ov) {
             f.menu_lang = g_zh ? "zh" : "en";
             set_fps_live(host, f);
         }
+        const bool lang_foc = ImGui::IsItemFocused();
         ImGui::SameLine();
         if (ImGui::Button(tr("关闭 (F1)", "Close (F1)"), ImVec2(close_w, 0.0f))) ov.request_hide();
+        const bool close_foc = ImGui::IsItemFocused();
+        bool hdr_foc = quit_foc || lang_foc || close_foc;
+        if (g_pane.focus_header && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup)) {
+            focus_widget(quit_id, ImGui::GetCurrentWindow());
+            g_pane.focus_header = false;
+            g_pane.rows_focused = false;
+            hdr_foc = true;
+        }
+        g_pane.header_focused = hdr_foc;
+        if (hdr_foc && !host.capturing() && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup) && any_dir_pressed(false)) {
+            g_pane.focus_first = true;
+            ImGui::NavMoveRequestCancel();
+        }
 
         ImGui::Dummy(ImVec2(0.0f, px(4.0f)));
         draw_settings_page(host);

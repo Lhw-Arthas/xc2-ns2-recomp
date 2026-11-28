@@ -12,6 +12,7 @@
 #include <fstream>
 
 #include "elf.h"
+#include "nxrt/cheats.h"
 #include "nxrt/log.h"
 #include "nxrt/module.h"
 
@@ -167,6 +168,11 @@ Module* module_load_nso_memory(const void* data, size_t size, const LoadOptions&
     std::memcpy(elf.data() + sizeof eh, ph, sizeof(elf::Phdr) * n);
     NXLOG_I(kTag, "NSO %s: text 0x%x ro 0x%x data 0x%x bss 0x%x, flags 0x%x, dynamic at 0x%llx", opt.name.c_str(), seg[0].dsize, seg[1].dsize, seg[2].dsize, bss, flags,
             static_cast<unsigned long long>(dyn_vaddr));
+    if (opt.name == "main") {
+        char bid[65]{};
+        for (int i = 0; i < 32; ++i) std::snprintf(bid + i * 2, 3, "%02x", d[0x40 + i]);
+        nxrt::cheats::register_main_nso(bid, static_cast<uint64_t>(seg[0].mem_off) + seg[0].dsize);
+    }
     return module_load_memory(elf.data(), elf.size(), opt, err);
 }
 

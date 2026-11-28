@@ -80,19 +80,30 @@ int CUDAAPI on_display(void* ud, CUVIDPARSERDISPINFO* info) {
     unsigned int pitch = 0;
     CUdeviceptr dev = 0;
     if (d->cv->cuvidMapVideoFrame(d->dec, info->picture_index, &dev, &pitch, &pp) != CUDA_SUCCESS) return 1;
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(dev));
     NvDecPicture pic;
     pic.w = d->w;
     pic.h = d->h;
     pic.pts = info->timestamp;
     pic.nv12.resize(static_cast<size_t>(d->w) * d->h * 3 / 2);
-    uint8_t* dst = pic.nv12.data();
-    for (int y = 0; y < d->h; ++y) std::memcpy(dst + static_cast<size_t>(y) * d->w, src + static_cast<size_t>(y) * pitch, static_cast<size_t>(d->w));
-    const uint8_t* uvs = src + static_cast<size_t>(pitch) * d->h;
-    uint8_t* uvd = dst + static_cast<size_t>(d->w) * d->h;
-    for (int y = 0; y < d->h / 2; ++y) std::memcpy(uvd + static_cast<size_t>(y) * d->w, uvs + static_cast<size_t>(y) * pitch, static_cast<size_t>(d->w));
+    // The mapped frame is device memory: copy both NV12 planes to the host with the driver (a plain memcpy faults).
+    const bool pushed = d->cu->cuCtxPushCurrent(d->ctx) == CUDA_SUCCESS;
+    bool ok = pushed;
+    for (int plane = 0; ok && plane < 2; ++plane) {
+        CUDA_MEMCPY2D c = {};
+        c.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        c.srcDevice = dev + (plane ? static_cast<CUdeviceptr>(pitch) * d->h : 0);
+        c.srcPitch = pitch;
+        c.dstMemoryType = CU_MEMORYTYPE_HOST;
+        c.dstHost = pic.nv12.data() + (plane ? static_cast<size_t>(d->w) * d->h : 0);
+        c.dstPitch = static_cast<size_t>(d->w);
+        c.WidthInBytes = static_cast<size_t>(d->w);
+        c.Height = static_cast<size_t>(plane ? d->h / 2 : d->h);
+        ok = d->cu->cuMemcpy2D(&c) == CUDA_SUCCESS;
+    }
+    CUcontext popped = nullptr;
+    if (pushed) d->cu->cuCtxPopCurrent(&popped);
     d->cv->cuvidUnmapVideoFrame(d->dec, dev);
-    d->out->push_back(std::move(pic));
+    if (ok) d->out->push_back(std::move(pic));
     return 1;
 }
 

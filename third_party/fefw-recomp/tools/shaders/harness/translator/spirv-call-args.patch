@@ -9,26 +9,30 @@ from atomics and calls now stay.
 Third change: an atomic or call whose result is read once was folded into that use and, by the second change, also
 kept as a statement, so it ran twice (a compare-and-swap loop's condition repeated the CAS; an atomicAdd whose result
 indexes a store incremented twice). Side-effecting operations are no longer propagated; their uses read the temporary.
+Fourth change: mutable memory loads (SSBO/global/shared/local/output/image) whose result has one use must not be
+folded into that use either, because PropagateExpression moves the load across intervening stores/barriers to the use
+site (e.g. morph-target base shader c83ff5fc5d458f3a reading previous frame pos before overwriting current pos).
 --- a/StructuredIr/AstOptimizer.cs
 +++ b/StructuredIr/AstOptimizer.cs
-@@ -24,12 +24,14 @@
+@@ -24,12 +24,15 @@
                      {
                          bool isWorthPropagating = propVar.Uses.Count == 1 || IsWorthPropagating(assignment.Source);
  
 -                        if (propVar.Defs.Count == 1 && isWorthPropagating)
-+                        // an atomic or a call is not folded into its use either: its assignment stays (below), so it would run twice
-+                        if (propVar.Defs.Count == 1 && isWorthPropagating && !HasSideEffects(assignment.Source))
++                        // side-effecting ops (atomics, calls) and mutable memory loads must stay in place:
++                        // atomics/calls would run twice or vanish, and moving a load past a store/barrier aliases memory
++                        if (propVar.Defs.Count == 1 && isWorthPropagating && CanPropagate(assignment.Source))
                          {
                              PropagateExpression(propVar, assignment.Source);
                          }
  
 -                        if (propVar.Type == OperandType.LocalVariable && propVar.Uses.Count == 0)
-+                        // an unused result does not make the operation dead: an atomic (RED, ATOMS with RZ) or a call must stay
++                        // an unused result does not make a side-effecting operation dead: atomics (RED, ATOMS with RZ) and calls stay
 +                        if (propVar.Type == OperandType.LocalVariable && propVar.Uses.Count == 0 && !HasSideEffects(assignment.Source))
                          {
                              visitor.Block.Remove(assignment);
  
-@@ -40,6 +42,11 @@
+@@ -40,6 +43,63 @@
              }
  
              RemoveEmptyBlocks(mainBlock);
@@ -36,11 +40,63 @@ indexes a store incremented twice). Side-effecting operations are no longer prop
 +
 +        private static bool HasSideEffects(IAstNode source)
 +        {
-+            return source is AstOperation op && (op.Inst.IsAtomic() || op.Inst == Instruction.Call);
++            if (source is not AstOperation op)
++            {
++                return false;
++            }
++
++            Instruction inst = op.Inst & Instruction.Mask;
++            if (inst.IsAtomic() || inst == Instruction.ImageAtomic || inst == Instruction.Call)
++            {
++                return true;
++            }
++
++            for (int i = 0; i < op.SourcesCount; i++)
++            {
++                if (HasSideEffects(op.GetSource(i)))
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++
++        private static bool CanPropagate(IAstNode source)
++        {
++            if (source is not AstOperation op)
++            {
++                return true;
++            }
++
++            Instruction inst = op.Inst & Instruction.Mask;
++            if (inst.IsAtomic() || inst == Instruction.ImageAtomic || inst == Instruction.Call || inst == Instruction.ImageLoad)
++            {
++                return false;
++            }
++
++            if (inst == Instruction.Load && op.StorageKind is not (
++                StorageKind.None or
++                StorageKind.Input or
++                StorageKind.InputPerPatch or
++                StorageKind.ConstantBuffer))
++            {
++                return false;
++            }
++
++            for (int i = 0; i < op.SourcesCount; i++)
++            {
++                if (!CanPropagate(op.GetSource(i)))
++                {
++                    return false;
++                }
++            }
++
++            return true;
          }
  
          private static bool IsWorthPropagating(IAstNode source)
-@@ -69,6 +76,13 @@
+@@ -69,6 +129,13 @@
                  }
                  else if (useNode is AstOperation useOperation)
                  {

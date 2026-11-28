@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -338,9 +339,13 @@ uint32_t Stream::append(uint64_t tag, const Desc& d) {
     if (in_range && d.size && guest_readable(d.buffer + d.offset, d.size)) {
         e.samples = d.buffer + d.offset;
     } else if (d.size) {
-        NXLOG_W("audout", "sample buffer %#llx (%llu bytes at %llu of %llu) is not readable: played as silence",
-                static_cast<unsigned long long>(d.buffer), static_cast<unsigned long long>(d.size),
-                static_cast<unsigned long long>(d.offset), static_cast<unsigned long long>(d.capacity));
+        static std::atomic<uint64_t> unread_warns{0};
+        const uint64_t w = unread_warns.fetch_add(1, std::memory_order_relaxed);
+        if (w < 4 || (w % 1000) == 0)
+            NXLOG_W("audout", "sample buffer %#llx (%llu bytes at %llu of %llu) is not readable: played as silence (count %llu)",
+                    static_cast<unsigned long long>(d.buffer), static_cast<unsigned long long>(d.size),
+                    static_cast<unsigned long long>(d.offset), static_cast<unsigned long long>(d.capacity),
+                    static_cast<unsigned long long>(w + 1));
     }
     std::lock_guard<std::mutex> lk(mu_);
     if (queue_.size() + released_.size() >= kMaxBuffers) return kResBufferCountFull;

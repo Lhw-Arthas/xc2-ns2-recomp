@@ -45,24 +45,24 @@ jobs:
               git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               base=FETCH_HEAD
             fi
-            mapfile -d '' -t files < <(git diff --name-only -z --diff-filter=ACMRT "$base" HEAD -- . ':!.github/workflows/ci.yml')
+            mapfile -d '' -t files < <(git diff --name-only -z --diff-filter=ACMRT "$base" HEAD -- . ':!.github/workflows/ci.yml' ':!tools/ci/check_invariants.py' ':!tools/tests/test_tools_ci.py' ':!third_party/')
             if [ "${#files[@]}" -eq 0 ]; then
               echo "ok: no personal paths (no added or modified files in PR)"
               exit 0
             fi
-            if git grep -n -I -E '[A-Za-z]:\\Users\\[A-Za-z0-9._-]+' -- "${files[@]}"; then
-              echo "a personal path is in the PR"; exit 1
+            if git grep -n -I -E '[A-Za-z]:\\Users\\[A-Za-z0-9._-]+|[A-Za-z]:\\(XC2|Tools)([-\\/]|$)|sync-to-nas' -- "${files[@]}"; then
+              echo "a personal or maintainer path is in the PR"; exit 1
             fi
             if git grep -n -I -F 'Xenoblade 2 Switch 2 Edition recomp' -- "${files[@]}"; then
               echo "the maintainer's absolute checkout path is in the PR"; exit 1
             fi
           else
-            # a real user profile, anywhere, docs included
-            if git grep -n -I -E '[A-Za-z]:\\Users\\[A-Za-z0-9._-]+' -- .; then
-              echo "a personal path is in the tree"; exit 1
+            # a real user profile or maintainer workspace drive, anywhere outside guard/test fixtures
+            if git grep -n -I -E '[A-Za-z]:\\Users\\[A-Za-z0-9._-]+|[A-Za-z]:\\(XC2|Tools)([-\\/]|$)|sync-to-nas' -- . ':!.github/workflows/ci.yml' ':!tools/ci/check_invariants.py' ':!tools/tests/test_tools_ci.py' ':!third_party/'; then
+              echo "a personal or maintainer path is in the tree"; exit 1
             fi
             # the maintainer's own checkout, hardcoded into a script or a source file
-            if git grep -n -I -F 'Xenoblade 2 Switch 2 Edition recomp' -- . ':!.github/workflows/ci.yml'; then
+            if git grep -n -I -F 'Xenoblade 2 Switch 2 Edition recomp' -- . ':!.github/workflows/ci.yml' ':!tools/ci/check_invariants.py'; then
               echo "the maintainer's absolute checkout path is in the tree"; exit 1
             fi
           fi
@@ -83,6 +83,11 @@ jobs:
             echo "these paths must never be published:"; echo "$bad"; exit 1
           fi
           python3 tools/ci/check_invariants.py --hook
+
+      - name: Run Python tool unit tests
+        run: |
+          set -eu
+          python3 -m unittest discover -s tools/tests -p "test_*.py" -v
 
       - name: No loose ExeFS under xc2/game
         run: |

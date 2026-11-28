@@ -22,6 +22,69 @@ namespace nxrt::gfx {
 void set_shader_backlog(int pending);
 int shader_backlog();
 
+// 3D ground navigation ribbon vertex & parameters (rendered by native Vulkan pass before ImGui, with depth occlusion).
+struct Ribbon3DVertex {
+    float x = 0.f, y = 0.f, z = 0.f;
+    float u = 0.f, v = 0.f;
+    float fade = 1.f;
+};
+
+struct Ribbon3DParams {
+    float view_proj[16] = {};
+    float color[4] = {0.22f, 0.85f, 1.0f, 0.88f};
+    float time_sec = 0.f;
+    float reveal_dist = 100.f;
+    float occluded_alpha = 0.14f;
+};
+
+// Lightweight game-agnostic 2D foreground canvas backed by ImGui's foreground draw list (no ImGui header needed by callers,
+// works transparently on both SDR and HDR swapchains, never captures input).
+struct HudCanvas {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    void* draw_list = nullptr;
+    void* font = nullptr;
+    void* ribbon_sink = nullptr;
+
+    void rect_filled(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding = 0.f) const;
+    void rect_filled_hgrad(float x0, float y0, float x1, float y1, uint32_t rgba_left, uint32_t rgba_right) const;
+    void rect(float x0, float y0, float x1, float y1, uint32_t rgba, float rounding = 0.f, float thickness = 1.f) const;
+    void line(float x0, float y0, float x1, float y1, uint32_t rgba, float thickness = 1.5f) const;
+    void triangle_filled(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t rgba) const;
+    void quad_filled(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba) const;
+    void quad(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t rgba, float thickness = 1.5f) const;
+    void convex_poly_filled(const float* xy, int count, uint32_t rgba) const;
+    void convex_poly_hgrad(const float* xy, int count, float x_left, float x_right, uint32_t rgba_left, uint32_t rgba_right) const;
+    void polyline(const float* xy, int count, uint32_t rgba, bool closed = false, float thickness = 1.5f) const;
+    void circle_filled(float cx, float cy, float r, uint32_t rgba, int segments = 0) const;
+    void circle(float cx, float cy, float r, uint32_t rgba, float thickness = 1.5f, int segments = 0) const;
+    void text(float x, float y, float size, uint32_t rgba, const char* str) const;
+    void text_outlined(float x, float y, float size, uint32_t rgba, uint32_t outline_rgba, const char* str) const;
+    void measure_text(float size, const char* str, float* out_w, float* out_h) const;
+    void image(uint64_t tex_id, float x0, float y0, float x1, float y1,
+               float u0 = 0.f, float v0 = 0.f, float u1 = 1.f, float v1 = 1.f,
+               uint32_t tint_rgba = 0xFFFFFFFFu) const;
+    void image_rounded(uint64_t tex_id, float x0, float y0, float x1, float y1,
+                       float u0, float v0, float u1, float v1,
+                       float rounding, uint32_t tint_rgba = 0xFFFFFFFFu) const;
+    void set_ribbon_3d(const Ribbon3DVertex* verts, uint32_t count, const Ribbon3DParams& params) const;
+};
+
+// Lightweight game-agnostic searchable destination picker window (toggled by caller, e.g. F4).
+struct PickerItem {
+    uint64_t id = 0;
+    uint8_t group = 0;     // 0 = Landmark / Skip-Travel, 1 = NPC
+    float dist = 0.f;
+    std::string name;
+    std::string detail;
+};
+
+struct PickerCallbacks {
+    std::function<void(std::vector<PickerItem>& out_items, bool& out_has_pin, std::string& out_pin_name)> query;
+    std::function<void(uint64_t id)> select;
+    std::function<void()> clear;
+};
+
 class Overlay {
 public:
     struct Context {
@@ -93,6 +156,19 @@ public:
 
     // A drawn arrow at a window pixel (test aid, S28: a screenshot of the game's own frame does not contain the OS cursor). Any thread.
     void set_pointer(bool show, float x, float y, bool in_screenshots);
+
+    // Optional per-frame foreground HUD callback (runs on the presenting thread inside the ImGui frame, even when the F1 menu is hidden).
+    // Pass an empty std::function to clear. Thread-safe.
+    void set_hud_callback(std::function<void(const HudCanvas&)> fn);
+
+    // Upload a linear BC3 (DXT5) texture for foreground HudCanvas::image / image_rounded (owned until Overlay shutdown).
+    // Returns an opaque non-zero ImTextureID handle, or 0 on failure.
+    uint64_t create_hud_texture_bc3(uint32_t w, uint32_t h, const void* bc3_linear, size_t bytes);
+
+    // Optional searchable destination picker window (toggled independently of F1, e.g. F4).
+    void set_picker(PickerCallbacks cb);
+    void toggle_picker();
+    bool picker_open() const;
 
     // The Renderer overlay hook: builds and draws the menu on top of the frame (no-op while hidden, unless the counter is on).
     void draw(const FrameInfo& f);

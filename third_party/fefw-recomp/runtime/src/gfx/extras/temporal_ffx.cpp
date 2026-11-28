@@ -39,7 +39,7 @@ std::string effective_want_version() {
         std::lock_guard<std::mutex> lk(g_ver_mu);
         if (!g_live_want_version.empty()) return g_live_want_version;
     }
-    return nxrt::config_get_str("upscale", "fsr_version", "");
+    return nxrt::config_get_str("upscale", "fsr_version", "3.1");
 }
 
 std::wstring exe_dir() {
@@ -393,7 +393,8 @@ public:
         // recomp never sees that because it tears the FidelityFX context down whenever the size changes; [upscale]
         // fsr_follow_size does the same here. Always enable per-size isolation for FSR 4.x to protect amdvlk.
         const std::string want_v = effective_want_version();
-        const bool follow_size = nxrt::config_get_bool("upscale", "fsr_follow_size", false) || (!want_v.empty() && want_v[0] == '4');
+        bool follow_size = nxrt::config_get_bool("upscale", "fsr_follow_size", false) || (!want_v.empty() && want_v[0] == '4') ||
+                           version_.rfind("FSR 4", 0) == 0;
         if (follow_size != follow_size_active_) {
             reset_contexts();
             follow_size_active_ = follow_size;
@@ -407,6 +408,13 @@ public:
             if (!make(f.render, f.out)) {
                 failed_ = true;
                 return false;
+            }
+            if (version_.rfind("FSR 4", 0) == 0 && !follow_size_active_) {
+                // Provider resolved to FSR 4.x even without an explicit fsr_version = 4*: isolate future resizes immediately.
+                follow_size_active_ = true;
+                slots_.push_back(Slot{ctx_, f.render, f.out, ++slot_tick_});
+                ctx_ = nullptr;
+                active_ = &slots_.back().ctx;
             }
         }
         ffxDispatchDescUpscale d = {};

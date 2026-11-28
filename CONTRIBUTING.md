@@ -36,7 +36,9 @@ See [docs/BUILD.md](docs/BUILD.md). In short: a Windows toolchain (MSVC + LLVM c
 - If you add or change runtime config keys (`config_get_*`), F1 settings (`play_config.cpp`), or `config/nxrt.ini.in`,
   update `config/keys.tsv`, regenerate `CONFIG.md` with `python tools/ci/config_table.py --emit`, and run the local CI
   checks (`check_invariants.py`, `check_links.py`, `config_table.py --check`, `check_play_settings.py`,
-  `check_install_template.py`).
+  `check_install_template.py`, plus `python -m unittest discover -s tools/tests -p "test_*.py" -v`).
+- For pre-release versions (`0.x`), tag releases as **pre-release** and publish a `SHA256SUMS` table for all attached
+  zip/tarball assets alongside the release notes.
 - Say which build you tested on, and what you measured. Numbers with a scene and a build are worth more than
   "it feels faster".
 

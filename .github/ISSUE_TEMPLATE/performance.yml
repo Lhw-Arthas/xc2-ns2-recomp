@@ -5,17 +5,22 @@ body:
   - type: markdown
     attributes:
       value: |
-        **If you are on an older build, update first.** Releases before 0.2.0 have problems that are already fixed
-        (720p internal render, the add-on `0/romfs` layout, the film hand-back, F1 not opening the settings page); a
-        report from one of them costs a round trip. Latest: <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>
+        **Please make sure you are on the latest release** (Launcher: **About → Check now**, or <https://github.com/weile10000/xc2-ns2-recomp/releases/latest>). Do **not** upload or link to game files, keys, or external voice/subtitle packs.
+        **请先确认已升级到最新版**（启动器 **关于 → 检查更新**）；**严禁上传或分享游戏文件、密钥及任何外部语音/字幕包或其下载链接。**
 
-        **请先确认版本是 0.2.0 或更新。** 0.2.0 之前有已修掉的问题（内部 720p 渲染、附加内容 `0/romfs` 布局、影片交还、
-        F1 打不开设置页），旧版本的报告会白跑一轮。最新版本见上面的链接。
-
-        Three things and you are done - the log below carries the rest.
-
-        The report zip is the important one: it holds the frame times, what grew during a slow frame, and whether a
-        cutscene had just ended. Without it a stutter report can only be guessed at.
+        The report zip carries the frame times, what grew during a slow frame, and whether a cutscene had just ended. Without it a stutter report can only be guessed at.
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      description: Native Windows 11 x64 is the primary target covered by release testing. Windows 10 x64 and Linux / SteamOS (Proton / Wine) receive best-effort compatibility without guaranteed full regression support — community PRs and forks are welcome.
+      options:
+        - "Windows 11 x64 (primary target)"
+        - "Windows 10 x64 (best-effort compatibility)"
+        - "Linux / SteamOS / Proton / Wine (best-effort compatibility)"
+        - "Other (community / fork)"
+    validations:
+      required: true
   - type: input
     id: where
     attributes:
@@ -32,12 +37,12 @@ body:
         Open a command prompt in the folder you unzipped and run:
 
         ```
-        tools\python\python.exe tools\report.py
+        tools\python\python.exe tools\report.py --no-validation
         ```
 
         Play until it goes slow, keep going for a few seconds of the slow part, then close the game. It writes
         `work\reports\report-<stamp>.zip` - attach that file. Nothing in it is game data.
-      placeholder: report-20261121-120000.zip
+      placeholder: report-20261124-120000.zip
     validations:
       required: true
   - type: dropdown
@@ -56,7 +61,7 @@ body:
     attributes:
       label: Build (optional)
       description: The report zip already says it; fill this in if you know it.
-      placeholder: 0.1.4
+      placeholder: latest (e.g. v0.2.6)
   - type: textarea
     id: notes
     attributes:
@@ -65,9 +70,21 @@ body:
         What you saw, the upscaler and "Lock render resolution" if you changed them, and whether the game had just
         played a cutscene when it started. A screenshot is welcome here.
   - type: checkboxes
+    id: custom_env
+    attributes:
+      label: Custom setup or external tweaks (optional — check any that apply)
+      description: Helps us spot external bottlenecks quickly (e.g. driver Low Latency Ultra, CPU core pinning, or FIFO VSync).
+      options:
+        - label: GPU driver overrides active (e.g. Low Latency Ultra, DLSS model override)
+          required: false
+        - label: Custom CPU affinity / core pinning, or third-party overlay (RTSS / ReShade)
+          required: false
+        - label: Mods / cheats enabled, or manual `nxrt.ini` edits
+          required: false
+  - type: checkboxes
     id: confirm
     attributes:
       label: Confirmation
       options:
-        - label: I attached no game files.
+        - label: I have not attached or linked any game files, keys, or external voice/subtitle packs.
           required: true

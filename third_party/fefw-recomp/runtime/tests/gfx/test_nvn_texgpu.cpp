@@ -6,6 +6,7 @@
 // allocation is left after shutdown.
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,11 +25,13 @@
 #include "nvn_format.h"
 #include "nvn_gpu.h"
 #include "nvn_gpu_internal.h"
+#include "nvn_hudless.h"
 #include "nvn_texdata.h"
 #include "nvn_texprep.h"
 #include "nvn_texture_layout.h"
 #include "nxrt/gfx.h"
 #include "nxrt/gfx_tuning.h"
+#include "nxrt/nvn_backend.h"
 #include "tegra_tiling.h"
 #include "test_framework.h"
 NXTEST_GROUP(gfx_nvn_texgpu)
@@ -1358,4 +1361,172 @@ NXTEST(sparse_texture_segments) {
     Texture plain;
     uint64_t hp = 0;
     CHECK(!texture_hash_virtual(plain, hp));
+}
+
+// Regression guards for #55 and #56: attachment scaling must never bloat intermediate 1080p-family targets past output
+// height (e.g. 1536x864 -> 4608x2592 at 4K or 3072x1728 at 1440p) and must downscale 3840x2160 targets even at 1080p.
+NXTEST(attachment_scale_xc2_targets) {
+    constexpr int T2D = NVN_TEXTURE_TARGET_2D;
+    auto near_f = [](float got, float want) { return std::fabs(got - want) < 1e-4f; };
+    // 4K Native: scene=3.0, out=2.0, out_h=2160
+    CHECK(near_f(gpu::compute_attachment_scale(1280, 720, T2D, 0, false, 1, 1, 3.0f, 2.0f, 1920, 0, true, 2160), 3.0f));
+    CHECK(near_f(gpu::compute_attachment_scale(1920, 1080, T2D, 0, false, 1, 1, 3.0f, 2.0f, 1920, 0, true, 2160), 2.0f));
+    CHECK(near_f(gpu::compute_attachment_scale(1536, 864, T2D, 0, false, 1, 1, 3.0f, 2.0f, 1920, 0, true, 2160), 2.0f));
+    CHECK(near_f(gpu::compute_attachment_scale(960, 540, T2D, 0, false, 1, 1, 3.0f, 2.0f, 1920, 0, true, 2160), 2.0f));
+    CHECK(near_f(gpu::compute_attachment_scale(3840, 2160, T2D, 0, false, 1, 1, 3.0f, 2.0f, 1920, 0, true, 2160), 1.0f));
+    // 1440p Native: scene=2.0, out=4/3, out_h=1440
+    const float o1440 = 4.0f / 3.0f;
+    CHECK(near_f(gpu::compute_attachment_scale(1280, 720, T2D, 0, false, 1, 1, 2.0f, o1440, 1920, 0, true, 1440), 2.0f));
+    CHECK(near_f(gpu::compute_attachment_scale(1536, 864, T2D, 0, false, 1, 1, 2.0f, o1440, 1920, 0, true, 1440), o1440));
+    CHECK(near_f(gpu::compute_attachment_scale(960, 540, T2D, 0, false, 1, 1, 2.0f, o1440, 1920, 0, true, 1440), o1440));
+    CHECK(near_f(gpu::compute_attachment_scale(3840, 2160, T2D, 0, false, 1, 1, 2.0f, o1440, 1920, 0, true, 1440), 2.0f / 3.0f));
+    // 1080p Quality: scene=1.0, out=1.0, out_h=1080 -> 3840x2160 targets still downscale to 0.5x (1920x1080)
+    CHECK(near_f(gpu::compute_attachment_scale(3840, 2160, T2D, 0, false, 1, 1, 1.0f, 1.0f, 1920, 0, true, 1080), 0.5f));
+    CHECK(near_f(gpu::compute_attachment_scale(1280, 720, T2D, 0, false, 1, 1, 1.0f, 1.0f, 1920, 0, true, 1080), 1.0f));
+    // 4K Ultra Performance: scene=1.0, out=2.0 -> 960x540 stays <= scene (1.0x)
+    CHECK(near_f(gpu::compute_attachment_scale(960, 540, T2D, 0, false, 1, 1, 1.0f, 2.0f, 1920, 0, true, 2160), 1.0f));
+}
+
+NXTEST(scale_viewport_info_for_overlay) {
+    nxrt::nvn::GameViewportInfo gvi;
+    gvi.render_w = 1280; gvi.render_h = 720;
+    gvi.base_w = 3840; gvi.base_h = 2160;
+    // 4K Native: 1280x720 * 3.0 = 3840x2160 against 3840x2160 (100%, not 33%)
+    auto v4k = nxrt::nvn::scale_viewport_info(gvi, 3.0f, 2.0f, 2160);
+    CHECK_EQ(v4k.render_w, 3840u);
+    CHECK_EQ(v4k.render_h, 2160u);
+    CHECK_EQ(v4k.base_w, 3840u);
+    CHECK_EQ(v4k.base_h, 2160u);
+    // 1440p Quality: 1280x720 * 4/3 = 1707x960 against 2560x1440
+    auto v1440 = nxrt::nvn::scale_viewport_info(gvi, 4.0f / 3.0f, 4.0f / 3.0f, 1440);
+    CHECK_EQ(v1440.render_w, 1707u);
+    CHECK_EQ(v1440.render_h, 960u);
+    CHECK_EQ(v1440.base_w, 2560u);
+    CHECK_EQ(v1440.base_h, 1440u);
+    // Console mode (no scaling): unchanged
+    auto vcon = nxrt::nvn::scale_viewport_info(gvi, 1.0f, 1.0f, 0);
+    CHECK_EQ(vcon.render_w, 1280u);
+    CHECK_EQ(vcon.base_w, 3840u);
+}
+
+// Regression guard for #53: HUD-less copy format must track present's UNORM (SDR) vs sRGB (HDR) view selection.
+NXTEST(hudless_copy_format_matches_hdr_and_sdr) {
+    CHECK_EQ(gpu::hudless_copy_format(VK_FORMAT_R8G8B8A8_UNORM, false), VK_FORMAT_R8G8B8A8_UNORM);
+    CHECK_EQ(gpu::hudless_copy_format(VK_FORMAT_R8G8B8A8_SRGB, false), VK_FORMAT_R8G8B8A8_UNORM);
+    CHECK_EQ(gpu::hudless_copy_format(VK_FORMAT_B8G8R8A8_SRGB, false), VK_FORMAT_B8G8R8A8_UNORM);
+    CHECK_EQ(gpu::hudless_copy_format(VK_FORMAT_R8G8B8A8_UNORM, true), VK_FORMAT_R8G8B8A8_SRGB);
+    CHECK_EQ(gpu::hudless_copy_format(VK_FORMAT_B8G8R8A8_UNORM, true), VK_FORMAT_B8G8R8A8_SRGB);
+    CHECK_EQ(gpu::hudless_copy_format(VK_FORMAT_R16G16B16A16_SFLOAT, true), VK_FORMAT_R16G16B16A16_SFLOAT);
+}
+
+// Who gets the copy of the window texture before the UI: HDR every frame, frame generation after its DLSS evaluation.
+NXTEST(hudless_copy_rules) {
+    Rig r;
+    if (!bring_up(r)) {
+        CHECK(false);
+        return;
+    }
+    {
+        Tex x, bad;
+        CHECK(make_tex(x, info(NVN_TEXTURE_TARGET_2D, 64, 32, 1, 1, NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_DISPLAY)));
+        CHECK(make_tex(bad, info(NVN_TEXTURE_TARGET_2D, 64, 32, 1, 1, NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_DISPLAY)));   // no GPU image
+        Texture* t = x.t.get();
+        Tex other;
+        CHECK(make_tex(other, info(NVN_TEXTURE_TARGET_2D, 64, 32, 1, 1, NVN_FORMAT_RGBA8)));
+        nxrt::nvn::be::Window w;
+        w.textures.push_back(x.t);
+        w.textures.push_back(bad.t);
+        gpu::run_frame_sync([&](Frame& f) {
+            gpu::tex_ensure_current(t, f);
+            gpu::tex_transition(t, f, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            gpu::hudless_end_present(&w, false);   // learns the window's textures
+
+            // nobody asks: no copy
+            CHECK(!gpu::hudless_candidate(t, true));
+            // HDR asks every frame: the first blended draw into a window texture is copied, once
+            gpu::hudless_want_every_frame(true);
+            CHECK(!gpu::hudless_candidate(t, false));
+            CHECK(!gpu::hudless_candidate(other.t.get(), true));
+            CHECK(gpu::hudless_candidate(t, true));
+            const uint64_t n0 = gpu::hudless_capture_count();
+            gpu::hudless_capture(f, t);
+            CHECK_EQ(gpu::hudless_capture_count(), n0 + 1);
+            CHECK(!gpu::hudless_candidate(t, true));
+            // frame generation's first ask drops that copy: its own comes from the next blended draw; a second ask keeps it
+            gpu::hudless_want_this_frame();
+            CHECK(gpu::hudless_candidate(t, true));
+            gpu::hudless_capture(f, t);
+            CHECK_EQ(gpu::hudless_capture_count(), n0 + 2);
+            gpu::hudless_want_this_frame();
+            CHECK(!gpu::hudless_candidate(t, true));
+            CHECK(gpu::hudless_view(t, f, false) != VK_NULL_HANDLE);
+            CHECK(gpu::hudless_view(other.t.get(), f, false) == VK_NULL_HANDLE);
+            gpu::hudless_end_present(&w, false);
+
+            // with frame generation's ask alone (HDR off), a frame gets a copy only after the ask
+            gpu::hudless_want_every_frame(false);
+            CHECK(!gpu::hudless_candidate(t, true));
+            gpu::hudless_want_this_frame();
+            CHECK(gpu::hudless_candidate(t, true));
+            gpu::hudless_end_present(&w, false);
+
+            // a failed copy blocks the rest of the frame, and the next ask tries again
+            gpu::hudless_want_every_frame(true);
+            CHECK(gpu::hudless_candidate(bad.t.get(), true));
+            gpu::hudless_capture(f, bad.t.get());
+            CHECK(gpu::hudless_failed_this_frame());
+            CHECK(!gpu::hudless_candidate(t, true));
+            gpu::hudless_want_this_frame();
+            CHECK(!gpu::hudless_failed_this_frame());
+            CHECK(gpu::hudless_candidate(t, true));
+            gpu::hudless_end_present(&w, false);
+            CHECK(!gpu::hudless_failed_this_frame());
+            gpu::hudless_want_every_frame(false);
+        });
+        gpu::finish();
+        gpu::run_on_render_thread([] { gpu::hudless_shutdown(); });
+    }
+    teardown(r);
+}
+
+// ---- device_lost: stop recording/capturing and drain defer_destroy closures (#81, #41) -----------------------------------------------
+NXTEST(device_lost_drains_deferred_and_stops_recording) {
+    // Validation is disabled here because simulating note_device_lost() on a live VkDevice queries vkGetDeviceFaultInfoEXT,
+    // which the validation layer rejects (VUID-vkGetDeviceFaultInfoEXT-device-07336) when the hardware device is not truly lost.
+    no_cache();
+    DeviceDesc dd;
+    dd.validation = 0;
+    dd.headless = 1;
+    std::string err;
+    std::unique_ptr<Device> dev = Device::create(dd, &err);
+    if (!dev) {
+        CHECK_MSG(false, err);
+        return;
+    }
+    const uint64_t baseline_allocs = dev->memory_stats().allocations;
+    REQUIRE(gpu::init_for_test(*dev, nullptr));
+    {
+        dev->note_device_lost(VK_ERROR_DEVICE_LOST, "unit test simulated device loss");
+        CHECK(dev->device_lost());
+
+        int destroyed = 0;
+        gpu::defer_destroy([&] { ++destroyed; });
+
+        int recorded = 0;
+        const uint64_t s1 = gpu::run_frame_sync([&](Frame&) { ++recorded; });
+        CHECK_EQ(recorded, 0);
+        CHECK_EQ(destroyed, 1);
+        CHECK(gpu::serial_done(s1));
+
+        const uint64_t s2 = gpu::submit({});
+        CHECK(s2 > s1);
+        CHECK(gpu::serial_done(s2));
+        CHECK(gpu::wait_serial(s2, 1000000ull));
+        CHECK(gpu::mirror_capture_take() == nullptr);
+    }
+    gpu::finish();
+    gpu::run_on_render_thread([] { gpu::tex_shutdown(); });
+    gpu::shutdown_for_test();
+    CHECK_EQ(dev->memory_stats().allocations, baseline_allocs);
+    dev.reset();
 }

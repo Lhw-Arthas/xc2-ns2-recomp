@@ -8,6 +8,7 @@ Exit code 0 when every check passes. Run it before committing and after pulling;
 checks that can run without the game files.
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -105,7 +106,7 @@ def check_ascii_inputs(files):
 
 
 # The checkout has one shape. A new top-level entry is a decision, not something a script leaves behind:
-# build outputs, logs and scratch have their own trees outside it (E:\\XC2), linked in when needed.
+# build outputs, logs and scratch have their own trees outside the checkout, linked in when needed.
 TOP_LEVEL_DIRS = {".github", "config", "docs", "launcher", "licenses", "third_party", "tools", "xc2"}
 TOP_LEVEL_FILES = {
     ".editorconfig", ".gitattributes", ".gitignore", "AGENTS.md", "CHANGELOG.md", "CONTRIBUTING.md", "LICENSE",
@@ -151,11 +152,57 @@ def check_cmd_crlf(files):
     return (not bad, bad)
 
 
+PRIVATE_TEXT_EXEMPT = {
+    ".github/workflows/ci.yml",
+    "tools/ci/check_invariants.py",
+    "tools/tests/test_tools_ci.py",
+}
+PRIVATE_PATH_PATTERNS = [
+    ("user profile path", re.compile(r"[A-Za-z]:\\Users\\[A-Za-z0-9._-]+")),
+    ("maintainer drive path", re.compile(r"[A-Za-z]:\\(?:XC2|Tools)(?:[-\\/]|$)", re.IGNORECASE)),
+    ("maintainer checkout path", re.compile(r"Xenoblade 2 Switch 2 Edition recomp")),
+    ("maintainer NAS sync script", re.compile(r"sync-to-nas", re.IGNORECASE)),
+]
+PRIVATE_INTERNAL_FILE_REF = re.compile(r"docs/internal/(?:handover|analysis)/\S+")
+PRIVATE_INTERNAL_ALLOWED = {"AGENTS.md", "tools/agent-brief.ps1"}
+
+
+def find_private_path_leaks(rel_path, text):
+    """Return a list of '<rel_path>:<line>: <reason>' matches for private path leaks."""
+    norm = rel_path.replace("\\", "/").lstrip("./")
+    if norm in PRIVATE_TEXT_EXEMPT or norm.startswith("third_party/"):
+        return []
+    hits = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        for label, pat in PRIVATE_PATH_PATTERNS:
+            if pat.search(line):
+                hits.append("%s:%d: %s (%s)" % (norm, lineno, label, line.strip()[:90]))
+        if norm not in PRIVATE_INTERNAL_ALLOWED and PRIVATE_INTERNAL_FILE_REF.search(line):
+            hits.append("%s:%d: internal handover/analysis ref (%s)" % (norm, lineno, line.strip()[:90]))
+    return hits
+
+
+def check_no_personal_or_maintainer_paths(files):
+    bad = []
+    for f in files:
+        norm = f.replace("\\", "/")
+        if norm in PRIVATE_TEXT_EXEMPT or norm.startswith("third_party/") or not os.path.isfile(f):
+            continue
+        with open(f, "rb") as fh:
+            raw = fh.read()
+        if b"\x00" in raw:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        bad.extend(find_private_path_leaks(norm, text))
+    return (not bad, bad)
+
+
 CHECKS = [
     ("nothing private is tracked", check_private_not_tracked),
     ("no game data is tracked", check_game_data),
     ("no ExeFS module is tracked", check_no_extension_exefs),
     ("shipped hook tables carry no game bytes", check_sites_have_no_game_bytes),
+    ("no personal or maintainer paths", check_no_personal_or_maintainer_paths),
     ("the root has one known shape", check_top_level),
     ("no source tree is ignored", check_no_hidden_trees),
 ]

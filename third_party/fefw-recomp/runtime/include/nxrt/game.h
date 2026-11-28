@@ -48,6 +48,7 @@ struct Info {
                                             // fails instead and the game moves on as after a skip
     bool movie_video_decoder = false;       // Switch 2: the game's player takes movie::VideoDecoder from its movie module; the host one decodes
                                             // AV1 into the player's CPU frames (media/movie_vdec.cpp, [media] movies = host; skip = the above)
+    bool frame_gen_hudless_default = false; // enable [dlss] frame_gen_hudless when the config key is absent (title draws UI into the window texture after DLSS eval)
     bool vi_hdr_status_sdr = false;         // Switch 2: nn::vi::QueryDisplayHdrStatus answers an SDR display on the host (core/switch2.cpp)
     int present_interval_hz = 0;            // the game paces itself by the console's vsync and steps its logic by a fixed amount per frame:
                                             // the frame limiter holds it to this rate / the NVN window's present interval (60: interval 2 is

@@ -21,6 +21,8 @@
 // overlap rule of nvn_cmd_handles.cpp ends it. [nvn] cmdmem_callback = false never calls the game and always falls back.
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 
 #include "nvn_cmd.h"
 #include "nvn_impl.h"
@@ -30,6 +32,7 @@
 #include "nxrt/log.h"
 
 namespace nxrt::nvn {
+void gprof_note_recording(int64_t elapsed_ns, uint32_t cmds);
 using namespace be;
 namespace {
 
@@ -101,7 +104,10 @@ void request(CommandBuffer* cb, int event, uint64_t min_size) {
     t_pending.cb = cb;
     if (event == kEventCommand) { if (!t_pending.cmd) t_pending.cmd_min = min_size; t_pending.cmd = true; }
     else { if (!t_pending.ctl) t_pending.ctl_min = min_size; t_pending.ctl = true; }
-    abi::t_cmdmem_pending = true;
+    if (!abi::t_cmdmem_pending) {
+        abi::t_cmdmem_pending = true;
+        abi::g_cmdmem_pending_count.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 uint64_t control_end(const CommandBuffer* cb) { return cb->control_total > kCtlJumpReserve ? cb->control_total - kCtlJumpReserve : 0; }
@@ -283,6 +289,63 @@ size_t nvnCommandBufferGetControlMemoryFree(const NVNcommandBuffer* c) { const C
 
 }  // namespace
 
+// Pooled uninitialized byte buffer for CmdList (nvn_cmd.h): recycles buffers across recording / replay threads so
+// guest-83 avoids malloc/free heap contention and per-record std::vector zero-fills across ~45k commands/frame.
+namespace {
+struct CmdBufPool {
+    std::mutex mu;
+    struct Entry { uint8_t* ptr; size_t cap; };
+    std::vector<Entry> free_list;
+    ~CmdBufPool() {
+        for (const Entry& e : free_list) std::free(e.ptr);
+        free_list.clear();
+    }
+};
+CmdBufPool& cmd_buf_pool() {
+    static CmdBufPool p;
+    return p;
+}
+}  // namespace
+
+void be::CmdBytes::reserve(size_t need) {
+    if (need <= cap) return;
+    if (!ptr) {
+        CmdBufPool& pool = cmd_buf_pool();
+        std::lock_guard<std::mutex> lk(pool.mu);
+        for (size_t i = pool.free_list.size(); i-- > 0;) {
+            if (pool.free_list[i].cap >= need) {
+                ptr = pool.free_list[i].ptr;
+                cap = pool.free_list[i].cap;
+                pool.free_list[i] = pool.free_list.back();
+                pool.free_list.pop_back();
+                return;
+            }
+        }
+    }
+    const size_t new_cap = (need + 4095u) & ~size_t(4095u);
+    uint8_t* p = static_cast<uint8_t*>(std::realloc(ptr, new_cap));
+    if (!p) std::abort();
+    ptr = p;
+    cap = new_cap;
+}
+
+void be::CmdBytes::release() {
+    if (!ptr) return;
+    if (cap >= 16384 && cap <= (4u << 20)) {
+        CmdBufPool& pool = cmd_buf_pool();
+        std::lock_guard<std::mutex> lk(pool.mu);
+        if (pool.free_list.size() < 64) {
+            pool.free_list.push_back({ptr, cap});
+            ptr = nullptr;
+            len = cap = 0;
+            return;
+        }
+    }
+    std::free(ptr);
+    ptr = nullptr;
+    len = cap = 0;
+}
+
 // Charges one record (nvn_cmd.h).
 void be::cmdmem_charge(CommandBuffer* cb, Op op, uint32_t blob_size) {
     switch (op) {
@@ -303,7 +366,10 @@ void be::cmdmem_charge(CommandBuffer* cb, Op op, uint32_t blob_size) {
 
 // Runs the callback this thread queued (from the thunk, after the NVN call, no lock held).
 void abi::cmdmem_run_pending(::Ctx* c) {
-    abi::t_cmdmem_pending = false;
+    if (abi::t_cmdmem_pending) {
+        abi::t_cmdmem_pending = false;
+        abi::g_cmdmem_pending_count.fetch_sub(1, std::memory_order_relaxed);
+    }
     const Pending p = t_pending;
     t_pending = Pending{};
     if (!p.cb) return;
@@ -361,6 +427,7 @@ void nvnCommandBufferBeginRecording(NVNcommandBuffer* c) {
     if (!cb) return;
     std::lock_guard<std::mutex> lk(cb->lock);
     cb->rec = Ref<CmdList>(new CmdList());
+    cb->rec->bytes.reserve(32768);
     cb->rec->meter = cb;
     cb->recording = true;
     cb->tpool = nullptr;
@@ -370,6 +437,7 @@ void nvnCommandBufferBeginRecording(NVNcommandBuffer* c) {
     cb->rec_block_end = cb->last_block_addr + cb->command_total;
     cb->rec_serial = cb->cmd_serial;
     cb->rec_unbacked = !cb->last_block_addr || cb->cmd_full;
+    cb->rec_start_ns = std::chrono::steady_clock::now().time_since_epoch().count();
     ctl_need(cb, 16);
 }
 
@@ -377,10 +445,13 @@ NVNcommandHandle nvnCommandBufferEndRecording(NVNcommandBuffer* c) {
     CommandBuffer* cb = cb_of(c);
     if (!cb) return 0;
     Ref<CmdList> list;
+    int64_t rec_start_ns = 0;
     {
         std::lock_guard<std::mutex> lk(cb->lock);
         if (!cb->recording || !cb->rec) return 0;
         list = std::move(cb->rec);
+        rec_start_ns = cb->rec_start_ns;
+        cb->rec_start_ns = 0;
         cb->recording = false;
         cb->tpool = nullptr;
         list->meter = nullptr;
@@ -413,16 +484,21 @@ NVNcommandHandle nvnCommandBufferEndRecording(NVNcommandBuffer* c) {
         }
     }
     const uint64_t h = handle_register(list);
-    std::lock_guard<std::mutex> lk(cb->lock);
-    cb->handles.push_back(h);
-    if (cb->handles.size() > 4096) cb->handles.erase(cb->handles.begin(), cb->handles.begin() + 2048);   // old ones are dropped by region anyway
+    {
+        std::lock_guard<std::mutex> lk(cb->lock);
+        cb->handles.push_back(h);
+        if (cb->handles.size() > 4096) cb->handles.erase(cb->handles.begin(), cb->handles.begin() + 2048);   // old ones are dropped by region anyway
+    }
+    if (rec_start_ns) {
+        const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        if (now_ns > rec_start_ns) gprof_note_recording(now_ns - rec_start_ns, list->record_count);
+    }
     return h;
 }
 
 void nvnCommandBufferCallCommands(NVNcommandBuffer* c, int count, const NVNcommandHandle* handles) {
     CommandBuffer* cb = cb_of(c);
     if (!cb || count <= 0 || !handles) return;
-    std::lock_guard<std::mutex> lk(cb->lock);
     if (!cb->recording || !cb->rec) return;
     P_CallCommands p{static_cast<uint32_t>(count), 0};
     cb->rec->emit(Op::CallCommands, p, handles, static_cast<uint32_t>(count) * 8u);
@@ -439,7 +515,7 @@ void nvnCommandBufferCopyCommands(NVNcommandBuffer* c, int count, const NVNcomma
         if (!src) continue;
         cmd_need(cb, src->hw_bytes);   // the console copies the command words
         cb->rec->hw_bytes += src->hw_bytes;
-        cb->rec->bytes.insert(cb->rec->bytes.end(), src->bytes.begin(), src->bytes.end());
+        cb->rec->bytes.append_bytes(src->bytes.data(), src->bytes.size());
         cb->rec->record_count += src->record_count;
         cb->rec->draw_count += src->draw_count;
         for (auto& h : src->held) cb->rec->held.push_back(h);

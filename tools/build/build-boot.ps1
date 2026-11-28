@@ -53,7 +53,7 @@ foreach ($m in 'subsdk1', 'subsdk2', 'subsdk3') { $p = Join-Path $libdir ($m + '
 # needs the library even though nothing in this exe mentions vpx - without it the link stops at nine vpx_codec_* symbols.
 # A runtime configured without libvpx (NXRT_HAVE_LIBVPX=0, see runtime/cmake/media_deps.cmake) references none of them,
 # which is why a missing library is a warning and not an error. Same search order as tools/build/build-release.ps1.
-$vpxRoots = @($env:VCPKG_ROOT, 'E:\Tools\dev\vcpkg', 'C:\vcpkg') | Where-Object { $_ }
+$vpxRoots = @($env:VCPKG_ROOT, 'C:\vcpkg') | Where-Object { $_ }
 $vpxLibs = @()
 foreach ($vpxRoot in $vpxRoots) {
     $cand = Join-Path $vpxRoot 'installed\x64-windows-static\lib\vpx.lib'
@@ -89,6 +89,13 @@ foreach ($f in $need) { if (-not (Test-Path $f)) { throw "missing $f (build it f
 $obj = Join-Path $bd 'xc2_boot.obj'
 $objOpus = Join-Path $bd 'x2_opus301.obj'
 $objAudio = Join-Path $bd 'x2_audio301.obj'
+$objNav = Join-Path $bd 'xc2_nav_overlay.obj'
+$objNavMesh = Join-Path $bd 'xc2_nav_mesh.obj'
+$objVoiceDb = Join-Path $bd 'xc2_voice_db.obj'
+$objVoiceDir = Join-Path $bd 'xc2_voice_director.obj'
+$objVoiceRen = Join-Path $bd 'xc2_voice_renderer.obj'
+$objVoiceHooks = Join-Path $bd 'xc2_voice_hooks.obj'
+$objVoiceOvl = Join-Path $bd 'xc2_voice_overlay.obj'
 # The headers of the pinned third-party libraries. CMake's FetchContent extracts them into the build directory
 # (build\runtime-gfx\_deps\<name>-src); an older layout kept them under third_party\deps\src. Look in both, and say
 # what was expected when neither is there: a clean clone that skipped the runtime configure used to fail here with a
@@ -112,10 +119,18 @@ $vma = Find-Dep 'VulkanMemoryAllocator' @(
 $sdlinc = Find-Dep 'SDL3' @(
     (Join-Path $depsDir 'sdl3-src\include'),
     (Join-Path $repo 'third_party\deps\src\sdl3\SDL3-3.4.18\include'))
+# The build stamp the runtime logs (xc2\src\xc2_boot.cpp): the nearest tag and the commit, so a log says which build
+# ran without a literal anyone has to remember to bump. -Defines may override it.
+if ($Defines -notmatch 'XC2_BUILD_STAMP') {
+    $stamp = ''
+    try { $stamp = (& git -C $repo describe --tags --always --dirty 2>$null | Select-Object -First 1) } catch { }
+    if (-not $stamp) { $stamp = 'unknown' }
+    $Defines = ($Defines + ' XC2_BUILD_STAMP="' + $stamp.Trim() + '"').Trim()
+}
 $defArgs = @()
 if ($Defines) { foreach ($d in $Defines.Split(' ')) { if ($d) { $defArgs += "/D$d" } } }
 & clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\xc2_boot.cpp') "/Fo$obj" @defArgs `
-    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$rt\runtime\src\gfx\play" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
 if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_boot.cpp' }
 & clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\x2_opus301.cpp') "/Fo$objOpus" @defArgs `
     "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
@@ -123,6 +138,27 @@ if ($LASTEXITCODE -ne 0) { throw 'compile failed: x2_opus301.cpp' }
 & clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\x2_audio301.cpp') "/Fo$objAudio" @defArgs `
     "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
 if ($LASTEXITCODE -ne 0) { throw 'compile failed: x2_audio301.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\xc2_nav_overlay.cpp') "/Fo$objNav" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_nav_overlay.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\xc2_nav_mesh.cpp') "/Fo$objNavMesh" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_nav_mesh.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_db.cpp') "/Fo$objVoiceDb" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_db.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_director.cpp') "/Fo$objVoiceDir" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_director.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_renderer.cpp') "/Fo$objVoiceRen" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_renderer.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_hooks.cpp') "/Fo$objVoiceHooks" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_hooks.cpp' }
+& clang-cl.exe /nologo /std:c++20 /O2 /MT /c (Join-Path $root 'src\voice\xc2_voice_overlay.cpp') "/Fo$objVoiceOvl" @defArgs `
+    "/I$nxinc" "/I$rt\runtime\include" "/I$rt\runtime\games" "/I$volk" "/I$vkinc" "/I$vma" "/I$sdlinc"
+if ($LASTEXITCODE -ne 0) { throw 'compile failed: xc2_voice_overlay.cpp' }
 
 # FFmpeg's hardware movie decoder (runtime/src/media/video_ffmpeg.cpp): nxrt.lib references avcodec/avutil when the
 # runtime was configured with NXRT_FFMPEG_DIR, so the link needs the same two import libraries.
@@ -175,14 +211,14 @@ $exe = Join-Path $bd 'xc2_boot.exe'
 # backtrace instead of printing bare offsets. Without it a dump says "xc2_boot+0x8383d" and nothing else - and the PDB of this
 # exe is 492 MB and only exists for the MSVC release build, never for this one (2026-11-22).
 $mapFile = Join-Path $bd 'xc2_boot.map'
-& clang-cl.exe /nologo /MT "/Fe:$exe" $obj $objOpus $objAudio @iconRes `
+& clang-cl.exe /nologo /MT "/Fe:$exe" $obj $objOpus $objAudio $objNav $objNavMesh $objVoiceDb $objVoiceDir $objVoiceRen $objVoiceHooks $objVoiceOvl @iconRes `
     "$gfxDir\nxrt_gfx.lib" "$gfxDir\nxrt.lib" "$game\nxrt_game_xc2ns2_core.lib" "$game\nxrt_game_xc2ns2_data.lib" `
     $mainlib (Join-Path $libdir 'sdk.lib') `
     (Join-Path $libdir 'subsdk0.lib') (Join-Path $libdir 'rtld.lib') @extraLibs @vpxLibs @vorbisLibs @ffLibs `
     "$gfxDir\nxrt_imgui.lib" "$gfxDir\nxrt_volk.lib" "$gfxDir\nxrt_tiling.lib" "$gfxDir\nxrt_astc2bc7.lib" "$gfxDir\nxrt_zstd.lib" `
     "$gfxDir\_deps\sdl3-build\SDL3-static.lib" "$gfxDir\third_party\dav1d\nxrt_dav1d.lib" `
     kernel32.lib user32.lib gdi32.lib winmm.lib imm32.lib ole32.lib oleaut32.lib version.lib uuid.lib advapi32.lib `
-    setupapi.lib shell32.lib dinput8.lib psapi.lib /link "/MAP:$mapFile"
+    setupapi.lib shell32.lib dinput8.lib psapi.lib /link "/MAP:$mapFile" "/HIGHENTROPYVA:NO"
 if ($LASTEXITCODE -ne 0) { throw 'link failed' }
 Write-Host ("boot exe: {0} ({1:N1} MB)" -f $exe, ((Get-Item $exe).Length / 1MB))
 

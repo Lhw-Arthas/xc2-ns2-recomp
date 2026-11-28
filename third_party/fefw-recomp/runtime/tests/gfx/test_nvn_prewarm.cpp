@@ -331,3 +331,71 @@ NXTEST(cache_saved_while_running) {
     CHECK(size > 0);
     app.shutdown();
 }
+
+// should_save_pipeline_cache policy (#49 Intel igvk64 vkGetPipelineCacheData guard).
+NXTEST(pipeline_cache_save_policy) {
+    CHECK(!gpu::should_save_pipeline_cache("auto", 0x8086u));
+    CHECK(!gpu::should_save_pipeline_cache("", 0x8086u));
+    CHECK(gpu::should_save_pipeline_cache("auto", 0x1002u));
+    CHECK(gpu::should_save_pipeline_cache("auto", 0x10DEu));
+    CHECK(gpu::should_save_pipeline_cache("true", 0x8086u));
+    CHECK(gpu::should_save_pipeline_cache("1", 0x8086u));
+    CHECK(!gpu::should_save_pipeline_cache("false", 0x1002u));
+    CHECK(!gpu::should_save_pipeline_cache("0", 0x10DEu));
+}
+
+// Runtime GPL cache handle is distinct from the persisted cache handle, and [nvn] pipeline_cache_save = 0 skips disk writes on real Vulkan.
+NXTEST(cache_handles_separated_and_opt_out_respected) {
+    TempDir td;
+    const fs::path keys = td.path / "pipeline_keys.bin", cache = td.path / "pipeline_cache.bin";
+    PrewarmConfig cfg(keys, cache);
+    struct SaveCfg {
+        std::string prev;
+        explicit SaveCfg(const char* v) : prev(nxrt::config_get_str("nvn", "pipeline_cache_save", "auto")) {
+            nxrt::config_set("nvn", "pipeline_cache_save", v);
+        }
+        ~SaveCfg() { nxrt::config_set("nvn", "pipeline_cache_save", prev.c_str()); }
+    };
+
+    {
+        SaveCfg sc("0");
+        App::Opts o;
+        o.width = 64;
+        o.height = 48;
+        App app;
+        REQUIRE(app.init(o));
+        VkPipelineCache persisted = gpu::pipeline_cache_handle();
+        VkPipelineCache gpl = gpu::pipeline_library_cache_handle();
+        CHECK(persisted != VK_NULL_HANDLE);
+        CHECK(gpl != VK_NULL_HANDLE);
+        CHECK(persisted != gpl);
+        gpu::note_pipeline_created(5.0, "test-gpl", false);
+        CHECK(!gpu::pipeline_cache_dirty());
+        gpu::note_pipeline_created(5.0, "test-whole", true);
+        CHECK(!gpu::pipeline_cache_dirty());   // opted out by pipeline_cache_save = 0
+        gpu::pipeline_cache_save();
+        app.shutdown();
+        std::error_code ec;
+        CHECK(!fs::exists(cache, ec));
+    }
+
+    {
+        SaveCfg sc("1");
+        App::Opts o;
+        o.width = 64;
+        o.height = 48;
+        App app;
+        REQUIRE(app.init(o));
+        CHECK(gpu::pipeline_cache_handle() != VK_NULL_HANDLE);
+        gpu::note_pipeline_created(5.0, "test-gpl", false);
+        CHECK(!gpu::pipeline_cache_dirty());   // non-persisted GPL part does not dirty disk cache
+        gpu::note_pipeline_created(5.0, "test-whole", true);
+        CHECK(gpu::pipeline_cache_dirty());
+        gpu::pipeline_cache_save();
+        CHECK(!gpu::pipeline_cache_dirty());
+        app.shutdown();
+        std::error_code ec;
+        CHECK(fs::exists(cache, ec));
+        CHECK(fs::file_size(cache, ec) > 0);
+    }
+}

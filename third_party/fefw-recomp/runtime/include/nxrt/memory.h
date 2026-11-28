@@ -28,6 +28,7 @@ constexpr uint64_t kHeapMax = 0x300000000ull;       // 12 GiB for the heap view 
 constexpr uint64_t kAliasBase = 0x2000000000ull;
 constexpr uint64_t kAliasSize = 0x2000000000ull;    // 128 GiB: [0x2000000000, 0x4000000000)
 uint64_t alias_base();   // kAliasBase when host-free, else a host-free 128 GiB aligned window in [0x0800000000, kMainBase)
+void release_alias_guard();   // drop init()'s placeholder guard so alias granules/views can map MEM_FREE host pages
 constexpr uint64_t kStackBase = 0x7C00000000ull;    // guest thread stacks handed out by the runtime
 constexpr uint64_t kStackSize = 0x100000000ull;
 constexpr uint64_t kKernelBase = 0x7E00000000ull;   // TLS regions, main-thread stack, kernel-owned memory

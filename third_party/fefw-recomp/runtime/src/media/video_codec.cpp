@@ -56,6 +56,7 @@
 #include "nxrt/log.h"
 #include "nxrt/module.h"
 #include "nxrt/video_codec.h"
+#include "nv12_convert.h"
 #include "video_nvdec.h"
 #include "video_ffmpeg.h"
 
@@ -70,6 +71,7 @@ namespace nxrt::media {
 void player_trace_new_film();   // movie_trace.cpp: reset this film's stall-dump budget and clock
 void player_trace_eos();        // movie_trace.cpp: the marker is out; re-arm the dump for what happens after it
 void movie_adec_film_end();     // movie_adec.cpp: this placeholder track ends with the picture, not on its own
+void movie_adec_video_advanced(); // movie_adec.cpp: wake any decoder waiting on the video-PTS gate
 }
 
 #if NXRT_HAVE_LIBVPX
@@ -341,9 +343,8 @@ struct Decoder {
     bool started = false;                                 // between Start*Decoder and Stop*Decoder: only then is input "ready"
     bool eos_pending = false;                             // end of stream seen, but the pictures before it have not all gone
     bool eos_queued = false;                              // the end-of-stream marker is already queued: the client resubmits it endlessly
+    bool film_end_signaled = false;                       // end-of-stream cleanup already ran (EOS packet or finalize)
 
-    std::vector<uint8_t> last;                            // last decoded picture (NV12) for the end-of-stream buffer
-    uint16_t last_w = 0, last_h = 0;
     uint64_t pictures = 0;
 };
 
@@ -434,13 +435,13 @@ void av1_close(Decoder& d) {
     if (d.av1) dav1d_close(&d.av1);
     d.av1 = nullptr;
 }
-// Opens dav1d for the codec 10 decoders. max_frame_delay 1: one packet in, one picture out, which is the shape nn::codec's
-// Submit/Acquire pair has (the movie library acquires an output buffer per submitted packet).
+// Opens dav1d for the codec 10 decoders. max_frame_delay 0 lets dav1d choose frame-level parallelism (ceil(sqrt(n_threads)))
+// alongside tile threads; delayed frames drain on flush/EOS and acquire_output primes startup when queued packets exist.
 bool av1_open(Decoder& d) {
     Dav1dSettings s;
     dav1d_default_settings(&s);
     s.n_threads = g_threads;
-    s.max_frame_delay = 1;
+    s.max_frame_delay = 0;
     if (dav1d_open(&d.av1, &s) < 0) {
         d.av1 = nullptr;
         note_error("decoder %u: dav1d failed to start", d.id);
@@ -487,19 +488,11 @@ Picture to_nv12(const vpx_image_t* img, int64_t pts) {
     p.h = static_cast<uint16_t>((img->d_h + 1) & ~1u);
     p.pts = pts;
     const size_t w = p.w, h = p.h;
-    p.nv12.assign(w * h + w * h / 2, 0);
-    for (size_t y = 0; y < img->d_h; y++) std::memcpy(&p.nv12[y * w], img->planes[0] + y * img->stride[0], img->d_w);
-    uint8_t* uv = p.nv12.data() + w * h;
-    const size_t cw = (img->d_w + 1) / 2, ch = (img->d_h + 1) / 2;
-    for (size_t y = 0; y < ch; y++) {
-        const uint8_t* u = img->planes[1] + y * img->stride[1];
-        const uint8_t* v = img->planes[2] + y * img->stride[2];
-        uint8_t* o = uv + y * w;
-        for (size_t x = 0; x < cw; x++) {
-            o[2 * x] = u[x];
-            o[2 * x + 1] = v[x];
-        }
-    }
+    p.nv12.resize(w * h + w * h / 2);
+    i420_to_nv12(p.nv12.data(), p.w, p.h, img->d_w, img->d_h,
+                 img->planes[0], img->stride[0],
+                 img->planes[1], img->stride[1],
+                 img->planes[2], img->stride[2]);
     return p;
 }
 #endif
@@ -513,7 +506,10 @@ std::atomic<int64_t> g_film_video_pts{0};
 void place(Pool& pool, uint32_t index, const Picture& p) {
     pool.w = p.w;
     pool.h = p.h;
-    if (p.pts > g_film_video_pts.load(std::memory_order_relaxed)) g_film_video_pts.store(p.pts, std::memory_order_relaxed);
+    if (p.pts > g_film_video_pts.load(std::memory_order_relaxed)) {
+        g_film_video_pts.store(p.pts, std::memory_order_relaxed);
+        movie_adec_video_advanced();
+    }
     const size_t pw = pool.w, ph = pool.h;
     std::vector<uint8_t>& image = pool.img(index);
     image.assign(pw * ph + pw * ph / 2, 0);
@@ -635,6 +631,19 @@ void after_change(::Ctx* c, Decoder& d, bool fences) {
 // anonymous namespace so the NVN copy path can ask (api_cmd_work.cpp).
 bool media_film_active() { return g_film_active.load(std::memory_order_relaxed); }
 int64_t media_film_video_pts() { return g_film_video_pts.load(std::memory_order_relaxed); }
+
+bool media_decoder_has_backlog() {
+    std::vector<std::shared_ptr<Decoder>> decs;
+    {
+        std::lock_guard<std::mutex> lk(g_reg_mu);
+        for (auto& e : g_decoders) decs.push_back(e.second);
+    }
+    for (auto& d : decs) {
+        std::lock_guard<std::mutex> lk(d->mu);
+        if (!d->ready.empty()) return true;
+    }
+    return false;
+}
 
 // Diagnostic for the player trace's stall watchdog (no locks held by the caller): what the decoder holds, and what the client
 // is still armed on. "REACHED" means the picture is in the buffer and our signal never got out; "not reached" means no picture
@@ -789,7 +798,35 @@ void decode_into(Decoder& d, const uint8_t* data, size_t size, int64_t pts, std:
     }
 #if NXRT_HAVE_DAV1D
     if (d.codec == 10) {   // AV1 (nn::codec's Av1DecoderType): the SDK 3.0.1 movie library's video path
-        if (!data || !size) return;   // nothing to drain: max_frame_delay 1 gives a picture per packet
+        auto drain_dav1d = [&] {
+            for (;;) {
+                Dav1dPicture pic{};
+                if (dav1d_get_picture(d.av1, &pic) < 0) break;
+                if (pic.p.bpc == 8 && pic.p.layout == DAV1D_PIXEL_LAYOUT_I420) {
+                    Picture p;
+                    p.w = static_cast<uint16_t>((pic.p.w + 1) & ~1u);
+                    p.h = static_cast<uint16_t>((pic.p.h + 1) & ~1u);
+                    p.pts = pic.m.timestamp;
+                    const size_t w = p.w, h = p.h;
+                    p.nv12.resize(w * h + w * h / 2);
+                    i420_to_nv12(p.nv12.data(), p.w, p.h,
+                                 static_cast<uint32_t>(pic.p.w), static_cast<uint32_t>(pic.p.h),
+                                 static_cast<const uint8_t*>(pic.data[0]), pic.stride[0],
+                                 static_cast<const uint8_t*>(pic.data[1]), pic.stride[1],
+                                 static_cast<const uint8_t*>(pic.data[2]), pic.stride[1]);
+                    if (d.pictures++ == 0) NXLOG_I("vcodec", "decoder %u: first picture %ux%u (AV1, dav1d %s, %d threads)", d.id, p.w, p.h, dav1d_version(), g_threads);
+                    out.push_back(std::move(p));
+                    s_decoded++;
+                } else {
+                    note_error("decoder %u: AV1 picture %d bits, layout %d not handled (8-bit 4:2:0 only)", d.id, pic.p.bpc, static_cast<int>(pic.p.layout));
+                }
+                dav1d_picture_unref(&pic);
+            }
+        };
+        if (!data || !size) {
+            if (d.av1) drain_dav1d();   // drain delayed frames on flush / EOS
+            return;
+        }
         if (!d.av1 && !av1_open(d)) return;
         Dav1dData in{};
         uint8_t* b = dav1d_data_create(&in, size);
@@ -802,40 +839,7 @@ void decode_into(Decoder& d, const uint8_t* data, size_t size, int64_t pts, std:
                 note_error("decoder %u: dav1d_send_data(%zu bytes, pts %lld) failed: %d", d.id, size, static_cast<long long>(pts), r);
                 break;
             }
-            for (;;) {
-                Dav1dPicture pic{};
-                if (dav1d_get_picture(d.av1, &pic) < 0) break;
-                if (pic.p.bpc == 8 && pic.p.layout == DAV1D_PIXEL_LAYOUT_I420) {
-                    Picture p;
-                    p.w = static_cast<uint16_t>((pic.p.w + 1) & ~1u);
-                    p.h = static_cast<uint16_t>((pic.p.h + 1) & ~1u);
-                    p.pts = pic.m.timestamp;
-                    const size_t w = p.w, h = p.h;
-                    p.nv12.assign(w * h + w * h / 2, 0);
-                    const auto* py = static_cast<const uint8_t*>(pic.data[0]);
-                    for (uint32_t y = 0; y < pic.p.h; y++) std::memcpy(&p.nv12[y * w], py + static_cast<size_t>(y) * pic.stride[0], pic.p.w);
-                    uint8_t* uv = p.nv12.data() + w * h;
-                    const uint32_t cw = (pic.p.w + 1) / 2, ch = (pic.p.h + 1) / 2;
-                    const auto* pu = static_cast<const uint8_t*>(pic.data[1]);
-                    const auto* pv = static_cast<const uint8_t*>(pic.data[2]);
-                    for (uint32_t y = 0; y < ch; y++) {
-                        uint8_t* o = uv + static_cast<size_t>(y) * w;
-                        for (uint32_t x = 0; x < cw; x++) {
-                            o[2 * x] = pu[static_cast<size_t>(y) * pic.stride[1] + x];
-                            o[2 * x + 1] = pv[static_cast<size_t>(y) * pic.stride[1] + x];
-                        }
-                    }
-                    if (d.pictures++ == 0) NXLOG_I("vcodec", "decoder %u: first picture %ux%u (AV1, dav1d %s, %d threads)", d.id, p.w, p.h, dav1d_version(), g_threads);
-                    d.last = p.nv12;
-                    d.last_w = p.w;
-                    d.last_h = p.h;
-                    out.push_back(std::move(p));
-                    s_decoded++;
-                } else {
-                    note_error("decoder %u: AV1 picture %d bits, layout %d not handled (8-bit 4:2:0 only)", d.id, pic.p.bpc, static_cast<int>(pic.p.layout));
-                }
-                dav1d_picture_unref(&pic);
-            }
+            drain_dav1d();
         }
         if (in.sz) dav1d_data_unref(&in);
         return;
@@ -855,9 +859,6 @@ void decode_into(Decoder& d, const uint8_t* data, size_t size, int64_t pts, std:
         }
         Picture p = to_nv12(img, pts);
         if (d.pictures++ == 0) NXLOG_I("vcodec", "decoder %u: first picture %ux%u (VP%d, %d threads)", d.id, img->d_w, img->d_h, d.codec, g_threads);
-        d.last = p.nv12;
-        d.last_w = p.w;
-        d.last_h = p.h;
         out.push_back(std::move(p));
         s_decoded++;
     }
@@ -1132,22 +1133,47 @@ void finalize_decoder(::Ctx* c) {
     const uint64_t g = A(0);
     auto d = dec_of(g);
     if (d) {
+        bool no_live_decoders = false;
         {
             std::lock_guard<std::mutex> lk(g_reg_mu);
             g_decoders.erase(d->id);
+            no_live_decoders = g_decoders.empty();
         }
         // fences of a finalized decoder count as reached: wake whoever still waits
         for (uint64_t evt : take_reached(d->id, ~0ull)) gcall(c, os().signal_event, evt);
         if (d->submit_event_made && os().destroy_sysevent) gcall(c, os().destroy_sysevent, reinterpret_cast<uint64_t>(d->submit_event));
+        // Stop and join the worker BEFORE closing codec contexts: finalizing mid-film with pending packets
+        // would otherwise close d->av1/vpx while decode_one runs dav1d_send_data without d->mu (#52).
         {
+            std::lock_guard<std::mutex> lk(d->mu);
+            d->stop = true;
+            d->pending.clear();
+            d->ready.clear();
+            d->pend.clear();
+            d->eos_pending = false;
+        }
+        d->cv.notify_all();
+        if (d->worker.joinable()) d->worker.join();
+        {
+            std::lock_guard<std::mutex> dlk(d->dec_mu);
             std::lock_guard<std::mutex> lk(d->mu);
             vpx_close(*d);
 #if NXRT_HAVE_DAV1D
             av1_close(*d);
 #endif
+            if (d->nv) { nvdec_destroy(d->nv); d->nv = nullptr; }
+            if (d->ff) { ffdec_destroy(d->ff); d->ff = nullptr; }
+        }
+        if (!d->film_end_signaled) {
+            d->film_end_signaled = true;
+            movie_adec_film_end();
+            hitch_note_film_end();
+        }
+        if (no_live_decoders) {
+            g_film_video_pts.store(0, std::memory_order_relaxed);
+            g_film_active.store(false, std::memory_order_relaxed);
         }
         NXLOG_I("vcodec", "decoder %u finalized after %llu pictures", d->id, (unsigned long long)d->pictures);
-        g_film_active.store(false, std::memory_order_relaxed);
         s_destroyed++;
         wr64(g, 0);
         wr64(g + 8, 0);
@@ -1286,63 +1312,49 @@ void submission_event_ret(::Ctx* c) {   // (dec) -> SystemEventType*
     RET(ev);
 }
 // Decodes one queued packet into pictures (no d.mu held while the decode runs, so the player's Acquire never waits on it).
+// Holding d.dec_mu before popping from d.pending preserves strict packet order whenever both the worker and Acquire call decode_one.
 void decode_one(Decoder& d) {
-    Pending p;
-    {
-        std::lock_guard<std::mutex> lk(d.mu);
-        if (d.pending.empty()) return;
-        p = std::move(d.pending.front());
-        d.pending.pop_front();
-    }
     std::vector<Picture> out;
+    bool is_eos = false;
     {
-        std::lock_guard<std::mutex> dlk(d.dec_mu);   // the codec context and the last picture
+        std::lock_guard<std::mutex> dlk(d.dec_mu);   // serialize pop + decode so packets never overtake each other
+        Pending p;
+        {
+            std::lock_guard<std::mutex> lk(d.mu);
+            if (d.pending.empty()) return;
+            p = std::move(d.pending.front());
+            d.pending.pop_front();
+        }
+        is_eos = p.eos;
         if (!p.data.empty()) decode_into(d, p.data.data(), p.data.size(), p.pts, out);
         if (p.eos) {
+            d.film_end_signaled = true;
             player_trace_eos();   // from here no new picture is expected: the dump that follows is the hand-back, or its absence
             movie_adec_film_end();   // the placeholder audio track ends with the picture; the player's finish covers every track
-            if (d.vpx_ok) decode_into(d, nullptr, 0, p.pts, out);   // drain
-            // End of stream is a marker for the LAST picture of the stream, not a picture of its own. The player's demuxer
-            // reads the whole file in the first second and then resubmits this zero-byte packet until it is taken, so
-            // handing out a fresh eos picture here told the client the film ended at frame ~60 while hundreds of pictures
-            // were still queued behind it - and the client stopped (measured 2026-11-21). Mark the picture this packet
-            // produced, else remember it and deliver it once the queue is empty (see assign).
-            // End of stream is a marker of its own, never a flag on a picture: the SDK's players drop an output that carries
-            // the flag instead of showing it and then wait for the picture they counted on, so the movie never completes
-            // (nxnative docs/reference/movies.md, "No picture carries the end-of-stream flag", CRI Sofdec2 on Catherine:
-            // 1,140 of 1,141 pictures delivered). Every picture goes out unflagged; one output with no picture carries the
-            // flag - the drain in assign() does that.
+            if (d.vpx_ok || d.av1) decode_into(d, nullptr, 0, p.pts, out);   // drain
             d.eos_pending = true;
             NXLOG_I("vcodec", "decoder %u: end of stream after %llu pictures (%zu still queued)", d.id,
                     (unsigned long long)d.pictures, d.pending.size());
             hitch_note_film_end();   // the hitch summaries say how long ago this was, so a slow stretch after a cutscene is visible
         }
-    }
-    if (out.empty()) {
-        // The end-of-stream marker produced no picture, and every picture before it is already decoded and waiting in ready.
-        // The reference library marks the LAST HELD PICTURE (held_eos[nheld-1] = 1), not a buffer of its own: the client reads
-        // through the pictures it has and the final one tells it the stream ended. Ours waited for ready to become empty and
-        // then handed out a separate eos buffer - but the decoder runs ahead by the preload, so ready never emptied, the marker
-        // was never delivered, and the player sat on the last frame with its sound still playing, exactly like a pause
-        // (measured 2026-11-22: a five-second insert that read 124 of its 148 pictures and then waited forever).
-        if (p.eos) {
+        if (out.empty()) {
+            if (is_eos) {
+                std::lock_guard<std::mutex> lk(d.mu);
+                d.eos_pending = true;
+                NXLOG_I("vcodec", "decoder %u: end of stream waiting for the drain (%zu pictures in hand, %llu read so far)", d.id,
+                        d.ready.size(), (unsigned long long)s_read.load());
+            }
+            return;
+        }
+        {
             std::lock_guard<std::mutex> lk(d.mu);
-            // No picture is flagged (see the note where eos_pending is set): the marker waits here until every decoded
-            // picture has gone out, and assign() then hands the waiting buffer one output with no picture and the flag.
-            d.eos_pending = true;
-            NXLOG_I("vcodec", "decoder %u: end of stream waiting for the drain (%zu pictures in hand, %llu read so far)", d.id,
-                    d.ready.size(), (unsigned long long)s_read.load());
+            if (d.first_picture_ms < 0 && d.t_first_packet.time_since_epoch().count() != 0) {
+                d.first_picture_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - d.t_first_packet).count());
+                NXLOG_I("vcodec", "decoder %u: first picture %lld ms after its first packet", d.id, d.first_picture_ms);
+            }
+            for (auto& pic : out) d.ready.push_back(std::move(pic));
         }
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lk(d.mu);
-        if (d.first_picture_ms < 0 && d.t_first_packet.time_since_epoch().count() != 0) {
-            d.first_picture_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - d.t_first_packet).count());
-            NXLOG_I("vcodec", "decoder %u: first picture %lld ms after its first packet", d.id, d.first_picture_ms);
-        }
-        for (auto& pic : out) d.ready.push_back(std::move(pic));
     }
     d.cv.notify_all();
 }
@@ -1356,6 +1368,7 @@ void worker_loop(Decoder& d) {
     // picture: below normal during loading, the frame arrived 1089 ms after the acquire, the player counted it as late and
     // jumped the film forward (measured 2026-11-21). So: normal priority until a picture exists, below normal after.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+    if (g_hwdec) ffdec_prewarm();
     bool lowered = false;
     std::unique_lock<std::mutex> lk(d.mu);
     const auto born = std::chrono::steady_clock::now();
@@ -1507,7 +1520,7 @@ void acquire_output(::Ctx* c) {   // (u32* index, NativeSyncHandle* fence, dec)
             // failed, against every read under 40 ms on the runs that played (2026-11-21). Decode one packet here, outside the
             // lock, so the picture exists before the client arms anything. main has this first-frame fallback; the protocol
             // rewrite dropped it, and without it the player stalls on runs where the other acquire path gets through.
-            if (d->ready.empty() && !d->pending.empty()) {
+            for (int tries = 0; d->ready.empty() && !d->pending.empty() && !d->stop && tries < 8; ++tries) {
                 lk.unlock();
                 decode_one(*d);
                 lk.lock();
@@ -1932,11 +1945,8 @@ bool install_video_codec_hle() {
     const int64_t def_threads = std::min<int64_t>(8, std::max<int64_t>(4, static_cast<int64_t>(std::thread::hardware_concurrency()) / 2));
     g_threads = static_cast<int>(std::clamp<int64_t>(config_get_int("media", "video_decoder_threads", def_threads), 1, 16));
     g_hwdec = config_get_bool("media", "hwdec", true);
-    if (g_hwdec) {
-        // The first film frame used to wait for the D3D11 device to come up (183 ms inside a 213 ms frame on 0.1.4).
-        // Build it now, off the game's threads, so that cost lands in the loading screen instead of in the film.
-        std::thread([] { ffdec_prewarm(); }).detach();
-    }
+    // ffdec_prewarm() is deferred to worker_loop when the first movie decoder is created: running av_hwdevice_ctx_create(VULKAN)
+    // on a detached thread at t=0.001s raced the main thread's gfx::Device::create() inside amdvlk64.dll on RX 9070 XT (#42).
         // Diagnostic: the player drops a frame whose timestamp is more than a frame or so behind its own movie clock, and a software 4K
         // AV1 decode plus the pool->VideoFrame copies put every frame ~85 ms behind, so it dropped all but the first. Reporting the
         // timestamps this much later makes them look on time (at the cost of that much A/V offset).

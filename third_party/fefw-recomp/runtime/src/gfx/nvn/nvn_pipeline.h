@@ -34,11 +34,25 @@ struct BindingDesc {
     int nvn_stage = 0;                          // NVNshaderStage of that module (0 vertex, 1 fragment, 2 geometry, 5 compute)
 };
 
+struct DescTemplateSlot {
+    union {
+        VkDescriptorBufferInfo buf;
+        VkDescriptorImageInfo img;
+        VkBufferView texel;
+    };
+};
+
 struct ProgLayout {
     VkDescriptorSetLayout sets[5] = {};         // 0..3 the program's own; kPoolSet (4) the shared pool arrays, when a stage samples through them
+    VkDescriptorUpdateTemplate templates[4] = {};   // bulk descriptor update templates (sets 0..3, VK_NULL_HANDLE if fallback needed)
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::vector<BindingDesc> bindings;          // every used descriptor of every stage, sorted by (set, binding)
+    std::vector<uint32_t> set_binding_idx[4];   // indices into `bindings` per descriptor set (0..3), matching templates[set] 1:1 (preserves resolve_memo!)
+    std::vector<uint32_t> sampler_binding_idx;  // indices into `bindings` for SamplerBinding/HandleInUniform COMBINED_IMAGE_SAMPLER
+    std::vector<uint32_t> prep_tex_idx;         // indices into `bindings` for STORAGE_IMAGE + COMBINED_IMAGE_SAMPLER (fast prepare_textures)
     bool has_sampler = false;                   // some binding is a combined image sampler (feedback_prepare can skip the others)
+    bool has_sampler_3d = false;                // some binding is a 3D combined image sampler (vol3d_prepare skips all others in O(1))
+    bool has_storage_writes = false;            // some binding is a storage buffer or storage image
     bool has_set[5] = {};
     VkShaderStageFlags push_stages = 0;         // push constant range [0, push_bytes) of generated stages (ShaderInfo::push_bytes); 0 = none
     uint32_t push_bytes = 0;
@@ -48,6 +62,9 @@ struct ProgLayout {
     // Set 0 is pushed and nothing outside it depends on the uniform buffers (no texture handle read from a uniform block): a draw whose
     // only change is a uniform buffer binding pushes set 0 again and keeps the other sets it has bound ([nvn] ubo_only_rebind).
     bool ubo_only = false;
+    bool has_handle_in_ubo = false;             // some binding reads a texture handle from a uniform block (HandleInUniform)
+    uint16_t ubo_mask[6] = {};                  // bit k: stage uses UBO slot k (NS1 XC2_BIND_SKIP port)
+    uint16_t ssbo_mask[6] = {};                 // bit k: stage uses SSBO slot k
 };
 
 // [nvn] push_uniforms (default true): programs whose set 0 fits the device's push descriptor limit push it (ProgLayout::push_set0). False when the
@@ -56,6 +73,7 @@ bool push_uniforms_on();
 
 // Stages by NVN stage index (0 vertex, 1 fragment, 2 geometry, 5 compute); null = absent.
 const ProgLayout* prog_layout(const ShaderInfo* const stages[6]);
+uint64_t prog_layout_gen();
 
 // Vertex input for the key.
 struct KeyAttr {
@@ -87,10 +105,13 @@ struct GraphicsKey {
     uint8_t xfb = 0;                            // the vertex shader runs with transform feedback (captured outputs, no fragment stage)
     uint8_t dual_src = 0;                       // a blend factor of an enabled attachment reads the second source (fragment output moved to Location 0, Index 1)
     uint8_t no_out = 0;                         // the pass has no colour attachment: the fragment shader's outputs become private variables
-    uint8_t pad[0 + 1] = {};
+    uint8_t sdr_tone_map = 0;                   // HDR scene shown as SDR: a patched tone-map shader runs as the game's own (extras/hdr_live.h)
     // Tessellation control and evaluation stages (null: none). Last, so that the prewarm key file keeps its record layout (it records the bytes
     // before these and never a tessellated key). A key with them has topology PATCH_LIST and patch_control_points = the NVN patch size.
     const ShaderInfo* tess[2] = {};
+    // Fragment refl.bindings bitmask (indices < 64) declared Float but fed with unsigned integer colour textures (R8_UINT/R16_UINT/R32_UINT).
+    // Kept after tess[] so nvn_prewarm's kRestBytes record layout stays unchanged.
+    uint64_t uint_samplers = 0;
     bool operator==(const GraphicsKey& o) const;
     uint64_t hash() const;
 };
@@ -116,7 +137,9 @@ const VkPipelineDynamicStateCreateInfo* pipeline_dynamic_state();
 // The pNext of every translated shader stage: robust uniform buffer access ([nvn] robust_ubo), or null when off or not supported.
 const void* ubo_robustness();
 VkPipelineCache pipeline_cache_handle();
-void note_pipeline_created(double ms, const char* what);   // counters and the dirty flag of the cache file
+VkPipelineCache pipeline_library_cache_handle();
+void note_pipeline_created(double ms, const char* what, bool persisted = true);   // counters and the dirty flag of the cache file
+bool should_save_pipeline_cache(const std::string& mode, uint32_t vendor_id);
 
 // Pipeline cache on disk ([nvn] pipeline_cache): written by a background thread while new pipelines appear and at shutdown.
 bool pipeline_cache_dirty();
@@ -233,6 +256,7 @@ using PrepareResult = nxrt::nvn::ShaderPrepareResult;
 bool gpl_prepare(const PrepareOptions& o, PrepareResult* r);       // false: nothing could be done (see r->error)
 void module_cache_clear();                                          // destroys every cached shader module and variant (nothing may be creating pipelines)
 
+bool early_fragment_tests_active();   // true when hardware EarlyFragmentTests is injected for all storage-image fragment shaders
 void pipeline_shutdown();
 size_t pipeline_count();
 
@@ -245,20 +269,7 @@ inline std::atomic<int>& compiles_in_flight() {
 void configure_guest_subgroup(VkPipelineShaderStageCreateInfo& stage,
                               VkPipelineShaderStageRequiredSubgroupSizeCreateInfo& size);
 
-inline VkResult create_graphics_pipeline_tracked(VkDevice dev, VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* gi, VkPipeline* out) {
-    compiles_in_flight().fetch_add(1, std::memory_order_relaxed);
-    const uint64_t t0 = nxrt::hitch_ticks();
-    // Centralised here so whole pipelines, GPL parts and prewarm workers agree.
-    auto info = *gi;
-    std::vector<VkPipelineShaderStageCreateInfo> stages;
-    std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> sizes(gi->stageCount);
-    if (gi->stageCount) stages.assign(gi->pStages, gi->pStages + gi->stageCount);
-    for (size_t i = 0; i < stages.size(); ++i) configure_guest_subgroup(stages[i], sizes[i]);
-    info.pStages = stages.data();
-    const VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &info, nullptr, out);
-    if (nxrt::hitch_on_render_thread()) nxrt::hitch_phase_add(nxrt::kHpRenderPipeline, nxrt::hitch_ticks() - t0);
-    compiles_in_flight().fetch_sub(1, std::memory_order_relaxed);
-    return r;
-}
+VkResult create_graphics_pipeline_tracked(VkDevice dev, VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* gi, VkPipeline* out);
+VkResult create_compute_pipeline_tracked(VkDevice dev, VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* out);
 
 }  // namespace nxrt::nvn::be::gpu

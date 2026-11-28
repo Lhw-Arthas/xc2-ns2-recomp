@@ -1,34 +1,28 @@
 # STATUS — dated milestones
 
-A short, dated record of what this project reached and when. The detailed evidence for every line lives in
-the §-numbered sections named on the right (internal notes).
+A dated record of verified milestones and active limits. Detailed public records live in
+[CHANGELOG.md](CHANGELOG.md), [docs/RELEASE-0.2.1.md](docs/RELEASE-0.2.1.md), [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md),
+and [docs/reports/](docs/reports/).
 
-| date | milestone | evidence |
+| date | milestone | public reference |
 |---|---|---|
-| 2026-11-09 | first static lift of a Switch title (4 modules, 90,691 functions) and the NVN → Vulkan replay rendering a frame | §1–§20 |
-| 2026-11-10 | models/materials: block-linear layouts, tile modes, texture formats, the deferred pass | §21–§30 |
-| 2026-11-11 | lighting: light lists, probe volumes, the integer render-target logic op | §31–§41 |
-| 2026-11-12 | volumetric fog pipeline identified; first 60 Hz experiments | §42–§51 |
-| 2026-11-13 | early-Z mask fix, 1080p output, replay phase split, 60/120 Hz pacing | §44–§56 |
-| 2026-11-14 | frame-rate census, pkg7 (Switch 2 add-on) analysis, DLC chain | §58–§88 |
-| 2026-11-15 | **retail 3.0.1 route boots**: 128 GiB alias region (VAMM), Opus + `nn::audio` HLE, the tensor-core upscaler translated (Ampere SASS), in-game at **30.0 fps**; full shader cache **21,171**; `earlyz_mask`; the logic-op "read your own output" fix; **quad_split** (cloud-sea shimmer on the title screen) | §89–§90 |
-| 2026-11-16 | rim audit — depth filter, shadow map, gather rounding, upscalers each tested and excluded (§91); cloud-shimmer quantified and the fog-composite dither ruled out (§92); **the game's three DLSS networks decoded**, FSR 4.1.2 / 3.1 selectable through one DLL, 1440p identified as the only fully 1:1 chain (§93) | §91–§93 |
-| 2026-11-16 | **the amdvlk crash is solved**: a FidelityFX context must never be reused across input sizes — the game's dynamic resolution (960x540 .. 1280x720) changes the size every few dozen frames and amdvlk dies on the barrier a few milliseconds later. One context per size (up to six, LRU) gives FSR 4.1.2 for 122 s over 24 size changes with no crash, 30.0 fps and a 1% low of 24.8-27.5 | §95.19 |
-| 2026-11-16 | **the replay is cut from 9.7-15.4 ms to 5.3-6.8 ms**: four diagnostic `std::getenv` calls inside `build_key()` cost 1.2 us/draw (the pipe phase went 1.46 to 0.29 us/draw), and a `config_get_bool("fb_debug")` that `feedback_prepare` ran once per sampler binding cost the rest of that phase (1.0-1.9 to 0.06 us/draw). `hot_int` twice a draw, a clock read per draw in `skip_fs_draw`, the leftover per-read `trace_stack_file` hook and a shader dump that rewrote 7,600 files per session are gone too. A memo written independently after reading xc2-recomp's `feedback_scan` (no code copied) never disagreed with a fresh scan (0 mismatches) but hardly ever hits, because this engine rebinds its textures for every draw. The remaining slow frames (59-69 ms) are texture uploads and lock waits, not the replay | §96 |
-| 2026-11-16 | **60 fps at 1080p, and FSR 4.1.2 proven safe under dynamic resolution**: `play-301.cmd -60` (the old `play60.cmd` only ever started the early NS2 dev build). The port holds **59.7 fps, 1% low 51.3** on TAAU and **59.7 / 50.8** on FSR 4.1.2 hot-switched inside the same session, so FSR 4 is not the cost. Six FidelityFX contexts over the game's resolution steps with **0 crashes** close §95.19. The heaviest open plain is **~4,400 draws/frame**, where the replay is **9 ms** and the game holds **43-52 fps** (it was 16 ms and 34-40 before the two upstream replay switches below) | §97 |
-| 2026-11-16 | **the amdvlk crash is pinned to one instruction**: the ICD is Adrenalin's own `amdvlk64.dll` (the only one registered), RADV does not exist on Windows, and the fault lands in `vkCmdPipelineBarrier` on the barrier list FSR 4.1.2's `ffxDispatch` records — 4 crashes in 21 min of FSR 4.1.2 against 0 in 236 min of FSR 3.1.6 / TAAU, and the FidelityFX barrier list itself proven clean — so the default upscaler is back to FSR 3.1.6 (`[upscale] fsr_version = 3.1`), with a FidelityFX barrier watchdog (`[upscale] barrier_check`) kept for the record. **Superseded the same day**: one FidelityFX context per input size fixed it (see the row above). The default upscaler stays **TAAU**; FSR 4.1.2 is selectable and measured no slower here | §95 |
+| 2026-11-09 | First static lift of a Switch title (4 modules, 90,691 functions) and NVN → Vulkan replay rendering a frame | [LIFT-REPORT.md](docs/reports/LIFT-REPORT.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| 2026-11-10 | Models & materials: block-linear layouts, tile modes, texture formats, deferred pass | [ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| 2026-11-11 | Lighting pipeline: light lists, probe volumes, integer render-target logic op | [ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| 2026-11-12 | Volumetric fog pipeline identified; initial 60 Hz pacing experiments | [PATCHES.md](tools/shader/PATCHES.md) |
+| 2026-11-13 | Early-Z mask fix, 1080p output, replay phase split, 60/120 Hz pacing | [MODIFICATIONS.md](third_party/fefw-recomp/MODIFICATIONS.md) |
+| 2026-11-14 | Frame-rate census, Switch 2 add-on (`pkg7`) analysis, DLC mount chain | [COMPATIBILITY.md](docs/COMPATIBILITY.md) |
+| 2026-11-15 | **Retail 3.0.1 route boots**: 128 GiB alias region (`VammManager`), Opus + `nn::audio` HLE, tensor-core upscaler translated (Ampere SASS), 30.0 fps in-game; shader cache 21,171; `earlyz_mask`, logic-op fix, `quad_split` | [LIFT-REPORT.md](docs/reports/LIFT-REPORT.md) · [BUILD.md](docs/BUILD.md) |
+| 2026-11-16 | **Dynamic resolution FidelityFX fix & replay hot-path optimization**: one LRU FidelityFX context per input size (6 contexts across `960x540`..`1280x720`, 0 crashes), replay trimmed from `9.7–15.4 ms` to `5.3–6.8 ms`; 1080p/1440p **60 Hz** (`59.7 fps`, 1% low `51.3` on TAAU, `59.7 / 50.8` on FSR 4.1.2; heaviest open plain ~4,400 draws at `43–52 fps`) | [COMPATIBILITY.md](docs/COMPATIBILITY.md) · [BENCHMARK-301.md](docs/reports/BENCHMARK-301.md) |
+| 2026-11-17 – 2026-11-22 | **Portable releases (`v0.1.0`–`v0.2.1`)**: Tauri launcher, self-contained setup, official DLSS & FSR downloaders, 4K AV1 hardware video, RDNA 2 cloud-sea rim & shimmer fix, 8 GB VRAM `mirror_capture`, #37 audio crackling fix | [CHANGELOG.md](CHANGELOG.md) · [RELEASE-0.2.1.md](docs/RELEASE-0.2.1.md) · [#30](https://github.com/weile10000/xc2-ns2-recomp/pull/30) · [#36](https://github.com/weile10000/xc2-ns2-recomp/pull/36) |
+| 2026-11-23 | **Mod support M2/M2b verified**: RomFS file overlay, `bf2.ard` inline record patching, and `ard_tail` appended replacement with patched `bf2.arh` (`xbc1` 48-byte headers) | [MODS.md](docs/MODS.md) |
+| 2026-11-24 | **`v0.2.3` release**: M4 Mods UI / DMNT Cheats VM, `#15` morph flicker root fix (`spirv_harness`), cutscene freeze fixes (`movie_adec` coalesced wakeup + `#35` CPU recovery + `#42` 9070 XT prewarm + PR `#48`), `#44` RTX 40 shadow bias fix, `#47`/`#39` 4K `DLAA`/`Quality` restore, `#45` CETCompat, `spirv_uint_samplers` ordering fix | [RELEASE-0.2.3.md](docs/RELEASE-0.2.3.md) · [COMPATIBILITY.md](docs/COMPATIBILITY.md) |
+| 2026-11-24 | **`v0.2.4` release**: `#53` FSR 3 FG `HUDLessColor` + HDR parity, `temporal_ffx` FSR `3.1` default + `4.*` dynres `slots_` isolation, F10 dual FPS HUD + wrap fix, `#49` Intel `vkGetPipelineCacheData` fix, `#51`/`#54` opt-in `depth_bias_force_unorm`, `#52` `dav1d` EOS/SSE2, `#55`/`#56` dynres fixes, `#57` HDR highlight expansion, `#58` PS 5.1 fallback + custom `game_dir`, 1080p native TAAU docked baseline, Frame Gen all-GPU & visual notice | [RELEASE-0.2.4.md](docs/RELEASE-0.2.4.md) · [COMPATIBILITY.md](docs/COMPATIBILITY.md) |
+| 2026-11-25 | **`v0.2.5` maintenance & diagnostic release**: runtime `#54`/`#44`/`#39`/`#61`/`#62`/`#64` depth-stencil float→`usampler` rewrite + `Op::Barrier` feedback fix (`6242d23`), SPIR-V unsigned/unattached output validation cleanup (`8048d6e`), `#41` `pVendorBinaryData` null-crash fix + `VK_NV_device_diagnostic_checkpoints` / `VK_EXT_device_fault` / `*_devicelost.txt` diagnostics & `report.py` collection (`010fc5e`, `94cb026`), `#50` F1 controller Top/Bottom boundary nav | [RELEASE-0.2.5.md](docs/RELEASE-0.2.5.md) · [COMPATIBILITY.md](docs/COMPATIBILITY.md) |
 
 ## Current limits
 
-* The window defaults to 2560×1440 so the chain is 1:1 (720p → 1440p → present). A 1080p window adds a second
-  full-screen resample with no image-quality gain, so it is a low-end option, not the default (§97.12).
-* The game's internal chain tops out at 2560×1440; 4K output is an upscale of that.
-* The 3D DLSS network is fixed at 1280×720 → 2560×1440 in every mode and cannot be lowered from configuration.
-* The blue-grey rim where objects meet the cloud sea and the residual cloud-sea shimmer are both properties of the
-  game's 640×360 volumetric fog; the platform-level suspects were tested and excluded (§91, §92).
-* Slow frames come from texture uploads and guest/host lock waits (§90.21).
-* The open plain reaches about 4,400 draws/frame with a replay of 9 ms and 43-52 fps; the frame time there is
-  18-23 ms against a 16.7 ms budget, so a solid 60 fps needs 1.5-6 ms more depending on the spot — the 2 ms
-  figure quoted above was the best case only (the 5,200 draw / 16 ms numbers are the superseded measurement, §97).
-* The window is 2560x1440 by default; 4K costs nothing extra because the internal chain is fixed at 1440p and the
-  last step is a blit.
+* **Default window (`1920×1080`)**: as of `v0.2.4`, fresh setups default to a clean docked **1080p Native TAAU (`lock_render_size = 1`, `60 fps`, `frame_gen = 0`)** baseline; `1440p` / `4K` output modes and upscalers (FSR 3/4, DLSS) remain selectable in Launcher / F1 Settings.
+* **Open plain GPU/CPU load**: reaches ~4,400 draws/frame (`~9 ms` replay CPU time, `18–23 ms` total frame time = `43–52 fps` on RX 6800 XT); VRR (`fifo_relaxed`) or future draw-batching optimizations target closing the `1.5–6 ms` gap to locked 60 fps.
+* **Texture uploads & pool imports**: area transitions can still introduce occasional hitch frames while streaming pools import and pipelines warm.
+* **GPU vendor coverage & NVIDIA TDR blocker**: primary verification is on AMD RDNA 2; NVIDIA has a dedicated tracking blocker for driver TDR / `VK_ERROR_DEVICE_LOST` hangs in `nvoglv64.dll` (`nvn-render` stalling under high-concurrency particle/transition loads ending around `fs be528292f3d04f1b`, tracked across [#32](https://github.com/weile10000/xc2-ns2-recomp/issues/32), [#41](https://github.com/weile10000/xc2-ns2-recomp/issues/41), and [#59](https://github.com/weile10000/xc2-ns2-recomp/issues/59)). See [COMPATIBILITY.md](docs/COMPATIBILITY.md).

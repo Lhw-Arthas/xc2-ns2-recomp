@@ -282,6 +282,8 @@ std::string build_report(const EXCEPTION_RECORD* rec, const CONTEXT* cx, DWORD t
 
     // The last 30 s of frame times: what the game was doing before it went wrong.
     out += frame_times_summary(30.0);
+    // Registered non-blocking GPU/replay reports (draw_ring, NVN backend state).
+    out += diag_extra_reports();
     return out;
 }
 

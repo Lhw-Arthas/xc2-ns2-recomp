@@ -45,6 +45,7 @@
 #include "nxrt/module.h"
 #include "nxrt/movie_vdec.h"
 #include "nxrt/services.h"
+#include "nv12_convert.h"
 
 #if NXRT_HAVE_DAV1D
 #include <dav1d/dav1d.h>
@@ -193,14 +194,7 @@ std::vector<Decoder*> g_reg;
 
 // I420 to NV12, rows packed at the picture's width, chroma interleaved.
 void to_nv12(uint8_t* o, uint32_t w, uint32_t h, const uint8_t* py, ptrdiff_t sy, const uint8_t* pu, const uint8_t* pv, ptrdiff_t suv) {
-    const uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
-    for (uint32_t r = 0; r < h; ++r) std::memcpy(o + static_cast<uint64_t>(r) * w, py + static_cast<ptrdiff_t>(r) * sy, w);
-    uint8_t* q = o + static_cast<uint64_t>(w) * h;
-    for (uint32_t r = 0; r < ch; ++r) {
-        const uint8_t* u = pu + static_cast<ptrdiff_t>(r) * suv;
-        const uint8_t* v = pv + static_cast<ptrdiff_t>(r) * suv;
-        for (uint32_t x = 0; x < cw; ++x) { *q++ = u[x]; *q++ = v[x]; }
-    }
+    i420_to_nv12(o, w, h, w, h, py, sy, pu, suv, pv, suv);
 }
 
 uint64_t nv12_size(uint32_t w, uint32_t h) { return static_cast<uint64_t>(w) * h + static_cast<uint64_t>((w + 1) / 2) * 2 * ((h + 1) / 2); }
@@ -316,23 +310,9 @@ void flush_signal(Decoder& d) {
     kernel::signal_system_event(reinterpret_cast<uint64_t>(d.out_ev));
 }
 
-// Decodes one packet into pictures (worker thread, without the lock). `av1` is the worker's own context.
+// Decodes one packet (or drains delayed pictures when k.data is empty) into pictures (worker thread, without the lock).
 void decode_packet(Decoder& d, Dav1dContext* av1, const Packet& k, std::vector<Picture>& out) {
-    Dav1dData in{};
-    uint8_t* b = dav1d_data_create(&in, k.data.size());
-    if (!b) {
-        NXLOG_E(kTag, "out of memory for a %zu-byte packet", k.data.size());
-        return;
-    }
-    std::memcpy(b, k.data.data(), k.data.size());
-    in.m.timestamp = k.time;
-    for (int guard = 0; in.sz && guard < 64; ++guard) {
-        const int r = dav1d_send_data(av1, &in);
-        if (r < 0 && r != DAV1D_ERR(EAGAIN)) {
-            if (!d.warned_error) NXLOG_E(kTag, "AV1 decode error %d (packet at %lld): its data is dropped", r, static_cast<long long>(k.time));
-            d.warned_error = true;
-            break;
-        }
+    auto drain = [&] {
         for (;;) {
             Dav1dPicture p{};
             if (dav1d_get_picture(av1, &p) < 0) break;
@@ -351,6 +331,27 @@ void decode_packet(Decoder& d, Dav1dContext* av1, const Packet& k, std::vector<P
             }
             dav1d_picture_unref(&p);
         }
+    };
+    if (k.data.empty()) {
+        drain();
+        return;
+    }
+    Dav1dData in{};
+    uint8_t* b = dav1d_data_create(&in, k.data.size());
+    if (!b) {
+        NXLOG_E(kTag, "out of memory for a %zu-byte packet", k.data.size());
+        return;
+    }
+    std::memcpy(b, k.data.data(), k.data.size());
+    in.m.timestamp = k.time;
+    for (int guard = 0; in.sz && guard < 64; ++guard) {
+        const int r = dav1d_send_data(av1, &in);
+        if (r < 0 && r != DAV1D_ERR(EAGAIN)) {
+            if (!d.warned_error) NXLOG_E(kTag, "AV1 decode error %d (packet at %lld): its data is dropped", r, static_cast<long long>(k.time));
+            d.warned_error = true;
+            break;
+        }
+        drain();
     }
     if (in.sz) dav1d_data_unref(&in);
 }
@@ -359,7 +360,7 @@ Dav1dContext* open_av1(Decoder& d, const std::vector<uint8_t>& config) {
     Dav1dSettings s;
     dav1d_default_settings(&s);
     s.n_threads = g_threads;
-    s.max_frame_delay = 1;   // a picture per packet: the player's output event wants no decoder delay
+    s.max_frame_delay = 0;   // auto frame parallelism (ceil(sqrt(n_threads))); drained on k.eos
     Dav1dContext* av1 = nullptr;
     if (dav1d_open(&av1, &s) < 0) {
         NXLOG_E(kTag, "dav1d failed to start");
@@ -401,6 +402,7 @@ void worker_main(Decoder* d) {
         std::vector<Picture> out;
         if (reopen) av1 = open_av1(*d, config);
         if (k.eos) {
+            if (av1) decode_packet(*d, av1, Packet{}, out);
             out.emplace_back();
             out.back().eos = true;
         } else if (av1) {
@@ -1027,5 +1029,14 @@ bool install_movie_decoder_hle() {
 #endif
 
 bool movie_decoder_enabled() { return g_enabled; }
+
+bool is_movie_playing() {
+#if NXRT_HAVE_DAV1D
+    std::lock_guard<std::mutex> lk(g_reg_mu);
+    return !g_reg.empty();
+#else
+    return false;
+#endif
+}
 
 }  // namespace nxrt::media

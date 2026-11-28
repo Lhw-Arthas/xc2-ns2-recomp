@@ -28,8 +28,7 @@ if (-not (Test-Path -LiteralPath $LiftDir)) { throw "lift dir not found: $LiftDi
 
 if (-not $Demangler) {
     foreach ($cand in @('llvm-cxxfilt.exe', 'llvm-cxxfilt') + @(
-            (Join-Path $env:ProgramFiles 'LLVM\bin\llvm-cxxfilt.exe'),
-            'E:\Tools\dev\llvm\bin\llvm-cxxfilt.exe')) {
+            (Join-Path $env:ProgramFiles 'LLVM\bin\llvm-cxxfilt.exe'))) {
         $c = Get-Command $cand -ErrorAction SilentlyContinue
         if ($c) { $Demangler = $c.Source; break }
         if ($cand -and (Test-Path -LiteralPath $cand)) { $Demangler = $cand; break }

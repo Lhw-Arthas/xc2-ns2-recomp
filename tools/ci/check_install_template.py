@@ -25,6 +25,10 @@ OVERRIDE = {
     # The package ships the 60 fps arrangement: `[xc2] fps = 0` would keep the console's 30 Hz step, and
     # `fps_interval = 2` (the default) is what turns 60 into one present per vsync.
     ("xc2", "fps"): "the package ships 60 fps (fps_interval = 2), not the console's 30 Hz step",
+    # Baseline quality preset: lock dynamic resolution to the top rung alongside [upscale] render_quality = native
+    # so the portable install serves as a crisp 1080p native TAAU baseline out of the box.
+    ("upscale", "lock_render_size"): "the package baseline locks dynamic resolution alongside 1080p native TAAU",
+    ("hdr", "mode"): "match launcher default (enable HDR only when Windows reports HDR active on the display)",
 }
 
 SECTION_RE = re.compile(r"^\[([^\]]+)\]\s*$")

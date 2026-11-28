@@ -400,7 +400,7 @@ void sample_npad(HidState& s, uint8_t* host, uint32_t idx, const InputSnapshot& 
                             bad_logged);
                 }
             } else if ((n % 900) == 0) {
-                NXLOG_W("hid", "pad %u state: l %d %d r %d %d buttons %llx style %x attributes %x", idx, in.left.x, in.left.y, in.right.x,
+                NXLOG_D("hid", "pad %u state: l %d %d r %d %d buttons %llx style %x attributes %x", idx, in.left.x, in.left.y, in.right.x,
                         in.right.y, static_cast<unsigned long long>(in.buttons | stick_buttons(in.left, in.right)), tag, attributes_of_tag(tag));
             }
         }

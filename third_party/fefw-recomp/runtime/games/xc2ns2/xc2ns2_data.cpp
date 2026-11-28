@@ -27,6 +27,7 @@ const game::Info& data_info() {
         // logs the value the game asks for.
         g.nvn_api_minor = 30;
         g.present_interval_hz = 0;             // XC2 paces itself; set once the boot log shows its vsync handling
+        g.frame_gen_hudless_default = true;    // XC2 draws its HUD directly (blended) onto the window texture after DLSS eval (#53)
         g.exe_name = "xc2ns2.exe";
         g.setup_exe_name = "xc2ns2_setup.exe";
         g.launcher_ini = "xc2ns2_launcher.ini";

@@ -14,7 +14,9 @@ as-is. It never kills a game you started yourself; with --seconds it stops the o
 Pure standard library, so the Python that ships in the package runs it. No PowerShell, no .NET.
 """
 import argparse
+import ctypes
 import datetime
+import json
 import os
 import re
 import subprocess
@@ -70,14 +72,16 @@ def run_game(args):
 
     env = dict(os.environ)
     env.update(read_env(os.path.join(ROOT, "launch.env")))
-    env["NXRT_GFX_VALIDATION"] = "1"
+    if not args.no_validation:
+        env["NXRT_GFX_VALIDATION"] = "1"
     env["NXRT_NVN_DS_DEBUG"] = "1"
     env["NXRT_NVN_FS_DEBUG"] = "1"
     env["NXRT_NVN_FRAME_CSV"] = csv
     lang = ini_language()
     if lang:
         env["NXRT_SYSTEM_LANGUAGE"] = lang
-    os.makedirs(os.path.dirname(os.path.join(ROOT, "nxrt.log")), exist_ok=True)
+    ini_log = os.path.join(ROOT, "nxrt.log")
+    os.makedirs(os.path.dirname(ini_log), exist_ok=True)
     env["NXRT_INI"] = os.path.join(ROOT, "nxrt.ini")
     t0 = time.time()
     argv = [exe, "--exefs", exefs, "--gfx", "headless" if args.headless else "window", "--log", log]
@@ -86,6 +90,7 @@ def run_game(args):
     p = subprocess.Popen(argv, cwd=ROOT, env=env)
     # A frozen game never exits, and a report is worth most exactly then: stop when the log has not grown for --stall
     # seconds (a frozen render thread writes nothing), or after --seconds when one is given.
+    # Packaged xc2_boot.exe ignores --log and writes to <install>/nxrt.log, so watch both paths to avoid false 60 s kills.
     stall = max(10, args.stall)
     last_size, last_change = -1, time.time()
     try:
@@ -93,10 +98,13 @@ def run_game(args):
             if args.seconds and time.time() - t0 >= args.seconds:
                 print("stopping after %d s" % args.seconds)
                 break
-            try:
-                size = os.path.getsize(log)
-            except OSError:
-                size = last_size
+            size = -1
+            for cand in (log, ini_log):
+                try:
+                    if os.path.getmtime(cand) >= t0 - 2.0:
+                        size = max(size, os.path.getsize(cand))
+                except OSError:
+                    pass
             if size != last_size:
                 last_size, last_change = size, time.time()
             elif time.time() - last_change >= stall:
@@ -137,6 +145,51 @@ def section(out_dir, name, lines):
     return path
 
 
+def collect_flags(lines):
+    """5-second triage flags: highlight non-default / external conditions at the top of environment.txt."""
+    flags = []
+    # 1. CPU affinity check on Windows (catches manual core pinning like #82)
+    if sys.platform == "win32":
+        try:
+            proc_mask = ctypes.c_size_t()
+            sys_mask = ctypes.c_size_t()
+            h = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.kernel32.GetProcessAffinityMask(h, ctypes.byref(proc_mask), ctypes.byref(sys_mask)):
+                allowed = bin(proc_mask.value).count("1")
+                total = bin(sys_mask.value).count("1")
+                if total > 0 and allowed < total:
+                    flags.append("FLAG: CPU affinity restricted (%d/%d logical cores)" % (allowed, total))
+        except Exception:
+            pass
+    # 2. Runtime vs link/prefill stamp check (catches mixed builds after upgrade)
+    rt_dll = os.path.join(ROOT, "runtime", "xc2_rt.dll")
+    if os.path.isfile(rt_dll):
+        try:
+            st = os.stat(rt_dll)
+            cur = {"size": st.st_size, "mtime": int(st.st_mtime)}
+            for label, rel in (("link-stamp", "link-stamp.json"), ("prefill-stamp", "prefill-stamp.json")):
+                sp = os.path.join(ROOT, "build", rel)
+                if os.path.isfile(sp):
+                    got = json.loads(open(sp, encoding="utf-8").read())
+                    if got.get("size") != cur["size"] or got.get("mtime") != cur["mtime"]:
+                        flags.append("FLAG: %s mismatch vs runtime/xc2_rt.dll (mixed build?)" % label)
+        except Exception:
+            pass
+    # 3. Mods / ExeFS patches present
+    mods_dir = os.path.join(ROOT, "mods")
+    if os.path.isdir(mods_dir):
+        mods = sorted(d for d in os.listdir(mods_dir)
+                      if not d.startswith(".") and os.path.isdir(os.path.join(mods_dir, d)))
+        if mods:
+            flags.append("FLAG: %d mod folder(s) present: %s" % (len(mods), ", ".join(mods[:8])))
+    if os.path.isdir(os.path.join(ROOT, "build", "exefs-patched")):
+        flags.append("FLAG: build/exefs-patched present (ExeFS code patches applied)")
+    # 4. Vulkan validation actually active (impacts performance measurements)
+    if any("validation on," in l for l in lines):
+        flags.append("FLAG: Vulkan validation layer was ACTIVE in this run (perf numbers are lower than normal)")
+    return flags
+
+
 def main():
     ap = argparse.ArgumentParser(description="Collect one diagnostics report into a zip.")
     ap.add_argument("--headless", action="store_true", help="no window")
@@ -144,6 +197,7 @@ def main():
     ap.add_argument("--stall", type=int, default=60, help="stop when the log has not grown for this many seconds (a frozen game)")
     ap.add_argument("--from-log", default="", help="package this log instead of running the game")
     ap.add_argument("--exe", default="", help="the game executable (default: <install>\\xc2_boot.exe)")
+    ap.add_argument("--no-validation", action="store_true", help="do not force NXRT_GFX_VALIDATION=1 (better for perf captures)")
     ap.add_argument("--no-zip", action="store_true")
     args = ap.parse_args()
 
@@ -191,17 +245,25 @@ def main():
 
     # 4. what was running
     env_lines = []
+    flags = collect_flags(lines)
+    if flags:
+        env_lines.append("triage flags:")
+        for fl in flags:
+            env_lines.append("  " + fl)
+    else:
+        env_lines.append("triage flags: none")
     exe = args.exe or os.path.join(ROOT, "xc2_boot.exe")
     if os.path.isfile(exe):
         st = os.stat(exe)
         env_lines.append("exe        %s  %.1f MB  %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
                                                         st.st_size / 1048576.0, exe))
-    ini = os.path.join(ROOT, "nxrt.ini")
-    if os.path.isfile(ini):
-        env_lines.append("ini        %s" % ini)
-        for l in open(ini, encoding="utf-8", errors="ignore"):
-            if l.strip():
-                env_lines.append("  " + l.rstrip())
+    for ini_name in ("nxrt.ini", "controls.ini"):
+        ini = os.path.join(ROOT, ini_name)
+        if os.path.isfile(ini):
+            env_lines.append("%-10s %s" % (ini_name, ini))
+            for l in open(ini, encoding="utf-8", errors="ignore"):
+                if l.strip():
+                    env_lines.append("  " + l.rstrip())
     env_lines.append("serial     %s" % os.path.join(ROOT, "shader_cache", "spirv"))
     if os.path.isdir(os.path.join(ROOT, "shader_cache", "spirv")):
         env_lines.append("  %d shader(s)" % len([f for f in os.listdir(os.path.join(ROOT, "shader_cache", "spirv")) if f.endswith(".spv")]))
@@ -214,6 +276,22 @@ def main():
             with open(src, "rb") as a, open(os.path.join(out_dir, name), "wb") as b:
                 b.write(a.read())
 
+    # Include recent freeze / crash / device-lost dumps written beside the exe or install root.
+    dump_dirs = [ROOT]
+    exe_dir = os.path.dirname(os.path.abspath(exe))
+    if exe_dir and exe_dir != ROOT:
+        dump_dirs.append(exe_dir)
+    ref_time = os.path.getmtime(log) if os.path.isfile(log) else started
+    for dname in ("xc2_boot_freeze.txt", "xc2_boot_crash.txt", "xc2_boot_devicelost.txt"):
+        for d in dump_dirs:
+            cand = os.path.join(d, dname)
+            if not os.path.isfile(cand):
+                continue
+            if os.path.getmtime(cand) >= min(started, ref_time) - 300.0:
+                with open(cand, "rb") as a, open(os.path.join(out_dir, dname), "wb") as b:
+                    b.write(a.read())
+                break
+
     readme = """Rendering report, %s
 
 run.log            the whole log of one run
@@ -222,6 +300,7 @@ features.txt       the capability lines the driver reported
 device-lost.txt    anything that says the device went away (empty is good)
 environment.txt    the exe, the ini, the shader cache, the toolchain
 frame-times.csv    one line per presented frame (only with --headless)
+xc2_boot_*.txt     freeze / crash / device-lost dumps from the run (when generated)
 
 Attach the zip to the issue as-is. Nothing here is game data: it is the log, the settings and the timing.
 """ % stamp

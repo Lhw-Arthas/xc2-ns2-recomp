@@ -541,3 +541,136 @@ NXTEST(predict_int_inputs_from_the_code) {
     CHECK(gpu::spirv_predict_int_inputs(std::vector<uint32_t>{1u, 2u}).empty());
 }
 
+NXTEST(uint_samplers_rewrites_float_sampler_to_uint_with_bitcast) {
+    // Minimal fragment shader with two combined image samplers at set=2 binding=129 (target) and binding=128 (untouched):
+    //   OpCapability Shader
+    //   OpMemoryModel Logical GLSL450
+    //   OpEntryPoint Fragment %main "main"
+    //   OpDecorate %v0 DescriptorSet 2
+    //   OpDecorate %v0 Binding 128
+    //   OpDecorate %v1 DescriptorSet 2
+    //   OpDecorate %v1 Binding 129
+    //   %void = OpTypeVoid
+    //   %fn = OpTypeFunction %void
+    //   %f32 = OpTypeFloat 32
+    //   %v2f = OpTypeVector %f32 2
+    //   %v4f = OpTypeVector %f32 4
+    //   %img = OpTypeImage %f32 2D 0 0 0 1 Unknown
+    //   %simg = OpTypeSampledImage %img
+    //   %ptr = OpTypePointer UniformConstant %simg
+    //   %v0 = OpVariable %ptr UniformConstant
+    //   %v1 = OpVariable %ptr UniformConstant
+    //   %c0 = OpConstant %f32 0
+    //   %uv = OpConstantComposite %v2f %c0 %c0
+    //   %main = OpFunction %void None %fn
+    //   %lbl = OpLabel
+    //   %l0 = OpLoad %simg %v0
+    //   %s0 = OpImageSampleImplicitLod %v4f %l0 %uv
+    //   %l1 = OpLoad %simg %v1
+    //   %s1 = OpImageSampleImplicitLod %v4f %l1 %uv
+    //   OpReturn
+    //   OpFunctionEnd
+    const uint32_t magic = 0x07230203u, ver = 0x00010000u, gen = 0u;
+    std::vector<uint32_t> in;
+    auto push = [&](std::initializer_list<uint32_t> ws) { in.insert(in.end(), ws.begin(), ws.end()); };
+    push({magic, ver, gen, 20u, 0u});
+    push({(2u << 16) | 17u, 1u});                             // OpCapability Shader
+    push({(3u << 16) | 14u, 0u, 1u});                         // OpMemoryModel Logical GLSL450
+    push({(5u << 16) | 15u, 4u, 1u, 0x6e69616du, 0u});        // OpEntryPoint Fragment %1 "main"
+    push({(3u << 16) | 16u, 1u, 7u});                         // OpExecutionMode %1 OriginUpperLeft
+    push({(4u << 16) | 71u, 11u, 34u, 2u});                   // %11 DescriptorSet 2
+    push({(4u << 16) | 71u, 11u, 33u, 128u});                 // %11 Binding 128
+    push({(4u << 16) | 71u, 12u, 34u, 2u});                   // %12 DescriptorSet 2
+    push({(4u << 16) | 71u, 12u, 33u, 129u});                 // %12 Binding 129
+    push({(2u << 16) | 19u, 2u});                             // %2 = OpTypeVoid
+    push({(3u << 16) | 33u, 3u, 2u});                         // %3 = OpTypeFunction %2
+    push({(3u << 16) | 22u, 4u, 32u});                        // %4 = OpTypeFloat 32
+    push({(4u << 16) | 23u, 5u, 4u, 2u});                     // %5 = OpTypeVector %4 2
+    push({(4u << 16) | 23u, 6u, 4u, 4u});                     // %6 = OpTypeVector %4 4
+    push({(9u << 16) | 25u, 7u, 4u, 1u, 0u, 0u, 0u, 1u, 0u}); // %7 = OpTypeImage %4 2D 0 0 0 1 Unknown
+    push({(3u << 16) | 27u, 8u, 7u});                         // %8 = OpTypeSampledImage %7
+    push({(4u << 16) | 32u, 9u, 0u, 8u});                     // %9 = OpTypePointer UniformConstant %8
+    push({(4u << 16) | 59u, 9u, 11u, 0u});                    // %11 = OpVariable %9 UniformConstant
+    push({(4u << 16) | 59u, 9u, 12u, 0u});                    // %12 = OpVariable %9 UniformConstant
+    push({(4u << 16) | 43u, 4u, 13u, 0u});                    // %13 = OpConstant %4 0
+    push({(5u << 16) | 44u, 5u, 14u, 13u, 13u});              // %14 = OpConstantComposite %5 %13 %13
+    push({(5u << 16) | 54u, 2u, 1u, 0u, 3u});                 // %1 = OpFunction %2 None %3
+    push({(2u << 16) | 248u, 15u});                           // %15 = OpLabel
+    push({(4u << 16) | 61u, 8u, 16u, 11u});                   // %16 = OpLoad %8 %11
+    push({(5u << 16) | 87u, 6u, 17u, 16u, 14u});              // %17 = OpImageSampleImplicitLod %6 %16 %14
+    push({(4u << 16) | 61u, 8u, 18u, 12u});                   // %18 = OpLoad %8 %12
+    push({(5u << 16) | 87u, 6u, 19u, 18u, 14u});              // %19 = OpImageSampleImplicitLod %6 %18 %14
+    push({(1u << 16) | 253u});                                // OpReturn
+    push({(1u << 16) | 56u});                                 // OpFunctionEnd
+
+    std::vector<uint32_t> out;
+    REQUIRE(gpu::spirv_uint_samplers(in, {{2u, 129u}}, out));
+
+    // Reflection must keep binding 128 as Float while moving binding 129 to Uint, with valid SPIR-V.
+    ShaderReflection refl;
+    std::string err;
+    REQUIRE(reflect(out, refl, err));
+    const DescriptorBinding* b128 = nullptr;
+    const DescriptorBinding* b129 = nullptr;
+    for (const DescriptorBinding& b : refl.bindings) {
+        if (b.set == 2 && b.binding == 128) b128 = &b;
+        if (b.set == 2 && b.binding == 129) b129 = &b;
+    }
+    REQUIRE(b128 != nullptr);
+    REQUIRE(b129 != nullptr);
+    CHECK(b128->image.component == ScalarType::Float);
+    CHECK(b129->image.component == ScalarType::Uint);
+    std::error_code ec;
+    if (fs::exists(kSpirvVal, ec)) {
+        std::string log;
+        CHECK_MSG(run_spirv_val(out, "uint_sampler_test", log) == 0, log);
+    }
+}
+
+NXTEST(uint_samplers_rewrites_opimage_fetch_pattern) {
+    // Matches stencil-plane texelFetch shaders (fd91fdb8): OpLoad %simg -> OpImage %img -> OpImageFetch %v4f.
+    const uint32_t magic = 0x07230203u, ver = 0x00010000u, gen = 0u;
+    std::vector<uint32_t> in;
+    auto push = [&](std::initializer_list<uint32_t> ws) { in.insert(in.end(), ws.begin(), ws.end()); };
+    push({magic, ver, gen, 25u, 0u});
+    push({(2u << 16) | 17u, 1u});                             // OpCapability Shader
+    push({(3u << 16) | 14u, 0u, 1u});                         // OpMemoryModel Logical GLSL450
+    push({(5u << 16) | 15u, 4u, 1u, 0x6e69616du, 0u});        // OpEntryPoint Fragment %1 "main"
+    push({(3u << 16) | 16u, 1u, 7u});                         // OpExecutionMode %1 OriginUpperLeft
+    push({(4u << 16) | 71u, 11u, 34u, 2u});                   // %11 DescriptorSet 2
+    push({(4u << 16) | 71u, 11u, 33u, 128u});                 // %11 Binding 128
+    push({(2u << 16) | 19u, 2u});                             // %2 = OpTypeVoid
+    push({(3u << 16) | 33u, 3u, 2u});                         // %3 = OpTypeFunction %2
+    push({(3u << 16) | 22u, 4u, 32u});                        // %4 = OpTypeFloat 32
+    push({(4u << 16) | 23u, 6u, 4u, 4u});                     // %6 = OpTypeVector %4 4
+    push({(4u << 16) | 21u, 12u, 32u, 1u});                   // %12 = OpTypeInt 32 1
+    push({(4u << 16) | 23u, 13u, 12u, 2u});                   // %13 = OpTypeVector %12 2
+    push({(9u << 16) | 25u, 7u, 4u, 1u, 0u, 0u, 0u, 1u, 0u}); // %7 = OpTypeImage %4 2D 0 0 0 1 Unknown
+    push({(3u << 16) | 27u, 8u, 7u});                         // %8 = OpTypeSampledImage %7
+    push({(4u << 16) | 32u, 9u, 0u, 8u});                     // %9 = OpTypePointer UniformConstant %8
+    push({(4u << 16) | 59u, 9u, 11u, 0u});                    // %11 = OpVariable %9 UniformConstant
+    push({(4u << 16) | 43u, 12u, 14u, 0u});                   // %14 = OpConstant %12 0
+    push({(5u << 16) | 44u, 13u, 15u, 14u, 14u});             // %15 = OpConstantComposite %13 %14 %14
+    push({(5u << 16) | 54u, 2u, 1u, 0u, 3u});                 // %1 = OpFunction %2 None %3
+    push({(2u << 16) | 248u, 16u});                           // %16 = OpLabel
+    push({(4u << 16) | 61u, 8u, 17u, 11u});                   // %17 = OpLoad %8 %11
+    push({(4u << 16) | 100u, 7u, 18u, 17u});                  // %18 = OpImage %7 %17
+    push({(7u << 16) | 95u, 6u, 19u, 18u, 15u, 2u, 14u});     // %19 = OpImageFetch %6 %18 %15 Lod %14
+    push({(5u << 16) | 81u, 4u, 20u, 19u, 0u});               // %20 = OpCompositeExtract %4 %19 0
+    push({(1u << 16) | 253u});                                // OpReturn
+    push({(1u << 16) | 56u});                                 // OpFunctionEnd
+
+    std::vector<uint32_t> out;
+    REQUIRE(gpu::spirv_uint_samplers(in, {{2u, 128u}}, out));
+    ShaderReflection refl;
+    std::string err;
+    REQUIRE(reflect(out, refl, err));
+    REQUIRE(refl.bindings.size() == 1);
+    CHECK(refl.bindings[0].image.component == ScalarType::Uint);
+    std::error_code ec;
+    if (fs::exists(kSpirvVal, ec)) {
+        std::string log;
+        CHECK_MSG(run_spirv_val(out, "uint_opimage_fetch_test", log) == 0, log);
+    }
+}
+

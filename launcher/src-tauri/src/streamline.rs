@@ -38,6 +38,40 @@ pub(crate) const AGENT: &str = "xc2-launcher";
 /// Downloads and the unpacked zip, inside the folder the files go to (removed when done).
 const WORK: &str = ".download";
 
+#[derive(Serialize, Clone)]
+pub struct DownloadAsset {
+    pub name: &'static str,
+    pub url: &'static str,
+    pub size: u64,
+    pub sha256: &'static str,
+}
+
+#[derive(Serialize, Clone)]
+pub struct DownloadManifest {
+    pub kind: &'static str,
+    pub version: &'static str,
+    pub repo_url: &'static str,
+    pub total_bytes: u64,
+    pub license: &'static str,
+    pub assets: Vec<DownloadAsset>,
+}
+
+pub fn manifest() -> DownloadManifest {
+    DownloadManifest {
+        kind: "dlss",
+        version: VERSION,
+        repo_url: "https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.16",
+        total_bytes: SIZE,
+        license: "NVIDIA RTX SDKs License + MIT",
+        assets: vec![DownloadAsset {
+            name: ZIP,
+            url: URL,
+            size: SIZE,
+            sha256: SHA256,
+        }],
+    }
+}
+
 #[derive(Serialize, Clone, Default)]
 pub struct Status {
     /// idle, running, done, error
@@ -206,5 +240,19 @@ impl Run<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn manifest_uses_official_url_and_sha256() {
+        let m = manifest();
+        assert_eq!(m.assets.len(), 1);
+        assert!(m.assets[0].url.starts_with("https://github.com/NVIDIA-RTX/Streamline/releases/"));
+        assert_eq!(m.assets[0].size, m.total_bytes);
+        assert_eq!(m.assets[0].sha256.len(), 64);
+        assert!(m.assets[0].sha256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }

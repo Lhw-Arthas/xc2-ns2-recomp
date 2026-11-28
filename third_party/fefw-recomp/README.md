@@ -1,8 +1,8 @@
 # fefw-recomp
 
-> **Fork notice.** This directory is a modified fork of [Goldoire/fefw-recomp](https://github.com/Goldoire/fefw-recomp),
+> **Fork notice.** This directory is a modified fork of `Goldoire/fefw-recomp` (the original GitHub repository now returns **404 / removed**),
 > vendored into the Xenoblade Chronicles 2 NS2E recompilation project (GPL-3.0-or-later).
-> Every change is listed in [MODIFICATIONS.md](MODIFICATIONS.md); upstream provenance is in [UPSTREAM.md](UPSTREAM.md).
+> Every change is listed in [MODIFICATIONS.md](MODIFICATIONS.md); upstream provenance is in [UPSTREAM.md](UPSTREAM.md). The `launcher/` subdirectory here is an unused upstream reference — the active XC2 launcher lives at the repository root.
 
 A native Windows PC port of **Fire Emblem: Fortune's Weave** (Nintendo Switch 2), made by static recompilation. The game's code is
 translated to C++ and compiled into a regular Windows program, which runs on a small runtime that stands in for the console's system

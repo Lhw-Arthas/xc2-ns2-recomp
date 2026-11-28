@@ -1,11 +1,11 @@
 # Upstream provenance
 
-This directory is a fork of **Goldoire/fefw-recomp**, vendored into this project (it is tracked by the outer
+This directory is a fork of **Goldoire/fefw-recomp** (the upstream GitHub repository has since been removed / returns **404**), vendored into this project (it is tracked by the outer
 repository, not a git submodule).
 
 | | |
 |---|---|
-| upstream | https://github.com/Goldoire/fefw-recomp |
+| upstream | `Goldoire/fefw-recomp` *(removed on GitHub / 404; `third_party/fefw-recomp/` is the self-contained fork base)* |
 | the fork is based on | an upstream state before **v0.2.0** (0.1-era runtime, 380 source files under runtime/src) |
 | latest upstream release | **v0.2.0** (2026-11-13) — `runtime/src` has **394** files |
 | snapshot of v0.2.0 | **kept outside the repository** (558 files of vendored upstream, not worth the tree): moved to `work/ref/fefw-recomp-ref-0.2.0/`, which git ignores; the pristine extract also sits at `<downloads>\fefw-recomp-src-0.2.0` |

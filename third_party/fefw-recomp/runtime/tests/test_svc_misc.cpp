@@ -118,6 +118,71 @@ NXTEST(misc_aoc_base_id_and_empty_list) {
     services::profile_reload();
 }
 
+NXTEST(misc_aoc_skips_incompatible_v300_upgrade_pack_98) {
+    nxsvc::Env env;
+    config_clear();
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    const std::filesystem::path dir = std::filesystem::path(tmp) / "nxrt_aoc_98_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir / "0100e95004039001" / "romfs", ec);
+    std::filesystem::create_directories(dir / "0100e95004039062" / "romfs", ec);
+    std::filesystem::create_directories(dir / "0100e95004039063" / "romfs", ec);
+    config_set("process", "program_id", "0x0100E95004038000");
+    config_set("aoc", "dir", dir.string().c_str());
+    config_set("aoc", "list", "1");
+    services::profile_reload();
+
+    nxsvc::Session s = nxsvc::connect("aoc:u");
+    REQUIRE(s.valid());
+    nxsvc::Reply cnt = s.call(2, nxsvc::Args().with_pid());
+    REQUIRE(cnt.ok());
+    CHECK_EQ(cnt.get<int32_t>(0), 2);
+
+    uint32_t listed[8]{};
+    nxsvc::Reply lst = s.call(3, nxsvc::Args().u32(0).buf_b(listed, sizeof listed));
+    REQUIRE(lst.ok());
+    CHECK_EQ(lst.get<int32_t>(0), 2);
+    CHECK_EQ(listed[0], 1u);
+    CHECK_EQ(listed[1], 99u);
+
+    std::filesystem::remove_all(dir, ec);
+    config_clear();
+    services::profile_reload();
+}
+
+NXTEST(misc_aoc_skips_non_hex_unicode_entries_without_throwing) {
+    nxsvc::Env env;
+    config_clear();
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    const std::filesystem::path dir = std::filesystem::path(tmp) / "nxrt_aoc_unicode_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir / "0100e95004039001" / "romfs", ec);
+    // Non-ASCII folder name and an unpaired surrogate UTF-16 folder name (issue #25).
+    std::filesystem::create_directories(dir / L"\u4e2d\u6587\u76ee\u5f55", ec);
+    const std::wstring bad_utf16 = std::wstring(L"dlc_") + static_cast<wchar_t>(0xD800) + L"_folder";
+    std::filesystem::create_directories(dir / bad_utf16, ec);
+    config_set("process", "program_id", "0x0100E95004038000");
+    config_set("aoc", "dir", dir.string().c_str());
+    config_set("aoc", "list", "1");
+    services::profile_reload();
+
+    nxsvc::Session s = nxsvc::connect("aoc:u");
+    REQUIRE(s.valid());
+    uint32_t listed[8]{};
+    nxsvc::Reply lst = s.call(3, nxsvc::Args().u32(0).buf_b(listed, sizeof listed));
+    REQUIRE(lst.ok());
+    CHECK_EQ(lst.get<int32_t>(0), 1);
+    CHECK_EQ(listed[0], 1u);
+
+    std::filesystem::remove_all(dir, ec);
+    config_clear();
+    services::profile_reload();
+}
+
 NXTEST(misc_caps_album_is_empty) {
     nxsvc::Env env;
     nxsvc::Session s = nxsvc::connect("caps:u");

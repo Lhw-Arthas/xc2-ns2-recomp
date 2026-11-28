@@ -58,6 +58,10 @@ struct GameViewportInfo {
 void set_game_viewport_info(uint32_t render_w, uint32_t render_h, uint32_t base_w, uint32_t base_h,
                             bool apply_present_crop, bool dlss_bypassed = false);
 GameViewportInfo game_viewport_info();
+// Applies active NVN scene/output attachment scaling to `gvi` for status display (overlay HUD). Pure and unit-testable.
+GameViewportInfo scale_viewport_info(const GameViewportInfo& gvi, float scene_scale, float out_scale, uint32_t quality_out_h,
+                                     int out_min = 1920);
+GameViewportInfo scaled_game_viewport_info();
 
 // Live 3D DLSS/FSR upscaler override for the F1 settings menu.
 // upscaler: "fsr3" | "taau" | "bilinear" | "dlss" | "auto" (empty/null = keep current).

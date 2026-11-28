@@ -37,12 +37,10 @@ P zeroed() {
     return p;
 }
 
-// Locks the buffer and returns it when it is recording; `lk` keeps the lock until the caller returns. Null otherwise.
-CommandBuffer* begin_record(NVNcommandBuffer* cmd, std::unique_lock<std::mutex>& lk) {
+// Returns the buffer when it is recording (lock-free between BeginRecording/EndRecording per NVN spec, matching NS1 nvn_api_cmd.c).
+CommandBuffer* begin_record(NVNcommandBuffer* cmd, std::unique_lock<std::mutex>&) {
     CommandBuffer* cb = host_of<CommandBuffer>(cmd);
-    if (!cb) return nullptr;
-    lk = std::unique_lock<std::mutex>(cb->lock);
-    return (cb->recording && cb->rec) ? cb : nullptr;
+    return (cb && cb->recording && cb->rec) ? cb : nullptr;
 }
 
 void set_view(const NVNtextureView* v, TextureViewInfo& out, uint32_t& has) {

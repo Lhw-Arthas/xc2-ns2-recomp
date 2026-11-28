@@ -8,10 +8,10 @@
 
 [![Latest Release](https://img.shields.io/github/v/release/weile10000/xc2-ns2-recomp?display_name=tag&style=flat-square&color=2b7fff)](https://github.com/weile10000/xc2-ns2-recomp/releases/latest)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg?style=flat-square)](LICENSE)
-[![Platform: Windows x64](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6?style=flat-square)](#build-from-source)
+[![Platform: Windows 11 x64](https://img.shields.io/badge/Platform-Windows%2011%20x64-0078D6?style=flat-square)](#build-from-source)
 [![Graphics: Vulkan 1.3](https://img.shields.io/badge/Graphics-Vulkan%201.3-AC162C?style=flat-square)](docs/COMPATIBILITY.md)
 
-**English** · [中文](#中文) · [Releases](https://github.com/weile10000/xc2-ns2-recomp/releases) · [Changelog](CHANGELOG.md) · [Compatibility](docs/COMPATIBILITY.md) · [Issues](https://github.com/weile10000/xc2-ns2-recomp/issues)
+**English** · [中文](#中文) · [Releases](https://github.com/weile10000/xc2-ns2-recomp/releases) · [Changelog](CHANGELOG.md) · [Compatibility](docs/COMPATIBILITY.md) · [Mods](docs/MODS.md) · [Voice Subtitles](docs/VOICE-SUBTITLES.md) · [Issues](https://github.com/weile10000/xc2-ns2-recomp/issues)
 
 </div>
 
@@ -21,7 +21,7 @@ An ahead-of-time ("static") recompilation of the **Nintendo Switch 2 program of 
 
 > [!IMPORTANT]
 > **This repository contains no game code, game assets, or cryptographic keys.**
-> It provides only the toolchain, runtime, launcher, and documentation. Executable binaries and shader caches are never distributed — you build them on your own PC from your own legally acquired copy of the game.
+> Release packages ship only the open-source launcher, generic runtime (`xc2_rt.dll`), and build toolchain. Game-derived builds (`xc2_boot.exe`, lifted game code) and translated shader caches (`.spv`) are never distributed — they are built locally on your own PC from your own legally acquired copy of the game.
 
 ## Target Program
 
@@ -30,7 +30,13 @@ An ahead-of-time ("static") recompilation of the **Nintendo Switch 2 program of 
 | **Title / Application ID** | `0100E95004038000` (update `1114112`) |
 | **Recompiled Program** | **Program 1** (`0400E95004038001`) · SDK 21.4.4 ("Ounce") · NVN2 231.39 · Retail **3.0.1** |
 | **Add-on Content (DLC)** | `0100E95004039001` … `0100E95004039063` (auto-discovered from your dump, non-contiguous IDs) |
-| **Releases & Known Issues** | See [GitHub Releases](https://github.com/weile10000/xc2-ns2-recomp/releases) for latest builds, upgrade notes & known issues, and [CHANGELOG.md](CHANGELOG.md) / [COMPATIBILITY.md](docs/COMPATIBILITY.md) |
+| **Verified Hardware & Known Issues** | Primarily verified on **AMD RDNA 2** (RX 6800 XT · 1440p/4K: 59–60 fps typical, 43–52 fps open plains); **NVIDIA / Intel** have limited coverage and open GPU/startup issues (e.g. [#32](https://github.com/weile10000/xc2-ns2-recomp/issues/32), [#39](https://github.com/weile10000/xc2-ns2-recomp/issues/39), [#25](https://github.com/weile10000/xc2-ns2-recomp/issues/25)). See [COMPATIBILITY.md](docs/COMPATIBILITY.md), [BENCHMARK-301.md](docs/reports/BENCHMARK-301.md), and [GitHub Releases](https://github.com/weile10000/xc2-ns2-recomp/releases) |
+
+### Screenshots (AMD RX 6800 XT · Vulkan 1.4 · Retail 3.0.1)
+
+| Title Screen (`1920×1080` preview from `2560×1440` 60 Hz log · `TitleLogoSwap` test mod · no OSD overlay) | Gormott Field (`1280×720` preview · Clear Save · Retail `3.0.1` · no OSD overlay) |
+|---|---|
+| ![Title Screen](docs/images/title-301-1440p.jpg) | ![Gormott Field](docs/images/gormott-field-301.jpg) |
 
 ---
 
@@ -86,7 +92,7 @@ The underlying Switch/NVN layer lives in `third_party/fefw-recomp/`, while every
 
 ## Build from Source
 
-Requirements: **Windows 10/11 x64**, **Vulkan 1.3 GPU**, **16 GB+ RAM**, **~60 GB free disk** (for source checkout + lifted C++ + objects), and the dev toolchain (VS Build Tools, LLVM/`clang-cl`, CMake + Ninja, .NET 10 SDK, Vulkan SDK, Python 3.12+, PowerShell 7). Full steps: [docs/BUILD.md](docs/BUILD.md) & [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
+Requirements: **Native Windows 11 x64** *(primary target covered by release testing; Windows 10 x64 and Linux / SteamOS / Proton / Wine receive best-effort compatibility without guaranteed full regression support — community PRs and forks are welcome)*, **Vulkan 1.3 GPU**, **16 GB+ RAM**, **~60 GB free disk** (for source checkout + lifted C++ + objects), and the dev toolchain (VS Build Tools, LLVM/`clang-cl`, CMake + Ninja, .NET 10 SDK, Vulkan SDK, Python 3.12+, PowerShell 7). Full steps: [docs/BUILD.md](docs/BUILD.md) & [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
 
 ```powershell
 # Place your 3.0.1 ExeFS modules in xc2\game\xc2ns301\
@@ -117,7 +123,7 @@ Requirements: **Windows 10/11 x64**, **Vulkan 1.3 GPU**, **16 GB+ RAM**, **~60 G
 | Category | Documents |
 |---|---|
 | **Getting Started** | [QUICKSTART.md](docs/QUICKSTART.md) · [COMPATIBILITY.md](docs/COMPATIBILITY.md) · [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) · [SETTINGS.md](docs/SETTINGS.md) |
-| **Building & Internals** | [BUILD.md](docs/BUILD.md) · [ENVIRONMENT.md](docs/ENVIRONMENT.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [MEDIA.md](docs/MEDIA.md) · [MODS.md](docs/MODS.md) |
+| **Building & Internals** | [BUILD.md](docs/BUILD.md) · [ENVIRONMENT.md](docs/ENVIRONMENT.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [MEDIA.md](docs/MEDIA.md) · [MODS.md](docs/MODS.md) · [VOICE-SUBTITLES.md](docs/VOICE-SUBTITLES.md) |
 | **Governance & History** | [INVARIANTS.md](docs/INVARIANTS.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md) · [STATUS.md](STATUS.md) · [SECURITY.md](SECURITY.md) |
 
 ---
@@ -125,14 +131,14 @@ Requirements: **Windows 10/11 x64**, **Vulkan 1.3 GPU**, **16 GB+ RAM**, **~60 G
 ## Credits & Legal Notice
 
 * **[nxrecomp](https://github.com/drakolordx7/nxrecomp)** — Static ARM64 → C++ recompiler
-* **[Goldoire/fefw-recomp](https://github.com/Goldoire/fefw-recomp)** — Base Switch runtime, NVN/NVN2 Vulkan replay, and shader pipeline
+* `Goldoire/fefw-recomp` *(upstream GitHub repo removed / 404)* — Base Switch runtime, NVN/NVN2 Vulkan replay, and shader pipeline (self-contained vendored fork preserved at [`third_party/fefw-recomp/`](third_party/fefw-recomp/MODIFICATIONS.md))
 * **Ryujinx** (MIT) — Maxwell shader translator behind `spirv_harness`
 * **[@capibawa](https://github.com/capibawa)** — [`nxnative` (`xc2-ns2-profile`)](https://github.com/capibawa/nxnative/tree/xc2-ns2-profile) launch switches & host media patterns
 * **[AksharDP/xc2-recomp](https://github.com/AksharDP/xc2-recomp)** & **[Lichii](https://github.com/zortos293/Lichii)** — Address & reference findings
 * **Community Contributors** — Credited individually in each [GitHub Release](https://github.com/weile10000/xc2-ns2-recomp/releases)
-* **Vendored Libraries & AI Assistance** — SDL3, Vulkan-Headers, VMA, Dav1d, FFmpeg, Dear ImGui ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md))
+* **Vendored Libraries & AI-Assisted Development** — SDL3, Vulkan-Headers, VMA, Dav1d, FFmpeg, Dear ImGui ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). Architecture, on-hardware testing, and final code review/merging are led by the human maintainer, with AI assistance:
   * Paired with **DeepSeek** ([deepseek.md](deepseek.md))
-  * **Gemini 4** ([gemini.md](gemini.md)) — joined the maintenance team starting from v0.2.1
+  * **Gemini 4** ([gemini.md](gemini.md)) — assisting maintenance starting from v0.2.1
 
 **Licence:** Project code is licensed under **GPL-3.0-or-later** ([LICENSE](LICENSE)). Third-party dependencies retain their respective licences. **No licence here grants any rights to Nintendo's copyrighted game code or assets; lifted user binaries remain the property of their respective rights holders.**
 
@@ -153,7 +159,7 @@ Requirements: **Windows 10/11 x64**, **Vulkan 1.3 GPU**, **16 GB+ RAM**, **~60 G
 [![运行平台: Windows x64](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6?style=flat-square)](#从源码构建)
 [![图形接口: Vulkan 1.3](https://img.shields.io/badge/Graphics-Vulkan%201.3-AC162C?style=flat-square)](docs/COMPATIBILITY.md)
 
-[English](#english) · **中文** · [发布页面 (Releases)](https://github.com/weile10000/xc2-ns2-recomp/releases) · [更新日志](CHANGELOG.md) · [兼容性说明](docs/COMPATIBILITY.md) · [问题反馈 (Issues)](https://github.com/weile10000/xc2-ns2-recomp/issues)
+[English](#english) · **中文** · [发布页面 (Releases)](https://github.com/weile10000/xc2-ns2-recomp/releases) · [更新日志](CHANGELOG.md) · [兼容性说明](docs/COMPATIBILITY.md) · [模组指南](docs/MODS.md#中文) · [语音字幕](docs/VOICE-SUBTITLES.md#中文) · [问题反馈 (Issues)](https://github.com/weile10000/xc2-ns2-recomp/issues)
 
 </div>
 
@@ -163,7 +169,7 @@ Requirements: **Windows 10/11 x64**, **Vulkan 1.3 GPU**, **16 GB+ RAM**, **~60 G
 
 > [!IMPORTANT]
 > **本仓库不包含任何游戏本体代码、美术资源或解密密钥。**
-> 仓库仅包含重编译工具链、运行时、启动器与公开文档。游戏可执行文件与着色器缓存从不随包分发，必须由你在自己电脑上使用合法持有的游戏副本现场构建。
+> 发行包仅分发开源启动器、通用运行时（`xc2_rt.dll`）与构建工具链；任何包含举升后游戏代码的可执行程序（`xc2_boot.exe`）与着色器缓存（`.spv`）从不随包分发，必须由你在自己电脑上使用合法持有的游戏副本现场构建。
 
 ## 目标程序信息
 
@@ -172,7 +178,13 @@ Requirements: **Windows 10/11 x64**, **Vulkan 1.3 GPU**, **16 GB+ RAM**, **~60 G
 | **Title / Application ID** | `0100E95004038000`（Update `1114112`） |
 | **重编译程序目标** | **Program 1**（`0400E95004038001`）· SDK 21.4.4 ("Ounce") · NVN2 231.39 · 零售版 **3.0.1** |
 | **附加内容（DLC）** | `0100E95004039001` … `0100E95004039063`（从同份 dump 自动识别，号段非连续） |
-| **最新版本与已知问题** | 最新下载地址、升级注意事项与当期已知问题请始终查看 [GitHub Releases](https://github.com/weile10000/xc2-ns2-recomp/releases)，历史里程碑见 [CHANGELOG.md](CHANGELOG.md) 与 [COMPATIBILITY.md](docs/COMPATIBILITY.md) |
+| **验证硬件与已知限制** | 主要在 **AMD RDNA 2**（RX 6800 XT · 1440p/4K：常规 59–60 fps、大型平原 43–52 fps）完成验证；**NVIDIA / Intel** 覆盖有限且存在已知问题（如 N 卡 [#32](https://github.com/weile10000/xc2-ns2-recomp/issues/32)、[#39](https://github.com/weile10000/xc2-ns2-recomp/issues/39)、[#25](https://github.com/weile10000/xc2-ns2-recomp/issues/25)）。详见 [COMPATIBILITY.md](docs/COMPATIBILITY.md)、[BENCHMARK-301.md](docs/reports/BENCHMARK-301.md) 与 [GitHub Releases](https://github.com/weile10000/xc2-ns2-recomp/releases) |
+
+### 实机运行截图（AMD RX 6800 XT · Vulkan 1.4 · 零售版 3.0.1）
+
+| 标题画面（`1920×1080` 预览图，源自 `2560×1440` 60 Hz 运行日志 · 含 `TitleLogoSwap` 归档 MOD · 无屏显帧率） | 古拉原野实机画面（`1280×720` 预览图 · 通关存档 · 零售版 `3.0.1` · 无屏显帧率） |
+|---|---|
+| ![标题画面](docs/images/title-301-1440p.jpg) | ![古拉原野实机画面](docs/images/gormott-field-301.jpg) |
 
 ---
 
@@ -228,7 +240,7 @@ ExeFS (NSO) ──nxrecomp 举升──▶ C++ ──Zig / clang-cl──▶ 模
 
 ## 从源码构建
 
-环境要求：**Windows 10/11 x64**、**支持 Vulkan 1.3 的显卡**、**16 GB+ 内存**、**约 60 GB 可用磁盘空间**，以及全套构建工具链（VS Build Tools、LLVM/`clang-cl`、CMake + Ninja、.NET 10 SDK、Vulkan SDK、Python 3.12+、PowerShell 7）。完整步骤请查阅 [docs/BUILD.md](docs/BUILD.md) 与 [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)。
+环境要求：**原生 Windows 11 x64**（主要测试与官方支持目标；Windows 10 x64 与 Linux / SteamOS (Proton / Wine) 仅提供尽力适配，暂不保证完整回归测试，欢迎社区 PR 或 Fork）、**支持 Vulkan 1.3 的显卡**、**16 GB+ 内存**、**约 60 GB 可用磁盘空间**，以及全套构建工具链（VS Build Tools、LLVM/`clang-cl`、CMake + Ninja、.NET 10 SDK、Vulkan SDK、Python 3.12+、PowerShell 7）。完整步骤请查阅 [docs/BUILD.md](docs/BUILD.md) 与 [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)。
 
 ```powershell
 # 先将 3.0.1 的 ExeFS 模块放入 xc2\game\xc2ns301\
@@ -259,7 +271,7 @@ ExeFS (NSO) ──nxrecomp 举升──▶ C++ ──Zig / clang-cl──▶ 模
 | 分类 | 文档列表 |
 |---|---|
 | **使用与排查** | [QUICKSTART.md](docs/QUICKSTART.md) · [COMPATIBILITY.md](docs/COMPATIBILITY.md) · [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) · [SETTINGS.md](docs/SETTINGS.md) |
-| **构建与架构** | [BUILD.md](docs/BUILD.md) · [ENVIRONMENT.md](docs/ENVIRONMENT.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [MEDIA.md](docs/MEDIA.md) · [MODS.md](docs/MODS.md) |
+| **构建与架构** | [BUILD.md](docs/BUILD.md) · [ENVIRONMENT.md](docs/ENVIRONMENT.md) · [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [MEDIA.md](docs/MEDIA.md) · [MODS.md](docs/MODS.md) · [VOICE-SUBTITLES.md](docs/VOICE-SUBTITLES.md#中文) |
 | **规范与里程碑** | [INVARIANTS.md](docs/INVARIANTS.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md) · [STATUS.md](STATUS.md) · [SECURITY.md](SECURITY.md) |
 
 ---
@@ -267,14 +279,14 @@ ExeFS (NSO) ──nxrecomp 举升──▶ C++ ──Zig / clang-cl──▶ 模
 ## 致谢与法律声明
 
 * **[nxrecomp](https://github.com/drakolordx7/nxrecomp)** —— 静态 ARM64 → C++ 重编译器
-* **[Goldoire/fefw-recomp](https://github.com/Goldoire/fefw-recomp)** —— Switch 基础运行时、NVN/NVN2 Vulkan 重放与着色器管线底座
+* `Goldoire/fefw-recomp` *（原 GitHub 仓库已下架 / 404）* —— Switch 基础运行时、NVN/NVN2 Vulkan 重放与着色器管线底座（完整独立分支留存于 [`third_party/fefw-recomp/`](third_party/fefw-recomp/MODIFICATIONS.md)）
 * **Ryujinx**（MIT）—— `spirv_harness` 背后的 Maxwell 着色器翻译器
 * **[@capibawa](https://github.com/capibawa)** —— [`nxnative`（`xc2-ns2-profile` 分支）](https://github.com/capibawa/nxnative/tree/xc2-ns2-profile) 的启动参数与宿主媒体方案参考
 * **[AksharDP/xc2-recomp](https://github.com/AksharDP/xc2-recomp)** 与 **[Lichii](https://github.com/zortos293/Lichii)** —— 相关地址与结构参考
 * **社区贡献者** —— 每位 PR 贡献者均会在对应版本的 [GitHub Releases](https://github.com/weile10000/xc2-ns2-recomp/releases) 中署名致谢
-* **依赖与 AI 协作** —— SDL3、Vulkan-Headers、VMA、dav1d、FFmpeg、Dear ImGui 等第三方库见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+* **依赖与 AI 辅助研发** —— SDL3、Vulkan-Headers、VMA、dav1d、FFmpeg、Dear ImGui 等第三方库见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。项目架构设计、实机测试与代码审查合入均由人类维护者主导把关，AI 协作如下：
   * 开发过程与 **DeepSeek** 结对协作（[deepseek.md](deepseek.md)）
-  * **Gemini 4**（[gemini.md](gemini.md)）—— 自 v0.2.1 版本起加入维护团队
+  * **Gemini 4**（[gemini.md](gemini.md)）—— 自 v0.2.1 版本起辅助项目维护
 
 **开源许可：** 本项目自有代码采用 **GPL-3.0-or-later**（[LICENSE](LICENSE)）；第三方组件保留其各自许可。**此处任何许可均不授予任天堂游戏代码或资源的任何权利；由玩家自行构建产出的举升二进制文件不属于本仓库分发内容，权利仍归原权利方所有。**
 

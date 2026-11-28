@@ -54,6 +54,7 @@ static std::set<struct TexGpu*> g_live_set;
 
 struct TexGpu {
     bool promoted = false;                              // HDR scene pipeline: an 8-bit sRGB render target kept as RGBA16F (src/gfx/extras/hdr_nvn.h)
+    bool float_tried = false;                           // tex_promote_float could not make the float16 image
     gfx::Image img;                                     // the image; created without a view (views are cached below)
     const FormatInfo* fmt = nullptr;
     VkFormat format = VK_FORMAT_UNDEFINED;              // the image format: the NVN one, its fallback, or BC7 for ASTC
@@ -78,6 +79,9 @@ struct TexGpu {
     bool last_sampled_ok = false;                       // ... and what it said, so a repeated format costs no map lookup
     std::array<uint32_t, 12> last_key = {};             // view_for's last answer (render thread): most lookups repeat it (rt agent)
     VkImageView last_view = VK_NULL_HANDLE;
+    gpu::ViewRequest last_req = {};                     // tex_sampled_view's last request (render thread MRU fast path)
+    VkImageView last_req_view = VK_NULL_HANDLE;
+    bool last_req_valid = false;
     int refs = 1;                                      // texture objects over the same storage share one image (render thread)
     struct SparseState* sparse = nullptr;               // a sparse-residency image (a big texture of a virtual pool), else null
     // CPU-streamed textures (tex_ensure_current): uploads for CPU writes that came at most kStreamGap presents apart, in a row
@@ -741,6 +745,10 @@ struct QualityScales { bool set = false; float scene = 1.0f, out = 1.0f; const c
 const QualityScales& quality_scales() {
     static const QualityScales q = [] {
         QualityScales r;
+        if (nxrt::gfx::tuning().game_handles_render_quality.load(std::memory_order_relaxed)) {
+            NXLOG_I(kTag, "[upscale] render_quality handled in-engine by game module (NVN attachment scale 1.000)");
+            return r;
+        }
         const std::string key = nxrt::config_get_str("upscale", "render_quality", "");
         const nxrt::RenderQualityMode* m = nxrt::render_quality_mode(key.c_str());
         if (!m) return r;
@@ -809,38 +817,56 @@ float output_scale_now() {
 // The scale a texture gets when its image is made for a render target (after Ryujinx's TextureScaling rules): 2D colour or depth targets
 // of at least 32x32, not block-compressed, not pitch-linear, and not square powers of two (shadow
 // maps, LUTs). Everything else, and every texture first used another way, keeps the NVN size.
-float attachment_scale(const Texture& t) {
-    const float scene = render_scale_now(), out = output_scale_now();
-    if (scene == 1.0f && out == 1.0f) return 1.0f;
-    static const int out_min = static_cast<int>(nxrt::config_get_int("gfx", "output_min_width", 1920));
-    float sc = t.b.width >= out_min ? out : scene;
+}  // namespace
+
+float compute_attachment_scale(int w, int h, int target, int flags, bool compressed, int block_w, int block_h,
+                               float scene, float out, int out_min, int min_w, bool quality_set, int quality_out_h) {
+    if (scene == 1.0f && out == 1.0f && !quality_set) return 1.0f;
+    float sc = w >= out_min ? out : scene;
+    // Output-side derivative targets (e.g. XC2's 1536x864 = 0.8 * 1080p) must not inherit `scene` (which assumes 720p base),
+    // otherwise 4K native scales 1536x864 -> 4608x2592 and 1440p native scales it -> 3072x1728.
+    if (w > 1280 && w < out_min && h > 720) sc = std::min(sc, out);
+    // When [upscale] render_quality locks the 3D ladder at 1280x720, 960x540 belongs to the 1080p half-res path; cap it at `out`.
+    if (quality_set && w == 960 && h == 540) sc = std::min(sc, out);
     // Output-side targets taller than 1080 lines (XC2's own 4K set) are drawn at the output height, not scaled past it.
-    if (t.b.width >= out_min && t.b.height > 1080) {
-        const float h = static_cast<float>(t.b.height);
-        if (quality_scales().set)
-            sc = static_cast<float>(quality_scales().out_h) / h;
+    if (w >= out_min && h > 1080) {
+        const float hf = static_cast<float>(h);
+        if (quality_set && quality_out_h > 0)
+            sc = static_cast<float>(quality_out_h) / hf;
         else if (sc > 1.0f)
-            sc = std::max(1.0f, std::min(sc, std::round(out * 1080.0f) / h));
+            sc = std::max(1.0f, std::min(sc, std::round(out * 1080.0f) / hf));
         if (std::fabs(sc - 1.0f) < 0.01f) sc = 1.0f;
     }
     if (sc == 1.0f) return 1.0f;
-    const TextureBuilderInfo& b = t.b;
-    if (!t.fmt || t.fmt->compressed || t.fmt->block_w != 1 || t.fmt->block_h != 1) return 1.0f;
-    if (b.target != NVN_TEXTURE_TARGET_2D && b.target != NVN_TEXTURE_TARGET_2D_ARRAY && b.target != NVN_TEXTURE_TARGET_2D_MULTISAMPLE &&
-        b.target != NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY && b.target != NVN_TEXTURE_TARGET_RECTANGLE)
+    if (compressed || block_w != 1 || block_h != 1) return 1.0f;
+    if (target != NVN_TEXTURE_TARGET_2D && target != NVN_TEXTURE_TARGET_2D_ARRAY && target != NVN_TEXTURE_TARGET_2D_MULTISAMPLE &&
+        target != NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY && target != NVN_TEXTURE_TARGET_RECTANGLE)
         return 1.0f;
     // not the IMAGE flag: the game sets it on every render target; storage use brings a scaled image back instead (tex_rescale)
-    if (b.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) return 1.0f;
-    const int w = b.width, h = b.height;
+    if (flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) return 1.0f;
     if (w < 32 || h < 32) return 1.0f;
     // [gfx] render_scale_min_width (default 0): textures narrower than this keep their size. XC2 NS2 draws its 3D scene into a
     // 1280x720 set (G-buffer, depth, 640x360 effect masks) one of which is a storage image, so the whole set falls back to 1x and
     // the effects that mix it with scaled masks read every other pixel (a dot grid over the shadows). 1920 keeps that set together
     // at 1x and scales the 1920x1080 post chain and the 3840x2160 targets: the upscaler then writes the 4K output directly.
-    static const int min_w = static_cast<int>(nxrt::config_get_int("gfx", "render_scale_min_width", 0));
     if (w < min_w) return 1.0f;
     if (w == h && (w & (w - 1)) == 0) return 1.0f;
     return sc;
+}
+
+namespace {
+
+float attachment_scale(const Texture& t) {
+    const float scene = render_scale_now(), out = output_scale_now();
+    static const int out_min = static_cast<int>(nxrt::config_get_int("gfx", "output_min_width", 1920));
+    static const int min_w = static_cast<int>(nxrt::config_get_int("gfx", "render_scale_min_width", 0));
+    const QualityScales& qs = quality_scales();
+    const TextureBuilderInfo& b = t.b;
+    const bool compressed = !t.fmt || t.fmt->compressed;
+    const int blk_w = t.fmt ? t.fmt->block_w : 1;
+    const int blk_h = t.fmt ? t.fmt->block_h : 1;
+    return compute_attachment_scale(b.width, b.height, b.target, b.flags, compressed, blk_w, blk_h,
+                                    scene, out, out_min, min_w, qs.set, qs.out_h);
 }
 
 // ---- barriers and copies ----------------------------------------------------------------------------------------------------
@@ -1551,6 +1577,15 @@ float render_scale() {
     return s != 1.0f ? s : output_scale_now();
 }
 
+float render_scale_live() { return render_scale_now(); }
+
+float output_scale_live() { return output_scale_now(); }
+
+uint32_t quality_output_height_live() {
+    const QualityScales& q = quality_scales();
+    return (q.set && q.out_h > 0) ? static_cast<uint32_t>(q.out_h) : 0u;
+}
+
 float tex_scale(Texture* t) {
     return (t && t->gpu && !t->gpu->failed) ? t->gpu->scale : 1.0f;
 }
@@ -1564,6 +1599,52 @@ float tex_scale_wanted(Texture* t) {
     TexGpu* g = tex_or_null(t);
     if (!g || g->scale_blocked || g->transcoded || is_block_format(g->format)) return g ? g->scale : 1.0f;
     return attachment_scale(*t);
+}
+
+// Puts `ni` (shape s, format nf) in place of the texture's image, the content blitted over when the formats allow it. The old image and its
+// views are destroyed after the frames that use them.
+static void swap_image(Texture* t, TexGpu* g, Frame& f, const Shape& s, const gfx::Image& ni, VkFormat nf) {
+    VkFormatProperties fp = {}, fq = {};
+    vkGetPhysicalDeviceFormatProperties(device().physical(), g->format, &fp);
+    vkGetPhysicalDeviceFormatProperties(device().physical(), nf, &fq);
+    const bool can_blit = g->layout != VK_IMAGE_LAYOUT_UNDEFINED && s.samples <= 1 && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) &&
+                          (fq.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) &&
+                          (g->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && (g->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    VkImageLayout nl = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (can_blit) {
+        move_layout(f, *g, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        image_barrier(f.cb, ni.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, g->aspect, 0, s.levels, 0, s.layers);
+        std::vector<VkImageBlit> regions;
+        for (uint32_t l = 0; l < s.levels; ++l) {
+            const VkExtent3D a = level_extent(g->base, l), b = level_extent(s.base, l);
+            VkImageBlit r = {};
+            r.srcSubresource = {g->aspect, l, 0, s.layers};
+            r.dstSubresource = {g->aspect, l, 0, s.layers};
+            r.srcOffsets[1] = {static_cast<int32_t>(a.width), static_cast<int32_t>(a.height), 1};
+            r.dstOffsets[1] = {static_cast<int32_t>(b.width), static_cast<int32_t>(b.height), 1};
+            regions.push_back(r);
+        }
+        const VkFilter filter = (!g->depth && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+                                    ? VK_FILTER_LINEAR
+                                    : VK_FILTER_NEAREST;
+        vkCmdBlitImage(f.cb, g->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ni.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(regions.size()),
+                       regions.data(), filter);
+        nl = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    }
+    gfx::Image old = g->img;
+    std::vector<VkImageView> views;
+    for (auto& kv : g->views) views.push_back(kv.second);
+    g->views.clear();
+    g->last_view = VK_NULL_HANDLE;
+    g->last_req_valid = false;
+    defer_destroy([old, views]() mutable {
+        for (VkImageView v : views) { vkDestroyImageView(vkdev(), v, nullptr); vk_gauge_image_views().sub(1); }
+        device().destroy_image(old);
+    });
+    g->img = ni;
+    g->base = s.base;
+    g->layout = nl;
+    pool_texture_remade(t);
 }
 
 // Remakes the image at another scale (Ryujinx scales a texture when it becomes a render target and blacklists one that cannot be
@@ -1588,44 +1669,35 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     static int logged = 0;
     if (logged++ < 60)
         NXLOG_I(kTag, "texture %u: %s %dx%d now rendered at %ux%u (%s)", t->id, g->fmt ? g->fmt->name : "?", t->b.width, t->b.height, s.base.width, s.base.height, why);
-    VkFormatProperties fp = {};
-    vkGetPhysicalDeviceFormatProperties(device().physical(), g->format, &fp);
-    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-    const bool can_blit = g->layout != VK_IMAGE_LAYOUT_UNDEFINED && s.samples <= 1 && (fp.optimalTilingFeatures & need) == need &&
-                          (g->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && (g->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    VkImageLayout nl = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (can_blit) {
-        move_layout(f, *g, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        image_barrier(f.cb, ni.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, g->aspect, 0, s.levels, 0, s.layers);
-        std::vector<VkImageBlit> regions;
-        for (uint32_t l = 0; l < s.levels; ++l) {
-            const VkExtent3D a = level_extent(g->base, l), b = level_extent(s.base, l);
-            VkImageBlit r = {};
-            r.srcSubresource = {g->aspect, l, 0, s.layers};
-            r.dstSubresource = {g->aspect, l, 0, s.layers};
-            r.srcOffsets[1] = {static_cast<int32_t>(a.width), static_cast<int32_t>(a.height), 1};
-            r.dstOffsets[1] = {static_cast<int32_t>(b.width), static_cast<int32_t>(b.height), 1};
-            regions.push_back(r);
-        }
-        vkCmdBlitImage(f.cb, g->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ni.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(regions.size()),
-                       regions.data(), g->depth ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
-        nl = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    }
-    gfx::Image old = g->img;
-    std::vector<VkImageView> views;
-    for (auto& kv : g->views) views.push_back(kv.second);
-    g->views.clear();
-    g->last_view = VK_NULL_HANDLE;
-    defer_destroy([old, views]() mutable {
-        for (VkImageView v : views) { vkDestroyImageView(vkdev(), v, nullptr); vk_gauge_image_views().sub(1); }
-        device().destroy_image(old);
-    });
-    g->img = ni;
-    g->base = s.base;
-    g->layout = nl;
+    swap_image(t, g, f, s, ni, g->format);
     g->scale = to;
     if (to == 1.0f) g->scale_blocked = true;
-    pool_texture_remade(t);
+    return true;
+}
+
+bool tex_promote_float(Texture* t, Frame& f, const char* why) {
+    TexGpu* g = tex_or_null(t);
+    if (!g || g->promoted || g->float_tried || g->format != VK_FORMAT_R8G8B8A8_UNORM || g->type != VK_IMAGE_TYPE_2D || g->levels != 1 || g->layers != 1 || g->sparse) return false;
+    constexpr VkFormat kFloat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    Shape s = shape_of(*t);
+    if (s.samples > 1) return false;
+    s.base = g->base;   // the scaled size
+    const VkImageCreateFlags flags = base_flags(s, kFloat);
+    gfx::Image ni;
+    std::string err;
+    if (!device().image_supported(make_desc(s, kFloat, g->usage, flags)) ||
+        device().create_image(make_desc(s, kFloat, g->usage, flags), &ni, &err) != VK_SUCCESS) {
+        NXLOG_W(kTag, "texture %u: cannot keep it as float16 (%s): it stays 8-bit", t->id, err.empty() ? "usage not supported" : err.c_str());
+        g->float_tried = true;   // not tried again
+        return false;
+    }
+    NXLOG_I(kTag, "texture %u: %s %ux%u now float16 for the HDR scene (%s)", t->id, g->fmt ? g->fmt->name : "?", s.base.width, s.base.height, why);
+    swap_image(t, g, f, s, ni, kFloat);
+    g->format = kFloat;
+    g->promoted = true;
+    g->mutable_fmt = srgb_partner(kFloat) != VK_FORMAT_UNDEFINED || bit_alias_class(kFloat);
+    g->sampled_formats.clear();
+    g->last_sampled_fmt = VK_FORMAT_MAX_ENUM;
     return true;
 }
 
@@ -2038,50 +2110,6 @@ void tex_sparse_before_copy(Texture* t, uint32_t layer, uint32_t level) {
 void tex_mark_gpu_written(Texture* t) {
     TexGpu* g = tex_or_null(t);
     if (!g) return;
-    // Is the film's own picture texture being written by the GPU? Its storage is never written by the CPU (measured: zero
-    // rewrites over a whole run, 2026-11-21), so if anything produces its content it is a draw or a copy on the GPU - and
-    // this counter says whether that still happens when the picture freezes.
-    // Whatever the film's target turns out to be, this names it: every 4K texture the GPU writes, once a second each, for the
-    // first 24 ids. The film-specific watch above kept pointing at the wrong texture, so the honest question is "which 4K
-    // targets are being drawn at all, and when do they stop" (2026-11-21).
-    if (t->b.width >= 1920) {
-        static std::mutex mu;
-        static std::map<uint32_t, std::pair<uint64_t, int64_t>> seen;
-        static int ids = 0;
-        bool log_it = false;
-        uint64_t n = 0;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch()).count();
-            auto it = seen.find(t->id);
-            if (it == seen.end()) {
-                if (ids >= 24) { seen[t->id] = {0, 0}; it = seen.find(t->id); }
-                else { ++ids; it = seen.emplace(t->id, std::make_pair<uint64_t, int64_t>(0, 0)).first; }
-            }
-            if (it != seen.end() && (ms - it->second.second) >= 1000) {
-                it->second.second = ms;
-                n = ++it->second.first;
-                log_it = true;
-            } else if (it != seen.end()) {
-                ++it->second.first;
-            }
-        }
-        if (log_it)
-            NXLOG_I("nvn.tex", "4k target %u (%dx%d): written %llu time(s)", t->id, t->b.width, t->b.height,
-                    static_cast<unsigned long long>(n));
-    }
-    if (film_texture_is(t->id)) {
-        static std::atomic<uint64_t> n{0};
-        static std::atomic<int64_t> last{0};
-        const uint64_t k = n.fetch_add(1, std::memory_order_relaxed) + 1;
-        const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::steady_clock::now().time_since_epoch()).count();
-        int64_t prev = last.load(std::memory_order_relaxed);
-        if (ms - prev >= 1000 && last.compare_exchange_strong(prev, ms))
-            NXLOG_I("nvn.tex", "film texture %u: written by the GPU %llu time(s) so far", t->id,
-                    static_cast<unsigned long long>(k));
-    }
     ++g->h_gpu_writes;
     g->gpu_written = true;
     t->cpu_dirty.store(false);                   // the GPU data is the newer one until the CPU writes again
@@ -2110,9 +2138,30 @@ uint32_t tex_layers(Texture* t) { return t->layers; }
 
 bool tex_is_depth(Texture* t) { return t->fmt && t->fmt->aspect != kAspectColor; }
 
+bool tex_copy_source_ok(Texture* t) {
+    TexGpu* g = tex_or_null(t);
+    return g && (g->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && g->layout != VK_IMAGE_LAYOUT_UNDEFINED && shape_of(*t).samples <= 1;
+}
+
 VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
     TexGpu* g = tex_or_null(t);
     if (!g) return VK_NULL_HANDLE;
+    if (g->last_req_valid &&
+        g->last_req.type == req.type &&
+        g->last_req.depth_compare == req.depth_compare &&
+        g->last_req.base_level == req.base_level &&
+        g->last_req.level_count == req.level_count &&
+        g->last_req.base_layer == req.base_layer &&
+        g->last_req.layer_count == req.layer_count &&
+        g->last_req.format == req.format &&
+        g->last_req.depth_aspect == req.depth_aspect &&
+        g->last_req.component == req.component &&
+        g->last_req.swizzle.r == req.swizzle.r &&
+        g->last_req.swizzle.g == req.swizzle.g &&
+        g->last_req.swizzle.b == req.swizzle.b &&
+        g->last_req.swizzle.a == req.swizzle.a) {
+        return g->last_req_view;
+    }
     const bool is3d = g->type == VK_IMAGE_TYPE_3D;
     const uint32_t total_layers = is3d ? g->base.depth : g->layers;   // 3D images: the slices are the layers of 2D views
     const uint32_t bl = req.base_level;
@@ -2236,7 +2285,13 @@ VkImageView tex_sampled_view(Texture* t, const ViewRequest& req) {
         g->last_sampled_ok = feature->second;
     }
     if (!g->last_sampled_ok) return bad_view(*t, "view format does not support sampling");
-    return view_for(*g, req.type, bl, nl, bly, nly, fmt, asp, req.swizzle);
+    const VkImageView v = view_for(*g, req.type, bl, nl, bly, nly, fmt, asp, req.swizzle);
+    if (v) {
+        g->last_req = req;
+        g->last_req_view = v;
+        g->last_req_valid = true;
+    }
+    return v;
 }
 
 VkImageView tex_attachment_view(Texture* t, uint32_t level, uint32_t layer, uint32_t layer_count, VkFormat view_format, bool keep_format) {
@@ -2382,17 +2437,23 @@ SamplerInfo tuned_sampler(const SamplerInfo& in) {
     SamplerInfo s = in;
     const int aniso = gfx::tuning().anisotropy.load(std::memory_order_relaxed);
     const float bias = gfx::tuning().lod_bias.load(std::memory_order_relaxed);
+    const float up_bias = gfx::tuning().upscale_lod_bias.load(std::memory_order_relaxed);
     if (s.compare_mode == NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE) return s;
     const bool mips = min_filter_uses_mips(s.min_filter);
-    if (aniso > 1 && mips && vk_min_filter(s.min_filter) == VK_FILTER_LINEAR && vk_mag_filter(s.mag_filter) == VK_FILTER_LINEAR)
+    const bool linear_mip = mips && vk_min_filter(s.min_filter) == VK_FILTER_LINEAR && vk_mag_filter(s.mag_filter) == VK_FILTER_LINEAR;
+    // Check the game's original anisotropy before our override: reflection cubemaps and blur chains do not ask
+    // for anisotropy, so restricting auto upscaler mip bias to game-aniso material samplers avoids corrupting them (#79).
+    const bool game_aniso = (in.max_anisotropy > 1.0f);
+    if (aniso > 1 && linear_mip)
         s.max_anisotropy = std::max(s.max_anisotropy, static_cast<float>(aniso));
+    if (up_bias != 0.0f && game_aniso && linear_mip) s.lod_bias += up_bias;
     if (bias != 0.0f && mips) s.lod_bias += bias;
     return s;
 }
 
 // sampler_for's last few answers, for the game's sampler and the tuning tuned_sampler applies (render thread, as the map): a draw's
 // samplers repeat from draw to draw (rt agent, notes/rt.md). Emptied with the map (tex_shutdown).
-struct SamplerLast { SamplerInfo in; int aniso = 0; float bias = 0.0f; VkSampler out = VK_NULL_HANDLE; };
+struct SamplerLast { SamplerInfo in; int aniso = 0; float bias = 0.0f; float up_bias = 0.0f; VkSampler out = VK_NULL_HANDLE; };
 static SamplerLast g_sampler_last[4];
 static unsigned g_sampler_last_next = 0;
 
@@ -2401,9 +2462,10 @@ VkSampler sampler_for(const SamplerInfo& game_sampler) {
     unsigned& last_next = g_sampler_last_next;
     const int aniso = gfx::tuning().anisotropy.load(std::memory_order_relaxed);
     const float bias = gfx::tuning().lod_bias.load(std::memory_order_relaxed);
+    const float up_bias = gfx::tuning().upscale_lod_bias.load(std::memory_order_relaxed);
     for (int i = 0; i < 4; ++i) {
         const SamplerLast& l = last[i];
-        if (l.out && l.aniso == aniso && l.bias == bias && l.in == game_sampler) {
+        if (l.out && l.aniso == aniso && l.bias == bias && l.up_bias == up_bias && l.in == game_sampler) {
             if (rt_check_on()) {   // [nvn] rt_check: the map gives the same sampler
                 const SamplerInfo s = tuned_sampler(game_sampler);
                 VkSampler m = VK_NULL_HANDLE;
@@ -2417,13 +2479,13 @@ VkSampler sampler_for(const SamplerInfo& game_sampler) {
     auto& bucket = g_sh.samplers[sampler_hash(s)];
     for (const auto& e : bucket)
         if (e.first == s) {
-            last[last_next++ % 4] = {game_sampler, aniso, bias, e.second};
+            last[last_next++ % 4] = {game_sampler, aniso, bias, up_bias, e.second};
             return e.second;
         }
     const VkSampler v = create_sampler(s);
     if (v == VK_NULL_HANDLE) return dummy_sampler();
     bucket.emplace_back(s, v);
-    last[last_next++ % 4] = {game_sampler, aniso, bias, v};
+    last[last_next++ % 4] = {game_sampler, aniso, bias, up_bias, v};
     return v;
 }
 

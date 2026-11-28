@@ -40,10 +40,14 @@ const DUMP_ERRORS = {
   'Checking whether the game has to be built again': 'about.step.checkingRebuild',
   'Checking the download': 'about.step.verifying',
   Unpacking: 'about.step.unpacking',
+  'precompiling GPU pipeline cache': 'setup.progress.precompiling',
 };
 export function dumpText(s) {
   const key = DUMP_ERRORS[s];
-  return key ? t(key) : s;
+  if (key) return t(key);
+  const prefill = /^prefill: (\d+) block\(s\) collected$/.exec(s || '');
+  if (prefill) return t('setup.progress.prefill', { count: prefill[1] });
+  return s;
 }
 
 /** The line a run of the game ends with (play.rs). */

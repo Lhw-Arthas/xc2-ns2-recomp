@@ -576,6 +576,11 @@ std::shared_ptr<fs::RomfsImage> aoc_image(uint64_t id) {
     std::lock_guard<std::mutex> lk(mu);
     auto it = cache.find(id);
     if (it != cache.end()) return it->second;
+    if (id == 0x0100E95004039062ull) {
+        NXLOG_W("aoc", "refusing incompatible Switch 2 v3.0.0 add-on content 0100e95004039062 (index 98): already merged in 3.0.1 base RomFS");
+        cache[id] = nullptr;
+        return nullptr;
+    }
     std::string name(16, '0');
     for (int i = 0; i < 16; ++i) name[15 - i] = "0123456789abcdef"[static_cast<unsigned>(id >> (4 * i)) & 0xF];
     const std::string base = config_get_str("aoc", "dir", "game/dlc") + "/" + name;

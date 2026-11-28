@@ -89,6 +89,14 @@ std::atomic<uint64_t> g_prep_fast{0};          // shader preparation: parts that
 std::unordered_map<std::string, Entry> g_libs;             // node based: a reference to an entry stays valid while others are added
 std::deque<std::function<void()>> g_exact_q;   // [nvn] gpl_async: parts a deferred draw needs, exactly as it needs them (first in line)
 std::unordered_set<std::string> g_exact_pending;
+// Async SPIR-V patching & vkCreateShaderModule offload: keyed by GraphicsKey::hash() with exact key comparison.
+struct ResolvedSm {
+    GraphicsKey key;
+    StageModules sm;
+    bool ok = false;
+};
+std::unordered_map<uint64_t, std::vector<ResolvedSm>> g_resolved_sm;
+std::unordered_map<uint64_t, std::vector<GraphicsKey>> g_resolve_pending;
 std::atomic<int64_t> g_frame_seen_ns{0};      // when the replay last saw the present count move
 std::deque<std::function<void()>> g_pre_q;     // parts of the key file's pipelines (gpl_prebuild): after the hot programs, before the cold ones
 std::deque<Job> g_hot_q, g_cold_q;    // hot: programs a command buffer was recorded with (oldest first); cold: set but not yet bound (newest first)
@@ -202,13 +210,16 @@ VkPipeline create_part(VkGraphicsPipelineCreateInfo& gi, const char* what) {
     if (g_retain) gi.flags |= VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
     VkPipeline p = VK_NULL_HANDLE;
     const auto t0 = Clock::now();
-    // shader preparation keeps nothing in the app cache file (it would grow to hundreds of MB); the driver's own cache holds the result
-    const VkResult r = create_graphics_pipeline_tracked(vkdev(), (g_discard.load(std::memory_order_relaxed) && !g_prepare_cache.load(std::memory_order_relaxed)) ? VK_NULL_HANDLE : pipeline_cache_handle(), &gi, &p);
+    const bool prepare_to_disk = g_discard.load(std::memory_order_relaxed) && g_prepare_cache.load(std::memory_order_relaxed);
+    const VkPipelineCache cache = g_discard.load(std::memory_order_relaxed)
+                                      ? (prepare_to_disk ? pipeline_cache_handle() : VK_NULL_HANDLE)
+                                      : pipeline_library_cache_handle();
+    const VkResult r = create_graphics_pipeline_tracked(vkdev(), cache, &gi, &p);
     if (r != VK_SUCCESS) {
         NXLOG_E(kTag, "pipeline part (%s) failed (%d)", what, static_cast<int>(r));
         return VK_NULL_HANDLE;
     }
-    note_pipeline_created(ms_since(t0), what);
+    note_pipeline_created(ms_since(t0), what, prepare_to_disk);
     return p;
 }
 
@@ -565,8 +576,8 @@ void upgrade_main() {
                 if (device().features().attachment_feedback_loop_layout)
                     gi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
                 gi.layout = j.layout->layout;
-                if (create_graphics_pipeline_tracked(vkdev(), pipeline_cache_handle(), &gi, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
-                else note_pipeline_created(ms_since(t0), "optimised link");
+                if (create_graphics_pipeline_tracked(vkdev(), pipeline_library_cache_handle(), &gi, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+                else note_pipeline_created(ms_since(t0), "optimised link", false);
             } else {
                 p = build_graphics_pipeline(j.key, *j.layout);
             }
@@ -736,7 +747,9 @@ namespace {
 bool frames_flowing() {
     const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
     const int64_t seen = g_frame_seen_ns.load(std::memory_order_relaxed);
-    return seen != 0 && now - seen < 100000000;
+    // Allow a 1.5 s window so a heavy scene-load upload frame (>100 ms) does not disable gpl_async
+    // and cascade into dozens of synchronous fragment-part compiles on the render thread.
+    return seen != 0 && now - seen < 1500000000ll;
 }
 bool part_done_locked(const std::string& key) {
     auto it = g_libs.find(key);
@@ -763,27 +776,89 @@ VkPipeline gpl_link(const GraphicsKey& key, const ProgLayout& layout, std::share
     if (!key.stage[0] || !key.stage[1] || key.xfb || key.patch_control_points || key.tess[0] || key.tess[1]) return VK_NULL_HANDLE;
     NXFT("pipe.link");
     const auto t0 = Clock::now();
-    StageModules sm;
-    if (!resolve_stage_modules(key, &sm)) return VK_NULL_HANDLE;
     RasterKey r;
     r.poly = key.polygon_mode;
     r.clamp = key.depth_clamp;
     r.neg = key.depth_neg_one;
     learn_raster(r);
     if (const std::vector<SpvIntSlot> ints = key_int_slots(key); !ints.empty()) g_pred_signed.store(ints[0].is_signed, std::memory_order_relaxed);
+    StageModules sm;
     static const bool async = config_get_bool("nvn", "gpl_async", true);
     if (async && pending && frames_flowing()) {
-        const std::string pk = pre_key(sm, layout, r), fk = fs_key(sm, layout);
+        const uint64_t kh = key.hash();
         std::lock_guard<std::mutex> lk(g_mu);
-        if (!g_stop && !(part_done_locked(pk) && part_done_locked(fk))) {
-            const ProgLayout* pl = &layout;               // layouts live as long as the back end
-            const StageModules m = sm;
-            if (!part_done_locked(pk)) queue_exact_locked(pk, [m, pl, r] { return build_pre(m.m[0], m.m[2], *pl, r); });
-            if (!part_done_locked(fk)) queue_exact_locked(fk, [m, pl] { return build_fs(m.m[1], *pl); });
-            ++g_stats.draws_deferred;
-            *pending = true;
-            return VK_NULL_HANDLE;
+        if (!g_stop) {
+            bool found_sm = false;
+            bool sm_ok = false;
+            if (auto it = g_resolved_sm.find(kh); it != g_resolved_sm.end()) {
+                for (const ResolvedSm& e : it->second) {
+                    if (e.key == key) {
+                        sm = e.sm;
+                        sm_ok = e.ok;
+                        found_sm = true;
+                        break;
+                    }
+                }
+            }
+            if (!found_sm) {
+                auto& pend = g_resolve_pending[kh];
+                bool already = false;
+                for (const GraphicsKey& pk_item : pend) {
+                    if (pk_item == key) { already = true; break; }
+                }
+                if (!already) {
+                    pend.push_back(key);
+                    const ProgLayout* pl = &layout;  // layouts live as long as the back end
+                    const GraphicsKey kcopy = key;
+                    ++g_stats.parts_async;
+                    g_exact_q.push_back([kcopy, kh, pl, r] {
+                        StageModules resolved;
+                        const bool ok = resolve_stage_modules(kcopy, &resolved);
+                        if (ok) {
+                            const std::string pk = pre_key(resolved, *pl, r);
+                            const std::string fk = fs_key(resolved, *pl);
+                            get_part(pk, false, [&] { return build_pre(resolved.m[0], resolved.m[2], *pl, r); });
+                            get_part(fk, false, [&] { return build_fs(resolved.m[1], *pl); });
+                        }
+                        std::lock_guard<std::mutex> lk2(g_mu);
+                        if (!g_stop) {
+                            g_resolved_sm[kh].push_back({kcopy, resolved, ok});
+                        }
+                        if (auto pit = g_resolve_pending.find(kh); pit != g_resolve_pending.end()) {
+                            auto& vec = pit->second;
+                            vec.erase(std::remove_if(vec.begin(), vec.end(), [&](const GraphicsKey& x) { return x == kcopy; }), vec.end());
+                            if (vec.empty()) g_resolve_pending.erase(pit);
+                        }
+                    });
+                    publish_backlog_locked();
+                    g_cv.notify_all();
+                }
+                ++g_stats.draws_deferred;
+                *pending = true;
+                return VK_NULL_HANDLE;
+            }
+            if (!sm_ok) return VK_NULL_HANDLE;
+            const std::string pk = pre_key(sm, layout, r), fk = fs_key(sm, layout);
+            if (!(part_done_locked(pk) && part_done_locked(fk))) {
+                const ProgLayout* pl = &layout;               // layouts live as long as the back end
+                const StageModules m = sm;
+                if (!part_done_locked(pk)) queue_exact_locked(pk, [m, pl, r] { return build_pre(m.m[0], m.m[2], *pl, r); });
+                if (!part_done_locked(fk)) queue_exact_locked(fk, [m, pl] { return build_fs(m.m[1], *pl); });
+                ++g_stats.draws_deferred;
+                *pending = true;
+                return VK_NULL_HANDLE;
+            }
+            // Both parts are ready; drop the temporary resolved-module cache entry as we link into g_gfx.
+            if (auto it = g_resolved_sm.find(kh); it != g_resolved_sm.end()) {
+                auto& vec = it->second;
+                vec.erase(std::remove_if(vec.begin(), vec.end(), [&](const ResolvedSm& e) { return e.key == key; }), vec.end());
+                if (vec.empty()) g_resolved_sm.erase(it);
+            }
+        } else {
+            if (!resolve_stage_modules(key, &sm)) return VK_NULL_HANDLE;
         }
+    } else {
+        if (!resolve_stage_modules(key, &sm)) return VK_NULL_HANDLE;
     }
     t_link_key = &key;
     VkPipeline parts[4];
@@ -804,7 +879,7 @@ VkPipeline gpl_link(const GraphicsKey& key, const ProgLayout& layout, std::share
         if (device().features().attachment_feedback_loop_layout)
             gi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
         gi.layout = layout.layout;
-        const VkResult res = create_graphics_pipeline_tracked(vkdev(), pipeline_cache_handle(), &gi, &pipe);
+        const VkResult res = create_graphics_pipeline_tracked(vkdev(), pipeline_library_cache_handle(), &gi, &pipe);
         if (res != VK_SUCCESS) {
             pipe = VK_NULL_HANDLE;
             ok = false;
@@ -824,7 +899,7 @@ VkPipeline gpl_link(const GraphicsKey& key, const ProgLayout& layout, std::share
     g_fail_streak = 0;
     ++g_stats.linked;
     g_stats.link_ms += ms;
-    note_pipeline_created(ms, "linked pipeline");
+    note_pipeline_created(ms, "linked pipeline", false);
     if (up && g_up_mode != UpMode::Off && !g_stop) {
         UpJob j;
         j.key = key;
@@ -985,6 +1060,8 @@ void gpl_stop() {
         g_pre_q.clear();
         g_exact_q.clear();
         g_exact_pending.clear();
+        g_resolved_sm.clear();
+        g_resolve_pending.clear();
         g_up_q.clear();
         publish_backlog_locked();
     }
@@ -1023,7 +1100,7 @@ std::string hex16(uint64_t h) {
 
 // The state file next to the program list: which GPU and driver the preparation ran on and whether it finished. The key changes with the
 // GPU, the driver version, the pipeline cache UUID (a driver update changes it) and the version of the part scheme in this file.
-constexpr int kPrepareScheme = 1;
+constexpr int kPrepareScheme = 2;
 std::string prepare_key(uint64_t programs) {
     const VkPhysicalDeviceProperties& p = device().properties();
     char uuid[40];

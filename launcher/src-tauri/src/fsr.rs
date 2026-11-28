@@ -7,7 +7,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use crate::streamline::{download_verified, Status};
+use crate::streamline::{download_verified, DownloadAsset, DownloadManifest, Status};
 
 /// Distinct Tauri state wrapper so FSR download status/cancellation never collides with DLSS `streamline::Shared`.
 #[derive(Default)]
@@ -63,6 +63,20 @@ const ASSETS: [FsrAsset; 5] = [
 
 const TOTAL_BYTES: u64 = 45_574_197;
 const WORK: &str = ".download";
+
+pub fn manifest() -> DownloadManifest {
+    DownloadManifest {
+        kind: "fsr",
+        version: "2.4.0 / 1.1.4",
+        repo_url: "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK",
+        total_bytes: TOTAL_BYTES,
+        license: "AMD FidelityFX SDK Binary EULA (v2.4.0) + MIT (v1.1.4)",
+        assets: ASSETS
+            .iter()
+            .map(|a| DownloadAsset { name: a.name, url: a.url, size: a.size, sha256: a.sha256 })
+            .collect(),
+    }
+}
 
 /// upscalers/fsr3 next to the game: the folder temporal_ffx.cpp and framegen_ffx.cpp search by default.
 pub fn dest(game_dir: &Path) -> PathBuf {
@@ -129,5 +143,17 @@ impl Run<'_> {
             total: TOTAL_BYTES,
             message: format!("AMD FidelityFX v2.4.0 / v1.1.4 installed in {}.", dest.display()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn manifest_matches_assets_and_sha256() {
+        let m = manifest();
+        assert_eq!(m.total_bytes, m.assets.iter().map(|a| a.size).sum::<u64>());
+        assert!(m.assets.iter().all(|a| a.url.starts_with("https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/")));
+        assert!(m.assets.iter().all(|a| a.sha256.len() == 64 && a.sha256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())));
     }
 }

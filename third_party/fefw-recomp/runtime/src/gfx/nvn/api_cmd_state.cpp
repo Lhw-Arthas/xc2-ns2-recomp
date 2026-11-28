@@ -16,11 +16,14 @@
 //   * BindCoverageModulationTable has no fields of its own: its record carries a zero P_U32 payload and the 16 floats as blob.
 // The layouts of the state objects are not read here, so no smo-recomp file was consulted for this family.
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include "nvn_cmd.h"
 #include "nvn_gpu.h"
 #include "nvn_impl.h"
+
+namespace nxrt::nvn::be { extern std::atomic<bool> g_tex_prep_on; }
 
 namespace nxrt::nvn {
 using namespace be;
@@ -28,13 +31,12 @@ namespace {
 
 CommandBuffer* cb_of(NVNcommandBuffer* c) { return host_of<CommandBuffer>(c); }
 
-// Runs fn(list) with the command buffer locked, but only while a list is being recorded.
+// Runs fn(list) while a list is being recorded. By NVN spec a command buffer is single-threaded between BeginRecording
+// and EndRecording (matching NS1 nvn_api_cmd.c), avoiding ~90k mutex lock/unlock pairs per frame on the game thread.
 template <class F>
 void with_rec(NVNcommandBuffer* c, F&& fn) {
     CommandBuffer* cb = cb_of(c);
-    if (!cb) return;
-    std::lock_guard<std::mutex> lk(cb->lock);
-    if (!cb->recording || !cb->rec) return;
+    if (!cb || !cb->recording || !cb->rec) return;
     fn(*cb->rec);
 }
 
@@ -81,15 +83,13 @@ void emit_buffer(NVNcommandBuffer* c, uint32_t kind, uint32_t stage, int index, 
 // Texture or image handles: stage, first slot, then the 64-bit handles as blob.
 void emit_handles(NVNcommandBuffer* c, Op op, NVNshaderStage stage, int first, int count, const uint64_t* handles) {
     if (count <= 0 || !handles) return;
+    CommandBuffer* cb = cb_of(c);
+    if (!cb || !cb->recording || !cb->rec) return;
     const P_BindTextures p{static_cast<uint32_t>(stage), static_cast<uint32_t>(first), static_cast<uint32_t>(count), 0};
     const uint32_t bytes = static_cast<uint32_t>(count) * 8u;
-    with_rec(c, [&](CmdList& l) {
-        l.emit(op, p, handles, bytes);
-        if (op == Op::BindTextures) {      // background texture preparation (nvn_texprep.h): the textures behind these handles are about to be sampled
-            CommandBuffer* cb = cb_of(c);
-            if (cb && cb->tpool) textures_note_bound(cb->tpool, handles, count);
-        }
-    });
+    cb->rec->emit(op, p, handles, bytes);
+    if (op == Op::BindTextures && cb->tpool && g_tex_prep_on.load(std::memory_order_relaxed))
+        textures_note_bound(cb->tpool, handles, count);
 }
 
 // Fills a render target entry: the texture (or null) and its view when one was given.

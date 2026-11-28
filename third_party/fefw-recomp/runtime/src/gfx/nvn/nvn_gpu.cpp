@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <condition_variable>
 #include <cstring>
@@ -61,7 +62,9 @@ struct Slot {
     size_t dpool_cur = 0;
     gfx::Buffer upload;
     VkDeviceSize upload_off = 0;
-    std::vector<gfx::Buffer> extra;       // staging / overflow buffers of the submission
+    std::vector<gfx::Buffer> upload_overflow;  // reusable 16 MiB chunks borrowed from g->upload_pool (returned on slot reset, never freed per frame!)
+    VkDeviceSize overflow_off = 0;
+    std::vector<gfx::Buffer> extra;       // one-off staging buffers (> 16 MiB) / adopted texprep buffers of the submission
     uint64_t serial = 0;                  // last submission that used the slot
     bool timed = false;                   // frame trace: the submission wrote GPU timestamps (query pair index = slot index * 2)
     uint64_t cpu_t0 = 0;
@@ -113,6 +116,7 @@ struct Gpu {
     int last_index = -1;
     std::chrono::steady_clock::time_point last_present{};
     Slot slots[kSlots];
+    std::vector<gfx::Buffer> upload_pool;   // render-thread pool of reusable kUploadBytes chunks (eliminates per-frame vkAllocateMemory/vkFreeMemory)
     VkQueryPool qpool = VK_NULL_HANDLE;   // frame trace: two timestamps per slot
     VkQueryPool gpool = VK_NULL_HANDLE;   // GPU pass profiler ([prof] gpu_passes): kGpMax timestamps per slot
     uint32_t next_slot = 0;
@@ -144,8 +148,22 @@ void flush_batch();   // [nvn] submit_batch, below
 std::mutex g_install_mu;
 
 uint64_t read_completed() {
+    if (!g) return 0;
+    if (g->dev->device_lost()) return g->completed.load();
     uint64_t v = 0;
-    if (g && g->timeline) vkGetSemaphoreCounterValue(g->dev->device(), g->timeline, &v);
+    if (g->timeline) {
+        const VkResult r = vkGetSemaphoreCounterValue(g->dev->device(), g->timeline, &v);
+        if (r == VK_ERROR_DEVICE_LOST) {
+            g->dev->note_device_lost(r, "vkGetSemaphoreCounterValue(nvn timeline)");
+            return g->completed.load();
+        }
+        if (r != VK_SUCCESS) return g->completed.load();
+        // Drivers have been observed returning VK_SUCCESS with UINT64_MAX on a lost/poisoned timeline: never let that corrupt g->completed.
+        if (v == UINT64_MAX && g->last_submitted.load() < UINT64_MAX - 1024) {
+            g->dev->note_device_lost(VK_ERROR_DEVICE_LOST, "vkGetSemaphoreCounterValue returned UINT64_MAX");
+            return g->completed.load();
+        }
+    }
     if (v > g->completed.load()) g->completed.store(v);
     return g->completed.load();
 }
@@ -160,14 +178,46 @@ void drain_pending_destroy() {
     for (auto& fn : pend) g->deferred.push_back({s, std::move(fn)});
 }
 
-void retire() {
+void retire(int64_t budget_ns = 0) {
     drain_pending_destroy();
-    const uint64_t done = read_completed();
+    const bool lost = g->dev->device_lost();
+    // Per the Vulkan spec, once VK_ERROR_DEVICE_LOST is observed all previously submitted commands are terminated and
+    // destroying child objects of the lost device remains valid. Without draining here, defer_destroy closures (such as
+    // mirror_capture CapArenas, textures, and pools) leak unboundedly after device loss (#81).
+    const uint64_t done = lost ? UINT64_MAX : read_completed();
+    const auto t0 = budget_ns > 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    size_t ran = 0;
     while (!g->deferred.empty() && g->deferred.front().serial <= done) {
         auto fn = std::move(g->deferred.front().fn);
         g->deferred.pop_front();
         g_gauge_deferred.sub(1);
         fn();
+        ++ran;
+        if (!lost && budget_ns > 0 && ran >= 4 &&
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count() >= budget_ns)
+            break;
+    }
+    // Reclaim completed slots' upload_overflow and extra staging buffers immediately (~2 frames) instead of waiting 72 slots (~2s)
+    // for the ring to wrap, preventing multi-GB host-visible memory accumulation during map switches.
+    constexpr size_t kUploadPoolMax = 8;
+    for (Slot& s : g->slots) {
+        if (!s.serial || s.serial > done) continue;
+        if (!s.upload_overflow.empty()) {
+            for (auto& b : s.upload_overflow) {
+                if (!lost && g->upload_pool.size() < kUploadPoolMax) g->upload_pool.push_back(b);
+                else g->dev->destroy_buffer(b);
+            }
+            s.upload_overflow.clear();
+            s.overflow_off = 0;
+        }
+        if (!s.extra.empty()) {
+            for (auto& b : s.extra) g->dev->destroy_buffer(b);
+            s.extra.clear();
+        }
+    }
+    if (lost && !g->upload_pool.empty()) {
+        for (auto& b : g->upload_pool) g->dev->destroy_buffer(b);
+        g->upload_pool.clear();
     }
 }
 
@@ -273,37 +323,9 @@ VkDescriptorPool new_dpool() {
     return p;
 }
 
-// VK_EXT_device_fault (enabled in vk_device.cpp): the reason the driver gives when it drops the device, instead of only the
-// -4 vkQueueSubmit2 returned. Empty when the extension is not there, which is the case for every driver that has no support -
-// the entry point is only resolvable on a device that enabled it. Called once, from the first failed submit. Issue 10 and
-// issue 4 both end here with nothing but "-4", and the N card reports have cost three rounds of guessing.
-static std::string device_fault_text(VkDevice dev) {
-    auto pfn = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(dev, "vkGetDeviceFaultInfoEXT"));
-    if (!pfn) return {};
-    VkDeviceFaultCountsEXT counts = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
-    if (pfn(dev, &counts, nullptr) != VK_SUCCESS) return {};
-    std::vector<VkDeviceFaultAddressInfoEXT> addrs(counts.addressInfoCount);
-    std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
-    VkDeviceFaultInfoEXT info = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
-    info.pAddressInfos = addrs.empty() ? nullptr : addrs.data();
-    info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
-    if (pfn(dev, &counts, &info) != VK_SUCCESS) return {};
-    char buf[400];
-    std::string out;
-    std::snprintf(buf, sizeof buf, "description '%s'", info.description[0] ? info.description : "(none)");
-    out = buf;
-    for (const VkDeviceFaultAddressInfoEXT& a : addrs) {
-        std::snprintf(buf, sizeof buf, "; address 0x%llx (type %d, precision 0x%llx)",
-                      static_cast<unsigned long long>(a.reportedAddress), static_cast<int>(a.addressType),
-                      static_cast<unsigned long long>(a.addressPrecision));
-        out += buf;
-    }
-    for (const VkDeviceFaultVendorInfoEXT& v : vendors) {
-        std::snprintf(buf, sizeof buf, "; vendor '%s' code 0x%llx data 0x%llx", v.description,
-                      static_cast<unsigned long long>(v.vendorFaultCode), static_cast<unsigned long long>(v.vendorFaultData));
-        out += buf;
-    }
-    return out;
+// VK_EXT_device_fault (enabled in vk_device.cpp): delegated to Device::query_device_fault so both NVN and Renderer share the latch/cache.
+static std::string device_fault_text(gfx::Device* dev) {
+    return dev ? dev->query_device_fault() : std::string{};
 }
 
 // Hands the recorded submissions of the batch to the GPU in one vkQueueSubmit2, in recording order, signalling the timeline with the last
@@ -339,8 +361,8 @@ void flush_batch() {
     si.pCommandBufferInfos = cbi.data();
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &sig;
-    VkResult r;
-    {
+    VkResult r = g->dev->device_lost() ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+    if (!g->dev->device_lost()) {
         nxrt::HitchTimer ht(nxrt::kHpRenderSubmit);
         const uint64_t tl = nxrt::hitch_ticks();
         std::lock_guard<std::mutex> lk(g->dev->queue_mutex());
@@ -348,20 +370,15 @@ void flush_batch() {
         r = vkQueueSubmit2(g->dev->queue(), 1, &si, VK_NULL_HANDLE);
     }
     if (r != VK_SUCCESS) {
+        g->dev->note_device_lost(r, "nvn flush_batch(vkQueueSubmit2)");
         // ONCE, not once per frame. A lost device makes every submit fail identically, and the retail log of one
         // session with a lost device held 21,872 copies of this line over 556 seconds - which buries the frames that
-        // came BEFORE the loss, the ones that would say why it happened. The submit itself is still attempted: the
-        // game keeps running and can be played blind, and stopping here would change behaviour this change is not
-        // meant to touch.
+        // came BEFORE the loss, the ones that would say why it happened.
         static std::atomic<bool> told{false};
         if (!told.exchange(true)) {
             NXLOG_E(kTag, "vkQueueSubmit2 failed (%d): the device is lost or out of memory", static_cast<int>(r));
-            if (const std::string why = device_fault_text(g->dev->device()); !why.empty())
+            if (const std::string why = device_fault_text(g->dev); !why.empty())
                 NXLOG_E(kTag, "device fault: %s", why.c_str());
-            // A host signal used to "keep the timeline moving" here. It cannot: once the device is lost the semaphore
-            // belongs to it, the signal fails too, and the attempt is a spec violation anyway - the value being
-            // signalled is still pending on the queue (VUID-VkSemaphoreSignalInfo-value-03259). Report it once and
-            // leave the timeline alone.
             NXLOG_E(kTag, "the GPU timeline can no longer be signalled: the device is gone. Restart the game.");
             NXLOG_E(kTag, "nothing will be drawn again; the game keeps running (sound and logic are unaffected), so "
                           "this is not a hang. Further submit failures are not logged.");
@@ -385,15 +402,23 @@ void want_flush(uint64_t serial) {
 }
 
 void wait_serial_blocking(uint64_t serial) {
-    if (!serial || read_completed() >= serial) return;
+    if (!serial || !g || g->dev->device_lost() || read_completed() >= serial) return;
     if (serial > g->flushed && on_render_thread()) flush_batch();     // a serial still in the batch would never signal
+    if (g->dev->device_lost()) return;
     NXFT("gpu.wait");
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g->timeline;
     wi.pValues = &serial;
-    VkResult r = vkWaitSemaphores(g->dev->device(), &wi, UINT64_MAX);
-    if (r != VK_SUCCESS) NXLOG_E(kTag, "vkWaitSemaphores failed (%d)", static_cast<int>(r));
+    for (;;) {
+        if (g->dev->device_lost() || read_completed() >= serial) break;
+        const VkResult r = vkWaitSemaphores(g->dev->device(), &wi, 2000000000ull);
+        if (r == VK_SUCCESS) break;
+        if (r == VK_TIMEOUT) continue;
+        if (!g->dev->note_device_lost(r, "nvn wait_serial_blocking(vkWaitSemaphores)"))
+            NXLOG_E(kTag, "vkWaitSemaphores failed (%d)", static_cast<int>(r));
+        break;
+    }
     read_completed();
 }
 
@@ -457,7 +482,7 @@ Slot& acquire_slot() {
     }
     s.gp_n = 0;
     s.gp_labels.clear();
-    retire();
+    retire(1500000);   // 1.5 ms per-frame teardown budget: spreads scene-switch resource frees smoothly across frames
     vkResetCommandPool(g->dev->device(), s.pool, 0);
     s.pro_next = 0;
     s.pro_cur = s.pro_final = VK_NULL_HANDLE;
@@ -466,8 +491,16 @@ Slot& acquire_slot() {
     s.sets_live = 0;
     s.dpool_cur = 0;
     s.upload_off = 0;
+    s.overflow_off = 0;
+    constexpr size_t kUploadPoolMax = 8;
+    for (auto& b : s.upload_overflow) {
+        if (g->upload_pool.size() < kUploadPoolMax) g->upload_pool.push_back(b);
+        else g->dev->destroy_buffer(b);
+    }
+    s.upload_overflow.clear();
     for (auto& b : s.extra) g->dev->destroy_buffer(b);
     s.extra.clear();
+    s.serial = 0;   // cleared while recording so retire() never touches the active slot
     return s;
 }
 
@@ -494,6 +527,9 @@ VkCommandBuffer Frame::prologue() {
     return c;
 }
 
+std::atomic<uint64_t> g_staging_overflows{0};
+uint64_t staging_overflow_count() { return g_staging_overflows.load(std::memory_order_relaxed); }
+
 UploadAlloc Frame::upload(VkDeviceSize size, VkDeviceSize align) {
     Slot& s = *static_cast<Slot*>(slot);
     if (align == 0) align = 16;
@@ -507,10 +543,50 @@ UploadAlloc Frame::upload(VkDeviceSize size, VkDeviceSize align) {
         a.size = size;
         return a;
     }
+    // Pooled 16 MiB overflow chunk arena: avoids calling vkCreateBuffer/vkAllocateMemory per allocation when >16 MiB/submission!
+    if (size <= kUploadBytes) {
+        if (!s.upload_overflow.empty()) {
+            gfx::Buffer& cur = s.upload_overflow.back();
+            const VkDeviceSize o2 = (s.overflow_off + align - 1) & ~(align - 1);
+            if (o2 + size <= cur.size) {
+                s.overflow_off = o2 + size;
+                UploadAlloc a;
+                a.buffer = cur.buffer;
+                a.offset = o2;
+                a.ptr = static_cast<uint8_t*>(cur.mapped) + o2;
+                a.size = size;
+                return a;
+            }
+        }
+        gfx::Buffer chunk;
+        if (g->upload_pool.empty()) retire();   // reclaim any just-finished slots before allocating a new 16 MiB chunk
+        if (!g->upload_pool.empty()) {
+            chunk = g->upload_pool.back();
+            g->upload_pool.pop_back();
+        } else {
+            g_staging_overflows.fetch_add(1, std::memory_order_relaxed);
+            const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+            if (g->dev->create_buffer(kUploadBytes, usage, gfx::MemoryUse::Upload, &chunk, "nvn upload chunk") != VK_SUCCESS) {
+                NXLOG_E(kTag, "upload chunk of %llu bytes failed", static_cast<unsigned long long>(kUploadBytes));
+                return {};
+            }
+        }
+        s.upload_overflow.push_back(chunk);
+        s.overflow_off = size;
+        UploadAlloc a;
+        a.buffer = chunk.buffer;
+        a.offset = 0;
+        a.ptr = static_cast<uint8_t*>(chunk.mapped);
+        a.size = size;
+        return a;
+    }
     return staging(size + align);
 }
 
 UploadAlloc Frame::staging(VkDeviceSize size) {
+    if (size <= kUploadBytes) return upload(size, 256);
+    g_staging_overflows.fetch_add(1, std::memory_order_relaxed);
     Slot& s = *static_cast<Slot*>(slot);
     gfx::Buffer b;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -545,6 +621,7 @@ void Frame::defer(std::function<void()> fn) {
 }
 
 VkDescriptorSet Frame::alloc_set(VkDescriptorSetLayout layout) {
+    if (g->dev->device_lost()) return VK_NULL_HANDLE;
     Slot& s = *static_cast<Slot*>(slot);
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (s.dpool_cur >= s.dpools.size()) {
@@ -564,6 +641,13 @@ VkDescriptorSet Frame::alloc_set(VkDescriptorSetLayout layout) {
             vk_gauge_descriptor_sets().add(1);
             return set;
         }
+        if (r == VK_ERROR_DEVICE_LOST) {
+            g->dev->note_device_lost(r, "nvn Frame::alloc_set(vkAllocateDescriptorSets)");
+            return VK_NULL_HANDLE;
+        }
+        // Only grow a fresh descriptor pool when the current one is actually full/fragmented; other errors (e.g.
+        // VK_ERROR_OUT_OF_DEVICE_MEMORY) must not spin creating hundreds of multi-megabyte pools (#41).
+        if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) return VK_NULL_HANDLE;
         ++s.dpool_cur;   // exhausted or fragmented: move on to the next pool (created on demand)
     }
     return VK_NULL_HANDLE;
@@ -729,6 +813,48 @@ void memory_barrier(VkCommandBuffer cb) {
     vkCmdPipelineBarrier2(cb, &di);
 }
 
+void memory_barrier_in_pass(VkCommandBuffer cb) {
+    g_gauge_barriers_mem.add(1);
+    VkMemoryBarrier2 b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+void transfer_pre_barrier(VkCommandBuffer cb) {
+    g_gauge_barriers_mem.add(1);
+    VkMemoryBarrier2 b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+void transfer_post_barrier(VkCommandBuffer cb) {
+    g_gauge_barriers_mem.add(1);
+    VkMemoryBarrier2 b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
+                      VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                      VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
 // ---- submission --------------------------------------------------------------------------------------------------------
 namespace {
 
@@ -743,6 +869,23 @@ VkCommandBuffer end_prologue(Slot& s) {
 }
 
 uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint64_t serial = 0) {
+    if (g->dev->device_lost()) {
+        if (!serial) {
+            std::lock_guard<std::mutex> lk(g->qmu);
+            serial = g->reserved.fetch_add(1) + 1;
+        }
+        if (serial > g->submitted) {
+            g->submitted = serial;
+            g->last_submitted.store(serial);
+        }
+        if (serial > g->flushed) {
+            g->flushed = serial;
+            g->flushed_pub.store(serial);
+            after_flush(serial);
+        }
+        retire();
+        return serial;
+    }
     NXFT("replay");
     nxrt::HitchTimer ht_replay(nxrt::kHpRenderReplay);
     const auto t0 = std::chrono::steady_clock::now();
@@ -818,10 +961,14 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
     {
         nxrt::HitchTimer ht(nxrt::kHpRenderSubmit);
         const uint64_t tl = nxrt::hitch_ticks();
-        std::lock_guard<std::mutex> lk(g->dev->queue_mutex());
+        std::unique_lock<std::mutex> lk(g->dev->queue_mutex());
         nxrt::hitch_phase_add(nxrt::kHpRenderLockWait, nxrt::hitch_ticks() - tl);
-        r = vkQueueSubmit2(g->dev->queue(), 1, &si, VK_NULL_HANDLE);
+        r = g->dev->device_lost() ? VK_ERROR_DEVICE_LOST : vkQueueSubmit2(g->dev->queue(), 1, &si, VK_NULL_HANDLE);
         if (r == VK_SUCCESS) vkQueueWaitIdle(g->dev->queue());   // nothing else tells when it is done
+        else {
+            lk.unlock();
+            g->dev->note_device_lost(r, "nvn sync submit(vkQueueSubmit2)");
+        }
     }
     g->recording = 0;
     s.serial = 0;
@@ -834,9 +981,10 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
 // recorded. The command buffer recorded so far goes to the queue on its own (no signal: the frame's serial is signalled by its last part),
 // and the recording continues in a fresh one that starts with a full memory barrier, so everything the earlier part wrote is visible to it.
 bool split_flush(Frame& f) {
-    if (!g || !f.slot || f.cb == VK_NULL_HANDLE) return false;
+    if (!g || !f.slot || f.cb == VK_NULL_HANDLE || g->dev->device_lost()) return false;
     Slot* s = static_cast<Slot*>(f.slot);
     flush_batch();                          // anything queued before this goes first (one queue: submission order is the order here)
+    if (g->dev->device_lost()) return false;
     VkCommandBuffer old = f.cb;
     if (vkEndCommandBuffer(old) != VK_SUCCESS) return false;
     const VkCommandBuffer pro = end_prologue(*s);   // [nvn] tex_prologue: the uploads recorded for this part go right before it
@@ -854,6 +1002,7 @@ bool split_flush(Frame& f) {
         r = vkQueueSubmit2(g->dev->queue(), 1, &si, VK_NULL_HANDLE);
     }
     if (r != VK_SUCCESS) {
+        g->dev->note_device_lost(r, "nvn split_flush(vkQueueSubmit2)");
         NXLOG_E(kTag, "split submit failed (%d): the frame stays in one command buffer", static_cast<int>(r));
         return false;
     }
@@ -907,11 +1056,12 @@ bool take_batch_for_present(std::vector<VkCommandBuffer>* cmds, gfx::Renderer::S
 }
 
 void present_batch_done(const gfx::Renderer::SubmitPrefix& p) {
-    if (!p.submitted) {   // as flush_batch: keep the timeline moving so waiters do not hang
+    if (!p.submitted && !g->dev->device_lost()) {   // keep the timeline moving if submit failed transiently without device loss
         VkSemaphoreSignalInfo ssi = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
         ssi.semaphore = g->timeline;
         ssi.value = p.value;
-        vkSignalSemaphore(g->dev->device(), &ssi);
+        const VkResult sr = vkSignalSemaphore(g->dev->device(), &ssi);
+        g->dev->note_device_lost(sr, "nvn present_batch_done(vkSignalSemaphore)");
     }
     g->flushed = p.value;
     g->flushed_pub.store(p.value);
@@ -978,6 +1128,7 @@ bool async_submit() {
 
 uint64_t submit(const std::vector<Ref<CmdList>>& lists) {
     if (!g) return ++g_idle_serial;
+    if (g->dev->device_lost()) return g->reserved.fetch_add(1) + 1;
     NXFT("submit");
     // [nvn] mirror_capture: the CPU's writes since the last submit are copied now, before the game can write its next frame; capture and
     // queueing under one lock, so captures stay in queue order
@@ -1006,6 +1157,7 @@ void finish() {
 
 bool serial_done(uint64_t serial) {
     if (!g || !serial) return true;
+    if (g->dev->device_lost()) return true;
     if (g->completed.load() >= serial) return true;
     if (read_completed() >= serial) return true;
     want_flush(serial);     // polled: it must reach the GPU to ever complete
@@ -1020,16 +1172,24 @@ std::atomic<uint64_t> g_wait_serial{0}, g_wait_timeout{0};   // the latest wait:
 std::string gpu_report() {
     if (!g) return {};
     uint64_t v = 0;
-    if (g->timeline) vkGetSemaphoreCounterValue(g->dev->device(), g->timeline, &v);
-    char b[400];
+    VkResult sr = VK_SUCCESS;
+    if (g->timeline) sr = vkGetSemaphoreCounterValue(g->dev->device(), g->timeline, &v);
+    const bool poisoned = (sr == VK_ERROR_DEVICE_LOST) || (sr == VK_SUCCESS && v == UINT64_MAX && g->last_submitted.load() < UINT64_MAX - 1024);
+    const bool lost = g->dev->device_lost() || poisoned;
+    std::string fault;
+    if (g->dev->features().device_fault) fault = g->dev->query_device_fault();
+    char b[512];
     size_t q = 0;
     bool got = false;
     if (g->qmu.try_lock()) { q = g->queue.size(); got = true; g->qmu.unlock(); }
-    std::snprintf(b, sizeof b, "NVN back end: last submitted serial %llu, timeline value %llu, %d game thread(s) in a sync wait (latest wait: serial %llu, timeout %llu ns), sync waits begun %llu done %llu, submits %llu, presents %llu, render queue %s%zu\n",
-                  static_cast<unsigned long long>(g->last_submitted.load()), static_cast<unsigned long long>(v), g_waiters.load(),
+    std::snprintf(b, sizeof b, "NVN back end: %slast submitted serial %llu, timeline value %llu (rc %d), %d game thread(s) in a sync wait (latest wait: serial %llu, timeout %llu ns), sync waits begun %llu done %llu, submits %llu, presents %llu, render queue %s%zu%s%s\n",
+                  lost ? "[DEVICE LOST] " : "",
+                  static_cast<unsigned long long>(g->last_submitted.load()), static_cast<unsigned long long>(v), static_cast<int>(sr),
+                  g_waiters.load(),
                   static_cast<unsigned long long>(g_wait_serial.load()), static_cast<unsigned long long>(g_wait_timeout.load()),
                   static_cast<unsigned long long>(g_waits_begun.load()), static_cast<unsigned long long>(g_waits_done.load()),
-                  static_cast<unsigned long long>(g->ctr.submits.load()), static_cast<unsigned long long>(g->ctr.presents.load()), got ? "" : "(busy) ", q);
+                  static_cast<unsigned long long>(g->ctr.submits.load()), static_cast<unsigned long long>(g->ctr.presents.load()), got ? "" : "(busy) ", q,
+                  fault.empty() ? "" : "; device fault: ", fault.empty() ? "" : fault.c_str());
     return b;
 }
 }  // namespace
@@ -1037,8 +1197,7 @@ std::string gpu_report() {
 int presents_since(uint64_t serial);   // below, beside the frame history
 
 bool wait_serial(uint64_t serial, uint64_t timeout_ns) {
-    if (!g || !serial) return true;
-    if (serial_done(serial)) return true;
+    if (!g || !serial || g->dev->device_lost() || serial_done(serial)) return true;
     if (timeout_ns == 0) return false;
     want_flush(serial);
     NXFT("sync.wait");
@@ -1059,6 +1218,7 @@ bool wait_serial(uint64_t serial, uint64_t timeout_ns) {
     wi.pSemaphores = &g->timeline;
     wi.pValues = &serial;
     const VkResult r = vkWaitSemaphores(g->dev->device(), &wi, timeout_ns);
+    if (r == VK_ERROR_DEVICE_LOST) g->dev->note_device_lost(r, "nvn wait_serial(vkWaitSemaphores)");
     read_completed();
     const auto tw1 = std::chrono::steady_clock::now();
     w_n[kind].fetch_add(1, std::memory_order_relaxed);
@@ -1137,7 +1297,10 @@ void present(Window* window, int index) {
     }();
     if (ahead == 0 || on_render_thread()) {
         Ref<Window> keep = Ref<Window>::share(window);
-        run_on_render_thread([&] { present_on_render_thread(window, index); });
+        run_on_render_thread([&] {
+            present_on_render_thread(window, index);
+            if (g->dev->device_lost()) retire();
+        });
         return;
     }
     {
@@ -1158,6 +1321,7 @@ void present(Window* window, int index) {
             });
             test_throw(g_test_presents);
             present_on_render_thread(keep.get(), index);
+            if (g->dev->device_lost()) retire();
         });
         g_gauge_render_queue.add(1);
     }
@@ -1403,6 +1567,8 @@ void tear_down() {
     gfx::Device& d = *gp->dev;
     vkDeviceWaitIdle(d.device());
     for (Slot& s : gp->slots) {
+        for (auto& b : s.upload_overflow) d.destroy_buffer(b);
+        s.upload_overflow.clear();
         for (auto& b : s.extra) d.destroy_buffer(b);
         vk_gauge_descriptor_sets().sub(static_cast<int64_t>(s.sets_live));
         s.sets_live = 0;
@@ -1417,6 +1583,8 @@ void tear_down() {
             if (s.cb) vk_gauge_command_buffers().sub(1);
         }
     }
+    for (auto& b : gp->upload_pool) d.destroy_buffer(b);
+    gp->upload_pool.clear();
     if (gp->qpool) { vkDestroyQueryPool(d.device(), gp->qpool, nullptr); vk_gauge_query_pools().sub(1); }
     if (gp->gpool) { vkDestroyQueryPool(d.device(), gp->gpool, nullptr); vk_gauge_query_pools().sub(1); }
     if (gp->timeline) { vkDestroySemaphore(d.device(), gp->timeline, nullptr); vk_gauge_semaphores().sub(1); }
@@ -1496,6 +1664,43 @@ GameViewportInfo game_viewport_info() {
     info.apply_present_crop = g_vp_crop.load(std::memory_order_relaxed);
     info.dlss_bypassed = g_vp_bypass.load(std::memory_order_relaxed);
     return info;
+}
+
+GameViewportInfo scale_viewport_info(const GameViewportInfo& gvi, float scene_scale, float out_scale, uint32_t quality_out_h,
+                                     int out_min) {
+    GameViewportInfo out = gvi;
+    if (gvi.render_w > 0 && gvi.render_h > 0) {
+        const float r_sc = be::gpu::compute_attachment_scale(
+            static_cast<int>(gvi.render_w), static_cast<int>(gvi.render_h),
+            NVN_TEXTURE_TARGET_2D, 0, false, 1, 1,
+            scene_scale, out_scale, out_min, 0, quality_out_h > 0, static_cast<int>(quality_out_h));
+        out.render_w = static_cast<uint32_t>(std::max(1L, std::lround(static_cast<double>(gvi.render_w) * r_sc)));
+        out.render_h = static_cast<uint32_t>(std::max(1L, std::lround(static_cast<double>(gvi.render_h) * r_sc)));
+    }
+    if (gvi.base_w > 0 && gvi.base_h > 0) {
+        const float b_sc = be::gpu::compute_attachment_scale(
+            static_cast<int>(gvi.base_w), static_cast<int>(gvi.base_h),
+            NVN_TEXTURE_TARGET_2D, 0, false, 1, 1,
+            scene_scale, out_scale, out_min, 0, quality_out_h > 0, static_cast<int>(quality_out_h));
+        out.base_w = static_cast<uint32_t>(std::max(1L, std::lround(static_cast<double>(gvi.base_w) * b_sc)));
+        out.base_h = static_cast<uint32_t>(std::max(1L, std::lround(static_cast<double>(gvi.base_h) * b_sc)));
+    }
+    return out;
+}
+
+GameViewportInfo scaled_game_viewport_info() {
+    const GameViewportInfo gvi = game_viewport_info();
+    if (!be::gpu::active()) return gvi;
+    static const int out_min = static_cast<int>(nxrt::config_get_int("gfx", "output_min_width", 1920));
+    // Call render_scale() first to ensure lazy init of scales, then read out_scale and quality_out_h.
+    (void)be::gpu::render_scale();
+    // Use direct render/output scale via compute_attachment_scale behavior:
+    // Note: when scene == 1.0f, be::gpu::render_scale() returns output_scale_live(), so expose exact render_scale_live too or query via config:
+    // Better: compute_attachment_scale uses exact scene & out; let's check both.
+    const float out_sc = be::gpu::output_scale_live();
+    const uint32_t q_h = be::gpu::quality_output_height_live();
+    // Wait: if scene != out, be::gpu::render_scale_now() != render_scale() when scene==1.0f! Let's read scene via render_scale_live().
+    return scale_viewport_info(gvi, be::gpu::render_scale_live(), out_sc, q_h, out_min);
 }
 
 BackendStats backend_stats() {

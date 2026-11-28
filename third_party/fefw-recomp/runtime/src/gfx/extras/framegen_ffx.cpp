@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <atomic>
 #include <cstdio>
@@ -319,10 +320,31 @@ void dump_tick(Ffx& f, VkExtent2D bb, VkFormat fmt) {
             f.dev->invalidate_buffer(sl.buf);
             std::vector<uint8_t> px(static_cast<size_t>(sl.w) * sl.h * 4);
             std::memcpy(px.data(), sl.buf.mapped, px.size());
-            const bool bgr = fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB;
-            for (size_t p = 0; p < px.size(); p += 4) {
-                if (bgr) std::swap(px[p], px[p + 2]);
-                px[p + 3] = 255;
+            if (fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+                auto pq10_to_srgb8 = [](uint32_t v10) -> uint8_t {
+                    const double e = static_cast<double>(v10) / 1023.0;
+                    const double p = std::pow(std::max(0.0, e), 1.0 / 78.84375);
+                    const double num = std::max(0.0, p - 0.8359375);
+                    const double den = 18.8515625 - 18.6875 * p;
+                    const double lin = (den > 1e-6) ? std::pow(num / den, 1.0 / 0.1593017578125) * (10000.0 / 203.0) : 1.0;
+                    const double c = std::clamp(lin, 0.0, 1.0);
+                    const double s = (c <= 0.0031308) ? (12.92 * c) : (1.055 * std::pow(c, 1.0 / 2.4) - 0.055);
+                    return static_cast<uint8_t>(std::lround(std::clamp(s, 0.0, 1.0) * 255.0));
+                };
+                for (size_t p = 0; p < px.size(); p += 4) {
+                    uint32_t w;
+                    std::memcpy(&w, px.data() + p, 4);
+                    px[p + 0] = pq10_to_srgb8(w & 0x3ffu);
+                    px[p + 1] = pq10_to_srgb8((w >> 10) & 0x3ffu);
+                    px[p + 2] = pq10_to_srgb8((w >> 20) & 0x3ffu);
+                    px[p + 3] = 255;
+                }
+            } else {
+                const bool bgr = fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB;
+                for (size_t p = 0; p < px.size(); p += 4) {
+                    if (bgr) std::swap(px[p], px[p + 2]);
+                    px[p + 3] = 255;
+                }
             }
             char name[96];
             std::snprintf(name, sizeof name, "fg_%06llu_%d_%s.png", static_cast<unsigned long long>(f.armed_at), i, sl.generated ? "generated" : "real");

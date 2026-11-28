@@ -18,6 +18,7 @@
 #include "nxrt/lowlat.h"
 #include "nxrt/platform.h"
 #include "extras/framegen.h"
+#include "extras/hdr_live.h"
 #include "extras/hdr_capture.h"
 #include "extras/hdr_math.h"
 #include "extras/win_display.h"
@@ -161,6 +162,8 @@ struct Renderer::Impl {
     VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
     // display extras (S14)
     extras::OutputKind wanted = extras::OutputKind::Sdr8;     // what the settings and the surface asked for at creation
+    bool offer10 = false, offer_sc = false;                   // the HDR swapchain flavours the surface offered at the decision
+    extras::OutputKind built_kind = extras::OutputKind::Sdr8; // what the last swapchain was made for (live [hdr] mode / format)
     extras::OutputKind kind = extras::OutputKind::Sdr8;       // what the swapchain in use carries
     VkColorSpaceKHR color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     uint32_t format_serial = 0;
@@ -268,7 +271,9 @@ struct Renderer::Impl {
             hs.output = k;
             if (k == extras::OutputKind::Sdr8) hs.peak_ratio = 1.0f;
             extras::hdr_set_state(hs);
+            if (k != extras::OutputKind::Sdr8) extras::hdr_refresh_levels();   // back from SDR: the peak ratio of the settings
         }
+        extras::set_hdr_shown_as_sdr(extras::hdr_state().scene_hdr && k == extras::OutputKind::Sdr8);
     }
 
     // The swapchain's HDR metadata (VK_EXT_hdr_metadata): the display's peak; in [hdr] mode = native the content levels are the game's own
@@ -310,9 +315,12 @@ struct Renderer::Impl {
         hs.game_max_fall = prev.game_max_fall;
         hs.game_display_max_nits = prev.game_display_max_nits;
         hs.metadata_serial = prev.metadata_serial + 1;
-        const bool forced = es.hdr.mode == extras::HdrMode::On || es.hdr.mode == extras::HdrMode::Native;   // Native: the game's HDR TV path, forced like On
+        // Started with HDR (auto / on): the HDR scene is set up, and [hdr] mode / format then pick the output live (live_kind). Started with
+        // off: nothing of it is set up (no cost); HDR needs a restart.
+        const extras::HdrMode mode = es.hdr.mode;
+        const bool forced = mode == extras::HdrMode::On || mode == extras::HdrMode::Native;   // Native: the game's HDR TV path, forced like On
         wanted = extras::OutputKind::Sdr8;
-        if (es.hdr.mode != extras::HdrMode::Off) {
+        if (mode != extras::HdrMode::Off) {
             bool o10 = false, osc = false;
             extras::DisplayHdrInfo di;
             if (headless) {
@@ -330,13 +338,15 @@ struct Renderer::Impl {
                 NXLOG_I(kTag, "HDR: surface offers HDR10 %s, scRGB %s; display %s: hdr %s, peak %.0f nits, SDR white %.0f nits (%s)", o10 ? "yes" : "no", osc ? "yes" : "no",
                         di.monitor, di.hdr_enabled ? "on" : "off", di.max_nits, di.sdr_white_nits, di.how);
             }
-            if (!headless && es.hdr.mode == extras::HdrMode::Auto && !(di.valid && di.hdr_enabled)) {
+            if (!headless && mode == extras::HdrMode::Auto && !(di.valid && di.hdr_enabled)) {
                 // the NVIDIA driver lists HDR10 and scRGB surface formats whether or not Windows HDR is on for the monitor, so "auto" needs Windows' own answer
                 if (o10 || osc) NXLOG_I(kTag, "HDR: the surface lists HDR formats but Windows does not report HDR on for this monitor (%s): SDR output (set [hdr] mode = on to force HDR)", di.how);
                 o10 = osc = false;
             }
             const bool pick10 = es.hdr.format == extras::HdrFormat::Hdr10 ? o10 : es.hdr.format == extras::HdrFormat::ScRgb ? false : o10;
             const bool pickSc = es.hdr.format == extras::HdrFormat::ScRgb ? osc : es.hdr.format == extras::HdrFormat::Hdr10 ? false : (!o10 && osc);
+            offer10 = o10;
+            offer_sc = osc;
             if (pick10) wanted = extras::OutputKind::Hdr10;
             else if (pickSc) wanted = extras::OutputKind::ScRgb;
             hs.scene_hdr = wanted != extras::OutputKind::Sdr8 || forced;
@@ -352,6 +362,7 @@ struct Renderer::Impl {
         }
         hs.output = extras::OutputKind::Sdr8;     // the swapchain sets the real one
         extras::hdr_set_state(hs);
+        extras::set_hdr_shown_as_sdr(hs.scene_hdr && kind == extras::OutputKind::Sdr8);   // a swapchain made before this decision
         NXLOG_I(kTag, "HDR: mode %d, scene %s, wanted output %s, paper white %.0f nits, peak %.0f nits, peak ratio %.2f", static_cast<int>(es.hdr.mode), hs.scene_hdr ? "HDR" : "SDR",
                 extras::output_kind_name(wanted), hs.paper_white_nits, hs.peak_nits, hs.peak_ratio);
     }
@@ -376,8 +387,21 @@ struct Renderer::Impl {
         return ok;
     }
 
+    // The output the settings ask for now: SDR with [hdr] mode = off, else the [hdr] format among what the surface offered (live)
+    extras::OutputKind live_kind() const {
+        if (wanted == extras::OutputKind::Sdr8 || headless) return wanted;
+        const extras::Settings es = extras::settings();
+        if (es.hdr.mode == extras::HdrMode::Off) return extras::OutputKind::Sdr8;
+        if (es.hdr.format == extras::HdrFormat::Hdr10 && offer10) return extras::OutputKind::Hdr10;
+        if (es.hdr.format == extras::HdrFormat::ScRgb && offer_sc) return extras::OutputKind::ScRgb;
+        if (es.hdr.format == extras::HdrFormat::Auto) return offer10 ? extras::OutputKind::Hdr10 : offer_sc ? extras::OutputKind::ScRgb : wanted;
+        return wanted;
+    }
+
     bool recreate(uint32_t want_w, uint32_t want_h) {
         dev->wait_idle();
+        built_kind = live_kind();
+        const extras::OutputKind wanted = built_kind;
         if (headless) {
             destroy_targets();
             extent = {want_w, want_h};
@@ -665,6 +689,10 @@ Renderer::~Renderer() {
 bool Renderer::begin_frame(FrameInfo* out) {
     Impl& s = *impl_;
     if (s.in_frame) end_frame();   // a forgotten end_frame must not wedge the slot
+    if (s.dev->device_lost()) {
+        s.st.skipped++;
+        return false;
+    }
     int pw = static_cast<int>(s.headless_w), ph = static_cast<int>(s.headless_h);
     if (!s.headless) platform::pixel_size(&pw, &ph);
     if (!s.headless && (pw == 0 || ph == 0)) {
@@ -676,6 +704,7 @@ bool Renderer::begin_frame(FrameInfo* out) {
         s.last_px_w = pw;
         s.last_px_h = ph;
     }
+    if (s.wanted != extras::OutputKind::Sdr8 && s.live_kind() != s.built_kind) s.dirty = true;   // [hdr] mode / format changed (live)
     if (s.dirty && !s.recreate(static_cast<uint32_t>(pw), static_cast<uint32_t>(ph))) {
         s.st.skipped++;
         return false;
@@ -688,14 +717,43 @@ bool Renderer::begin_frame(FrameInfo* out) {
     if (s.kind != extras::OutputKind::Sdr8 && extras::hdr_state().metadata_serial != s.md_serial) s.apply_hdr_metadata();   // the game declared new levels
 
     Impl::Slot& slot = s.slots[s.cur_slot];
-    vkWaitForFences(s.vk(), 1, &slot.fence, VK_TRUE, UINT64_MAX);
+    for (;;) {
+        if (s.dev->device_lost()) { s.st.skipped++; return false; }
+        const VkResult fr = vkWaitForFences(s.vk(), 1, &slot.fence, VK_TRUE, 2000000000ull);
+        if (fr == VK_SUCCESS) break;
+        if (fr == VK_TIMEOUT) continue;
+        s.dev->note_device_lost(fr, "Renderer::begin_frame(vkWaitForFences)");
+        s.st.skipped++;
+        return false;
+    }
     s.read_timestamps(slot);
 
     uint32_t idx = 0;
     if (s.headless) {
         idx = static_cast<uint32_t>(s.frame_number % s.targets.size());
     } else {
-        VkResult r = vkAcquireNextImageKHR(s.vk(), s.swapchain, UINT64_MAX, slot.acquire, VK_NULL_HANDLE, &idx);
+        const auto t0 = std::chrono::steady_clock::now();
+        uint64_t timeouts = 0;
+        VkResult r = VK_TIMEOUT;
+        for (;;) {
+            if (s.dev->device_lost()) { s.st.skipped++; return false; }
+            r = vkAcquireNextImageKHR(s.vk(), s.swapchain, 2000000000ull, slot.acquire, VK_NULL_HANDLE, &idx);
+            if (r != VK_TIMEOUT) break;
+            ++timeouts;
+        }
+        const double acq_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (timeouts > 0 || acq_ms >= 100.0) {
+            static auto last_warn = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_warn >= std::chrono::seconds(2)) {
+                last_warn = now;
+                NXLOG_W(kTag,
+                        "slow vkAcquireNextImageKHR: %.1f ms (timeouts %llu, rc %d, present_mode %s, frames_in_flight %u, low_latency %d)",
+                        acq_ms, static_cast<unsigned long long>(timeouts), static_cast<int>(r),
+                        present_mode_name(s.active), static_cast<unsigned>(s.desc.frames_in_flight),
+                        (s.latency && s.latency->enabled()) ? 1 : 0);
+            }
+        }
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
             s.dirty = true;
             s.st.out_of_date++;
@@ -706,6 +764,7 @@ bool Renderer::begin_frame(FrameInfo* out) {
             s.dirty = true;     // finish this frame, rebuild before the next
             s.st.out_of_date++;
         } else if (r != VK_SUCCESS) {
+            s.dev->note_device_lost(r, "Renderer::begin_frame(vkAcquireNextImageKHR)");
             NXLOG_E(kTag, "vkAcquireNextImageKHR failed (%d)", static_cast<int>(r));
             s.st.skipped++;
             return false;
@@ -740,6 +799,8 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
         barrier(slot.cmd, t.image, kColorAtt, kColorAtt);
         s.overlay(s.info);
     }
+    s.info.scene_depth_view = VK_NULL_HANDLE;
+    s.info.scene_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     const bool capturing = s.cap_pending.load(std::memory_order_acquire) && (s.headless || s.capture_supported);
     Buffer cap;
@@ -780,6 +841,7 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
         vkCmdWriteTimestamp2(slot.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot.queries, 1);
         slot.ts_pending = true;
     }
+    s.dev->cmd_checkpoint(slot.cmd, "present_end");
     vkEndCommandBuffer(slot.cmd);
 
     VkSemaphoreSubmitInfo waits[2] = {};
@@ -824,7 +886,18 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
     uint64_t present_id = 0;
     uint64_t probe_value = 0;
     if (!s.headless && s.latency) {
+        const auto pt0 = std::chrono::steady_clock::now();
         const uint64_t id = s.latency->present_begin();
+        const double pms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pt0).count();
+        if (pms >= 100.0) {
+            static auto last_pwarn = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_pwarn >= std::chrono::seconds(2)) {
+                last_pwarn = now;
+                NXLOG_W(kTag, "slow present_begin (low_latency): %.1f ms (present_id %llu)",
+                        pms, static_cast<unsigned long long>(id));
+            }
+        }
         if (s.latency->enabled() && s.latency->backend() == extras::LowLatency::Backend::Reflex) present_id = id;
         s.probe_init();
         if (s.probe_sem) {
@@ -837,19 +910,32 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
             pr.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         }
     }
+    VkResult submit_r = VK_ERROR_DEVICE_LOST;
     {
-        std::lock_guard<std::mutex> lk(s.dev->queue_mutex());
-        VkResult r = vkQueueSubmit2(s.dev->queue(), 1, &si, slot.fence);
-        if (r != VK_SUCCESS) {
+        bool skip_submit = s.dev->device_lost();
+        if (!skip_submit && prefix && prefix->wait) {
+            uint64_t tv = 0;
+            const VkResult tr = vkGetSemaphoreCounterValue(s.vk(), prefix->wait, &tv);
+            if (tr == VK_ERROR_DEVICE_LOST || (tr == VK_SUCCESS && tv == UINT64_MAX && prefix->wait_value < UINT64_MAX - 1024)) {
+                s.dev->note_device_lost(VK_ERROR_DEVICE_LOST, "Renderer::end_frame(timeline check)");
+                skip_submit = true;
+            }
+        }
+        if (!skip_submit) {
+            std::lock_guard<std::mutex> lk(s.dev->queue_mutex());
+            submit_r = vkQueueSubmit2(s.dev->queue(), 1, &si, slot.fence);
+        }
+        if (submit_r != VK_SUCCESS) {
+            s.dev->note_device_lost(submit_r, "Renderer::end_frame(vkQueueSubmit2)");
             // once, for the same reason as the NVN submit path: one lost device produced 21,872 identical lines
             static std::atomic<bool> told{false};
             if (!told.exchange(true))
                 NXLOG_E(kTag, "vkQueueSubmit2 failed (%d) - further present-path submit failures are not logged",
-                        static_cast<int>(r));
+                        static_cast<int>(submit_r));
         }
         else if (probe_value) s.probe_published.store(probe_value);
-        if (prefix) prefix->submitted = r == VK_SUCCESS;
-        if (!s.headless) {
+        if (prefix) prefix->submitted = submit_r == VK_SUCCESS;
+        if (submit_r == VK_SUCCESS && !s.headless) {
             VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
             pi.waitSemaphoreCount = 1;
             pi.pWaitSemaphores = &t.render_done;
@@ -862,13 +948,14 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
                 pid.pPresentIds = &present_id;
                 pi.pNext = &pid;
             }
-            r = vkQueuePresentKHR(s.dev->queue(), &pi);
+            const VkResult pr = vkQueuePresentKHR(s.dev->queue(), &pi);
             s.st.presents++;
-            if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
+            if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR || pr == VK_ERROR_SURFACE_LOST_KHR) {
                 s.dirty = true;
                 s.st.out_of_date++;
-            } else if (r != VK_SUCCESS) {
-                NXLOG_E(kTag, "vkQueuePresentKHR failed (%d)", static_cast<int>(r));
+            } else if (pr != VK_SUCCESS) {
+                s.dev->note_device_lost(pr, "Renderer::end_frame(vkQueuePresentKHR)");
+                NXLOG_E(kTag, "vkQueuePresentKHR failed (%d)", static_cast<int>(pr));
             }
         }
     }
@@ -890,7 +977,20 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
     s.cur_slot = (s.cur_slot + 1) % static_cast<uint32_t>(s.slots.size());
 
     if (cap) {
-        vkWaitForFences(s.vk(), 1, &slot.fence, VK_TRUE, UINT64_MAX);
+        bool cap_ok = (submit_r == VK_SUCCESS) && !s.dev->device_lost();
+        while (cap_ok) {
+            const VkResult wr = vkWaitForFences(s.vk(), 1, &slot.fence, VK_TRUE, 2000000000ull);
+            if (wr == VK_SUCCESS) break;
+            if (wr == VK_TIMEOUT && !s.dev->device_lost()) continue;
+            s.dev->note_device_lost(wr, "Renderer::end_frame(capture vkWaitForFences)");
+            cap_ok = false;
+        }
+        if (!cap_ok) {
+            s.dev->destroy_buffer(cap);
+            if (!s.cap_path.empty()) g_png_writes.fetch_sub(1);
+            s.cap_pending.store(false, std::memory_order_relaxed);
+            return;
+        }
         std::vector<uint8_t> raw(static_cast<size_t>(w) * h * bpp);
         s.dev->invalidate_buffer(cap);
         std::memcpy(raw.data(), cap.mapped, raw.size());
@@ -941,6 +1041,12 @@ void Renderer::end_frame(SubmitPrefix* prefix) {
 }
 
 void Renderer::set_overlay_hook(std::function<void(const FrameInfo&)> hook) { impl_->overlay = std::move(hook); }
+void Renderer::set_scene_depth(VkImageView view, VkImageLayout layout, bool flip_y, int depth_mode) {
+    impl_->info.scene_depth_view = view;
+    impl_->info.scene_depth_layout = layout;
+    impl_->info.scene_depth_flip_y = flip_y;
+    impl_->info.scene_depth_mode = depth_mode;
+}
 
 bool Renderer::set_present_mode(PresentMode m) {
     Impl& s = *impl_;

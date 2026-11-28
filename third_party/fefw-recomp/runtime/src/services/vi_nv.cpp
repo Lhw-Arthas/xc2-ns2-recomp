@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "nxrt/config.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
 #include "nxrt/services_api.h"
@@ -158,12 +159,29 @@ ViState& vi() {
     return s;
 }
 
-// The display's vsync: a host thread signals the event at 60 Hz. Started by the first GetDisplayVsyncEvent, stopped by vi_nv_reset().
+std::atomic<double> g_vsync_hz_override{0.0};
+
+double active_vsync_hz() {
+    const double ov = g_vsync_hz_override.load(std::memory_order_relaxed);
+    if (ov > 0.0) return (ov < 30.0) ? 30.0 : (ov > 240.0 ? 240.0 : ov);
+    static const double cfg = nxrt::config_get_double("nvn", "present_interval_hz", 60.0);
+    if (cfg <= 0.0) return 60.0;
+    return (cfg < 30.0) ? 30.0 : (cfg > 240.0 ? 240.0 : cfg);
+}
+
+// The display's vsync: a host thread signals the event at active_vsync_hz() (drift-free deadline so 90 Hz gameplay
+// and 60 Hz cutscenes stay in exact phase with FrameLimiter and Reflex, never beating at 3:2 against 60 Hz).
 void vsync_main() {
     ViState& s = vi();
     std::unique_lock<std::mutex> lk(s.mu);
+    auto next_tick = std::chrono::steady_clock::now();
     while (!s.vsync_stop) {
-        s.cv.wait_for(lk, std::chrono::microseconds(16667), [&] { return s.vsync_stop; });
+        const double hz = active_vsync_hz();
+        const auto period = std::chrono::nanoseconds(static_cast<int64_t>(1e9 / hz));
+        next_tick += period;
+        const auto now = std::chrono::steady_clock::now();
+        if (next_tick + period * 4 < now) next_tick = now + period;
+        s.cv.wait_until(lk, next_tick, [&] { return s.vsync_stop; });
         if (s.vsync_stop) break;
         s.vsync.signal();
     }
@@ -393,7 +411,7 @@ uint32_t vsync_new_handle() {
         s.vsync_on = true;
         s.vsync_stop = false;
         s.th = std::thread(vsync_main);
-        NXLOG_I(kTagVi, "display vsync: 60 Hz event started");
+        NXLOG_I(kTagVi, "display vsync: %.2f Hz event started (dynamic)", active_vsync_hz());
     }
     return s.vsync.new_handle();
 }
@@ -477,7 +495,7 @@ void setup_system_display(ipc::Service& s) {
         display_size(&w, &h);
         rsp.push<uint32_t>(w);
         rsp.push<uint32_t>(h);
-        rsp.push<float>(60.0f);
+        rsp.push<float>(static_cast<float>(active_vsync_hz()));
         rsp.push<uint32_t>(0);
         return 0;
     });
@@ -1320,6 +1338,10 @@ void vi_nv_reset() {
 
 namespace viapi {
 uint32_t display_vsync_handle() { return vsync_new_handle(); }
+void set_display_vsync_hz(double hz) {
+    const double clamped = hz > 0.0 ? (hz < 30.0 ? 30.0 : (hz > 240.0 ? 240.0 : hz)) : 0.0;
+    g_vsync_hz_override.store(clamped, std::memory_order_relaxed);
+}
 }  // namespace viapi
 
 }  // namespace nxrt::services

@@ -14,9 +14,14 @@ constexpr uint64_t MiB = 1ull << 20;
 constexpr uint64_t GiB = 1ull << 30;
 }  // namespace
 
-NXTEST(large_card_caps_at_2048_mib) {
-    CHECK_EQ(mirror_cap(10 * GiB, -1).bytes, 2048 * MiB);
-    CHECK_EQ(mirror_cap(24 * GiB, -1).bytes, 2048 * MiB);
+NXTEST(large_card_gets_a_quarter_of_the_heap_up_to_8_gib) {
+    // The cap used to stop at 2048 MiB (the upstream value). XC2 NS2's mesh pools need a whole-pool copy of about 2.6 GiB
+    // for the capture to serve every pool it is meant to, so 60da2f1 raised kMirrorCapMax to 8192 MiB: a quarter of the
+    // heap, capped there, instead of a quarter capped at 2048.
+    CHECK_EQ(mirror_cap(10 * GiB, -1).bytes, 2560 * MiB);
+    CHECK_EQ(mirror_cap(24 * GiB, -1).bytes, 6144 * MiB);
+    CHECK_EQ(mirror_cap(32 * GiB, -1).bytes, 8192 * MiB);     // a quarter is exactly the cap
+    CHECK_EQ(mirror_cap(64 * GiB, -1).bytes, 8192 * MiB);     // above that the cap holds
     CHECK_EQ(mirror_cap(8 * GiB, -1).bytes, 2048 * MiB);      // exactly a quarter
 }
 

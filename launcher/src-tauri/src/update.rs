@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Updates of the release package from inside the launcher: asks GitHub for the latest release, downloads its package for this
-//! platform (the -win64.zip, or the -linux-x64.tar.gz) with curl (Windows' own curl.exe), checks it against the SHA-256 digest
-//! GitHub lists for the asset, unpacks it with tar (Windows' own tar.exe) and moves the new files over the install folder. Everything the old package had is moved to update/old first and moved back if any step fails.
-//! The player's files (fefw.exe, fefw.ini, controls.ini, save/, shader_cache/, build/, logs) are not in the zip and stay as they are.
-//! Afterwards the new package's `fefw_build.py --check` says whether fefw.exe has to be built again (Set up).
+//! platform (XC2-package-dist-*.zip) with curl (Windows' own curl.exe), checks it against the SHA-256 digest GitHub lists for
+//! the asset, unpacks it with tar (Windows' own tar.exe) and moves the new files over the install folder. Everything the old
+//! package had is moved to update/old first and moved back if any step fails.
+//! The player's files (xc2_boot.exe, nxrt.ini, controls.ini, save/, shader_cache/, logs) are not in the zip and stay as they are.
+//! Afterwards `rebuild_needed` checks whether xc2_boot.exe is missing or the hook tables / stub sources changed.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -17,18 +18,18 @@ use std::time::Duration;
 /// The GitHub repository whose releases the launcher follows. FEFW_UPDATE_REPO at build time: a fork's launcher follows the fork.
 pub const REPO: &str = match option_env!("FEFW_UPDATE_REPO") {
     Some(r) => r,
-    None => "Goldoire/fefw-recomp",
+    None => "weile10000/xc2-ns2-recomp",
 };
 /// FEFW_BUILD_ID at build time: the release tag this launcher was built for (a fork tagging its releases by commit). Any other
 /// latest release then counts as newer, as tags like that have no order.
 pub const BUILD_ID: Option<&str> = option_env!("FEFW_BUILD_ID");
 /// The release asset for this platform, and files a downloaded package must have.
 #[cfg(windows)]
-const PACKAGE: (&str, &str, [&str; 4]) = ("-win64.zip", "Windows", ["fefw-launcher.exe", "fefw_rt.dll", "tools/build/fefw_build.py", "tools/python/python.exe"]);
+const PACKAGE: (&str, &str, [&str; 4]) = (".zip", "Windows", ["xc2-launcher.exe", "runtime/xc2_rt.dll", "engine/xc2_setup.py", "tools/python/python.exe"]);
 #[cfg(not(windows))]
 const PACKAGE: (&str, &str, [&str; 4]) =
-    ("-linux-x64.tar.gz", "Linux", ["fefw-launcher.AppImage", "fefw_rt.dll", "tools/build/fefw_build.py", "tools/python/bin/python3"]);
-const AGENT: &str = "fefw-launcher";
+    ("-linux-x64.tar.gz", "Linux", ["xc2-launcher.AppImage", "runtime/xc2_rt.dll", "engine/xc2_setup.py", "tools/python/bin/python3"]);
+const AGENT: &str = "xc2-launcher";
 const CURL: &str = if cfg!(windows) { "curl.exe" } else { "curl" };
 const TAR: &str = if cfg!(windows) { "tar.exe" } else { "tar" };
 /// The launcher's working folder inside the install folder: downloads, the unpacked package, the previous version's files.
@@ -100,10 +101,66 @@ fn curl() -> Command {
     c
 }
 
+fn parse_release(v: &serde_json::Value) -> Release {
+    let tag = v["tag_name"].as_str().unwrap_or_default();
+    let version = tag.trim_start_matches(['v', 'V']).to_string();
+    let assets = v["assets"].as_array().cloned().unwrap_or_default();
+    let none = serde_json::Value::Null;
+    let zip = assets
+        .iter()
+        .find(|a| a["name"].as_str().is_some_and(|n| n.starts_with("XC2-package-dist-") && n.ends_with(PACKAGE.0)))
+        .unwrap_or(&none);
+    let digest = zip["digest"].as_str().unwrap_or_default();
+    Release {
+        name: v["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(tag).to_string(),
+        notes: v["body"].as_str().unwrap_or_default().replace("\r\n", "\n"),
+        page: v["html_url"].as_str().unwrap_or_default().to_string(),
+        asset_name: zip["name"].as_str().unwrap_or_default().to_string(),
+        asset_url: zip["browser_download_url"].as_str().unwrap_or_default().to_string(),
+        size: zip["size"].as_u64().unwrap_or(0),
+        sha256: digest.strip_prefix("sha256:").unwrap_or("").to_ascii_lowercase(),
+        version,
+    }
+}
+
+/// Picks the newest published release from GitHub's `/releases` list. `/releases/latest` skips pre-releases
+/// (`prerelease = true`), whereas all `0.x` releases are marked pre-release, so listing + sorting by semver finds them.
+fn select_latest_release(v: &serde_json::Value) -> Result<Release, String> {
+    if let Some(arr) = v.as_array() {
+        let mut best: Option<(Option<(u64, u64, u64)>, Release)> = None;
+        for item in arr {
+            if item["draft"].as_bool().unwrap_or(false) {
+                continue;
+            }
+            let rel = parse_release(item);
+            if rel.version.is_empty() {
+                continue;
+            }
+            let ver = parse_version(&rel.version);
+            let replace = match &best {
+                None => true,
+                Some((bv, _)) => match (ver, *bv) {
+                    (Some(a), Some(b)) => a > b,
+                    (Some(_), None) => true,
+                    _ => false,
+                },
+            };
+            if replace {
+                best = Some((ver, rel));
+            }
+        }
+        return best.map(|(_, r)| r).ok_or_else(|| "GitHub has no published releases yet.".to_string());
+    }
+    if v["tag_name"].is_string() {
+        return Ok(parse_release(v));
+    }
+    Err("GitHub sent an unexpected release list.".to_string())
+}
+
 /// The latest published release of REPO and its package for this platform. A release without one (Linux, while only the Windows
 /// zip is published) comes back with an empty asset: it can be shown, not installed.
 pub fn latest() -> Result<Release, String> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=20");
     let out = curl()
         .args(["--retry", "2", "--retry-all-errors", "--max-time", "30", "--header", "Accept: application/vnd.github+json", &url])
         .stdin(Stdio::null())
@@ -113,22 +170,7 @@ pub fn latest() -> Result<Release, String> {
         return Err(format!("Could not reach GitHub: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("GitHub sent an unexpected answer: {e}"))?;
-    let tag = v["tag_name"].as_str().unwrap_or_default();
-    let version = tag.trim_start_matches(['v', 'V']).to_string();
-    let assets = v["assets"].as_array().cloned().unwrap_or_default();
-    let none = serde_json::Value::Null;
-    let zip = assets.iter().find(|a| a["name"].as_str().is_some_and(|n| n.starts_with("fefw-recomp-") && n.ends_with(PACKAGE.0))).unwrap_or(&none);
-    let digest = zip["digest"].as_str().unwrap_or_default();
-    Ok(Release {
-        name: v["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(tag).to_string(),
-        notes: v["body"].as_str().unwrap_or_default().replace("\r\n", "\n"),
-        page: v["html_url"].as_str().unwrap_or_default().to_string(),
-        asset_name: zip["name"].as_str().unwrap_or_default().to_string(),
-        asset_url: zip["browser_download_url"].as_str().unwrap_or_default().to_string(),
-        size: zip["size"].as_u64().unwrap_or(0),
-        sha256: digest.strip_prefix("sha256:").unwrap_or("").to_ascii_lowercase(),
-        version,
-    })
+    select_latest_release(&v)
 }
 
 pub fn check(current: &str, package: bool) -> Result<Check, String> {
@@ -263,7 +305,7 @@ impl Run<'_> {
         Ok(zip)
     }
 
-    /// Unpacks the zip into `stage` and returns its package folder (fefw-recomp-<version>/).
+    /// Unpacks the zip into `stage` and returns its package root (supporting both a flat zip root and a single top folder).
     fn unpack(&self, zip: &Path, stage: &Path) -> Result<PathBuf, String> {
         self.set("unpack", 0, 0, "Unpacking");
         if stage.exists() {
@@ -279,10 +321,14 @@ impl Run<'_> {
         if !out.status.success() && !only_time_errors(&String::from_utf8_lossy(&out.stderr)) {
             return Err(format!("Unpacking failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
-        let dirs: Vec<PathBuf> = fs::read_dir(stage).map_err(|e| e.to_string())?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-        let top = match dirs.as_slice() {
-            [one] => one.clone(),
-            _ => return Err("The package does not have the expected layout.".into()),
+        let top = if stage.join(PACKAGE.2[0]).is_file() {
+            stage.to_path_buf()
+        } else {
+            let dirs: Vec<PathBuf> = fs::read_dir(stage).map_err(|e| e.to_string())?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+            match dirs.as_slice() {
+                [one] => one.clone(),
+                _ => return Err("The package does not have the expected layout.".into()),
+            }
         };
         for need in PACKAGE.2 {
             if !top.join(need).is_file() {
@@ -418,25 +464,34 @@ pub fn install(install: &Path, top: &Path, old: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the installed package's tools would rebuild fefw.exe: the package's own `fefw_build.py --check`.
+/// Whether the updated package requires rebuilding xc2_boot.exe. Compares `install/xc2` against `update/old/xc2`
+/// saved aside during `install()` (because `tar -m` gives all unpacked files the current timestamp).
 pub fn rebuild_needed(install: &Path, game_dir: &Path) -> (Option<bool>, String) {
-    let tools = install.join("tools");
-    if !game_dir.join("fefw.exe").is_file() {
-        return (Some(true), "fefw.exe is not built yet".into());
+    if !game_dir.join("xc2_boot.exe").is_file() {
+        return (Some(true), "xc2_boot.exe is not built yet".into());
     }
-    let mut c = Command::new(crate::setup::package_python(&tools));
-    c.arg("-I").arg(tools.join("build").join("fefw_build.py")).arg("--check").arg("--game").arg(game_dir);
-    crate::setup::quiet(&mut c);
-    match c.stdin(Stdio::null()).output() {
-        Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-            let last = text.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or_default();
-            // --check prints {"current": ..., "reason": "..."}
-            let reason = serde_json::from_str::<serde_json::Value>(last).ok().and_then(|v| v["reason"].as_str().map(String::from)).unwrap_or_else(|| last.to_string());
-            (Some(!o.status.success()), reason)
+    let old_dir = install.join(WORK).join("old");
+    if !old_dir.is_dir() {
+        return (None, String::new());
+    }
+    let new_xc2 = install.join("xc2");
+    let old_xc2 = old_dir.join("xc2");
+    if !new_xc2.is_dir() && !old_xc2.is_dir() {
+        return (Some(false), String::new());
+    }
+    let mut new_files = walk(&new_xc2);
+    let mut old_files = walk(&old_xc2);
+    new_files.sort();
+    old_files.sort();
+    if new_files != old_files {
+        return (Some(true), "hook tables or stub sources changed".into());
+    }
+    for rel in &new_files {
+        if fs::read(new_xc2.join(rel)).ok() != fs::read(old_xc2.join(rel)).ok() {
+            return (Some(true), format!("{} changed", crate::dump::fwd(rel)));
         }
-        Err(e) => (None, format!("cannot run the build check: {e}")),
     }
+    (Some(false), String::new())
 }
 
 /// At start: removes what an earlier update left behind (the previous version, downloads, the unpacked package).
@@ -497,22 +552,22 @@ mod tests {
     #[test]
     fn install_replaces_package_files_only() {
         let (inst, top, old) = (tmp("i1"), tmp("t1"), tmp("o1").join("old"));
-        put(inst.join("fefw_rt.dll"), "old dll");
+        put(inst.join("runtime/xc2_rt.dll"), "old dll");
         put(inst.join("tools/a.py"), "old a");
         put(inst.join("tools/gone.py"), "stale");
-        put(inst.join("fefw.ini"), "player ini");
+        put(inst.join("nxrt.ini"), "player ini");
         put(inst.join("save/x"), "player save");
-        put(top.join("fefw_rt.dll"), "new dll");
+        put(top.join("runtime/xc2_rt.dll"), "new dll");
         put(top.join("tools/a.py"), "new a");
         put(top.join("tools/sub/b.py"), "new b");
         install(&inst, &top, &old).unwrap();
-        assert_eq!(get(inst.join("fefw_rt.dll")), "new dll");
+        assert_eq!(get(inst.join("runtime/xc2_rt.dll")), "new dll");
         assert_eq!(get(inst.join("tools/a.py")), "new a");
         assert_eq!(get(inst.join("tools/sub/b.py")), "new b");
         assert!(!inst.join("tools/gone.py").exists());
-        assert_eq!(get(inst.join("fefw.ini")), "player ini");
+        assert_eq!(get(inst.join("nxrt.ini")), "player ini");
         assert_eq!(get(inst.join("save/x")), "player save");
-        assert_eq!(get(old.join("fefw_rt.dll")), "old dll");
+        assert_eq!(get(old.join("runtime/xc2_rt.dll")), "old dll");
         assert_eq!(get(old.join("tools/gone.py")), "stale");
     }
 
@@ -522,18 +577,18 @@ mod tests {
         put(inst.join("locales/zh.ini"), "the player's own zh");
         put(inst.join("locales/mine.ini"), "a table the player wrote");
         put(top.join("locales/zh.ini"), "the shipped zh");
-        put(top.join("fefw_rt.dll"), "new dll");
+        put(top.join("runtime/xc2_rt.dll"), "new dll");
         install(&inst, &top, &old).unwrap();
         // the shipped table does not overwrite the copy already there
         assert_eq!(get(inst.join("locales/zh.ini")), "the player's own zh");
         // and a table only the player has is not treated as stale
         assert_eq!(get(inst.join("locales/mine.ini")), "a table the player wrote");
-        assert_eq!(get(inst.join("fefw_rt.dll")), "new dll");
+        assert_eq!(get(inst.join("runtime/xc2_rt.dll")), "new dll");
 
         // with no copy there yet, the shipped table is put in place
         let (inst2, top2, old2) = (tmp("i4"), tmp("t4"), tmp("o4").join("old"));
         put(top2.join("locales/zh.ini"), "the shipped zh");
-        put(top2.join("fefw_rt.dll"), "new dll");
+        put(top2.join("runtime/xc2_rt.dll"), "new dll");
         install(&inst2, &top2, &old2).unwrap();
         assert_eq!(get(inst2.join("locales/zh.ini")), "the shipped zh");
     }
@@ -541,22 +596,66 @@ mod tests {
     #[test]
     fn install_rolls_back_on_failure() {
         let (inst, top, old) = (tmp("i2"), tmp("t2"), tmp("o2").join("old"));
-        put(inst.join("fefw_rt.dll"), "old dll");
+        put(inst.join("runtime/xc2_rt.dll"), "old dll");
         put(inst.join("tools/a.py"), "old a");
         put(inst.join("tools/gone.py"), "stale");
         put(inst.join("zz"), "a file where the new package has a folder");
-        put(top.join("fefw_rt.dll"), "new dll");
+        put(top.join("runtime/xc2_rt.dll"), "new dll");
         put(top.join("tools/a.py"), "new a");
         put(top.join("zz/inner"), "cannot go under a file");
         // zz is a file in the install but a folder in the package: zz/inner cannot be created, after the other files moved
         assert!(install(&inst, &top, &old).is_err());
-        assert_eq!(get(inst.join("fefw_rt.dll")), "old dll");
+        assert_eq!(get(inst.join("runtime/xc2_rt.dll")), "old dll");
         assert_eq!(get(inst.join("tools/a.py")), "old a");
         assert_eq!(get(inst.join("tools/gone.py")), "stale");
         assert_eq!(get(inst.join("zz")), "a file where the new package has a folder");
     }
 
-    /// End to end against GitHub: FEFW_UPDATE_TEST_DIR = an unpacked older package (fefw-recomp-<old>/ contents).
+    #[test]
+    fn release_selection_includes_prereleases_and_picks_dist_zip() {
+        let list = serde_json::json!([
+            {
+                "tag_name": "v0.2.3-draft",
+                "draft": true,
+                "prerelease": true,
+                "assets": [{"name": "XC2-package-dist-0.2.3.zip", "browser_download_url": "https://x/0.2.3.zip", "size": 10, "digest": "sha256:aa"}]
+            },
+            {
+                "tag_name": "v0.2.1",
+                "draft": false,
+                "prerelease": true,
+                "assets": [{"name": "XC2-package-dist-0.2.1.zip", "browser_download_url": "https://x/0.2.1.zip", "size": 20, "digest": "sha256:bb"}]
+            },
+            {
+                "tag_name": "v0.2.2",
+                "draft": false,
+                "prerelease": true,
+                "assets": [
+                    {"name": "xc2-launcher-0.2.2-src.zip", "browser_download_url": "https://x/src.zip", "size": 1, "digest": "sha256:cc"},
+                    {"name": "XC2-package-dist-0.2.2.zip", "browser_download_url": "https://x/0.2.2.zip", "size": 30, "digest": "sha256:dd"}
+                ]
+            }
+        ]);
+        let rel = select_latest_release(&list).unwrap();
+        assert_eq!(rel.version, "0.2.2");
+        assert_eq!(rel.asset_name, "XC2-package-dist-0.2.2.zip");
+        assert_eq!(rel.sha256, "dd");
+    }
+
+    #[test]
+    fn rebuild_needed_tracks_boot_exe_and_xc2_sources() {
+        let inst = tmp("rb1");
+        let old = inst.join(WORK).join("old");
+        put(inst.join("xc2/sites/main.txt"), "same");
+        put(old.join("xc2/sites/main.txt"), "same");
+        assert_eq!(rebuild_needed(&inst, &inst).0, Some(true));
+        put(inst.join("xc2_boot.exe"), "exe");
+        assert_eq!(rebuild_needed(&inst, &inst), (Some(false), String::new()));
+        put(inst.join("xc2/sites/main.txt"), "changed");
+        assert_eq!(rebuild_needed(&inst, &inst).0, Some(true));
+    }
+
+    /// End to end against GitHub: FEFW_UPDATE_TEST_DIR = an unpacked older package.
     /// cargo test --release -- --ignored update_end_to_end --nocapture
     #[test]
     #[ignore]
@@ -573,8 +672,8 @@ mod tests {
         let run = Run { shared: &shared, install: install.clone(), game_dir: install.clone(), emit: &emit };
         let st = run.run(&rel).expect("update");
         println!("done: {} rebuild {:?} ({})", st.message, st.rebuild, st.rebuild_reason);
-        assert!(install.join("fefw_rt.dll").is_file() && install.join("tools/build/fefw_build.py").is_file());
-        assert!(install.join("update/old/fefw_rt.dll").is_file());
+        assert!(install.join("runtime/xc2_rt.dll").is_file() && install.join("engine/xc2_setup.py").is_file());
+        assert!(install.join("update/old/runtime/xc2_rt.dll").is_file());
         cleanup(&install);
         assert!(!install.join("update/old").exists());
     }

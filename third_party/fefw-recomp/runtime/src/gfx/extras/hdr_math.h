@@ -52,6 +52,15 @@ bool extend_shoulder(TonemapEval* e, float peak_ratio);
 // paper_white_nits <= 0 is treated as 203; boost is clamped to 0..2.
 float peak_ratio(float peak_nits, float paper_white_nits, float boost);
 
+// The game's UI on HDR output ([hdr] ui_split, ui_white_nits): its brightness over paper white, and whether the copy of the scene
+// before the UI is needed (the highlight boost or a UI brightness of its own). hdr_output: an HDR swapchain fed with the game's
+// display-referred 8-bit picture. ui_white_nits <= 0 keeps the UI at paper white.
+struct HdrUiSplit {
+    bool wanted = false;
+    float ui_scale = 1.0f;
+};
+HdrUiSplit hdr_ui_split(bool hdr_output, float peak_ratio, float paper_white_nits, double ui_white_nits);
+
 // ---- HDR output encodes of a scene-linear colour where 1.0 = paper white ----------------------------------------------------------
 
 struct HdrOut {

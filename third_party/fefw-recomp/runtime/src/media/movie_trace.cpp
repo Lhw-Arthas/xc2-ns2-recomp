@@ -34,6 +34,7 @@
 namespace nxrt::media {
 
 bool media_film_active();   // video_codec.cpp: a film's decoder is alive right now
+bool media_decoder_has_backlog();   // video_codec.cpp: decoded pictures are waiting in d->ready
 
 namespace {
 
@@ -109,11 +110,16 @@ uint64_t fn_release_frame() { static const uint64_t f = module_find_symbol(kRele
 std::atomic<int64_t> g_last_getbuf_ns{0};
 std::atomic<int64_t> g_last_movie_frame_ns{0};
 std::atomic<int> g_stall_dumps{0};
+std::atomic<bool> g_frame_displayed{false};
+std::atomic<int> g_consecutive_drops{0};
 int64_t now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 void release_frame(::Ctx* c) {   // (VideoDecoder*, VideoFrame*): how long the player held the frame (pixels -> texture -> back)
     const uint64_t fn = fn_release_frame();
     if (!fn) { A(0) = 0; return; }
     const uint64_t r = call_original(c, fn);
+    if (!g_frame_displayed.exchange(false, std::memory_order_relaxed)) {
+        g_consecutive_drops.fetch_add(1, std::memory_order_relaxed);
+    }
     if (g_on) {
         const int64_t t = now_ns(), since = t - g_last_getbuf_ns.load(std::memory_order_relaxed);
         if (seen(g_any_seen, 0x4000, 40)) NXLOG_I(kTag, "ReleaseVideoFrame: %.1f ms after GetBuffer", since / 1e6);
@@ -281,6 +287,20 @@ void frame_timestamp(::Ctx* c) {   // (VideoFrame*, nn::TimeSpan* out): what clo
     const uint64_t fn = fn_get_ts();
     if (!fn) { A(0) = 0; return; }
     const uint64_t r = call_original(c, fn);
+    // When RenderThread (f_7100722ba0, lr 0x7100722bfc) drops a frame because its PTS is >40 ms behind the initial wall-clock
+    // anchor, a CPU decode (dav1d on 4K AV1) that has no pre-decoded backlog in d->ready cannot catch up by dropping frames and
+    // would otherwise drop 100% of remaining frames until the user pauses and unpausing sets player[+644]=1 (#35, #17).
+    // Setting player[+644]=1 here runs f_7100722ba0's own native clock re-anchor (f_7100724ee0) two instructions later.
+    const int drops = g_consecutive_drops.load(std::memory_order_relaxed);
+    if (drops > 0 && (!media_decoder_has_backlog() || drops >= 6)) {
+        const uint64_t player = c->x[22];
+        if (lr == 0x7100722bfcull && heap_address(player) && rd8(player + 819) == 1 && heap_address(rd64(player + 664))) {
+            wr8(player + 644, 1);
+            g_consecutive_drops.store(0, std::memory_order_relaxed);
+            if (g_on && seen(g_any_seen, 0x5000, 40))
+                NXLOG_I(kTag, "clock re-anchored after %d dropped frame(s) (player 0x%llx)", drops, (unsigned long long)player);
+        }
+    }
     if (g_on) {
         int64_t ts = 0;
         if (out && mem::is_mapped(out, 8)) std::memcpy(&ts, reinterpret_cast<const void*>(out), 8);
@@ -293,12 +313,14 @@ void frame_buffer(::Ctx* c) {   // (VideoFrame*, void** data, size_t* size): doe
     const uint64_t fn = fn_get_buf();
     if (!fn) { A(0) = 0; return; }
     const uint64_t r = call_original(c, fn);
+    g_frame_displayed.store(true, std::memory_order_relaxed);
+    g_consecutive_drops.store(0, std::memory_order_relaxed);
+    g_last_getbuf_ns.store(now_ns(), std::memory_order_relaxed);
+    g_last_movie_frame_ns.store(now_ns(), std::memory_order_relaxed);
     if (g_on) {
         uint64_t data = 0, size = 0;
         if (pdata && mem::is_mapped(pdata, 8)) std::memcpy(&data, reinterpret_cast<const void*>(pdata), 8);
         if (psize && mem::is_mapped(psize, 8)) std::memcpy(&size, reinterpret_cast<const void*>(psize), 8);
-        g_last_getbuf_ns.store(now_ns(), std::memory_order_relaxed);
-        g_last_movie_frame_ns.store(now_ns(), std::memory_order_relaxed);
         if (seen(g_any_seen, 0x2000, 40))
             NXLOG_I(kTag, "VideoFrame::GetBuffer(0x%llx) -> %llx bytes, data 0x%llx, lr 0x%llx", f, (unsigned long long)size,
                     (unsigned long long)data, lr);
@@ -365,6 +387,8 @@ void media_dump_state(const char* why);
 // film that actually broke left nothing in the log (2026-11-21).
 void player_trace_new_film() {
     g_stall_dumps.store(0, std::memory_order_relaxed);
+    g_frame_displayed.store(false, std::memory_order_relaxed);
+    g_consecutive_drops.store(0, std::memory_order_relaxed);
     // The clock too: it used to carry over from the previous film, so a film starting 146 s after the last frame of the
     // one before was already "146 s stalled" at its first packet and spent the whole dump budget in two seconds
     // (measured 2026-11-22: film 2 at 259 s, twelve dumps by 261 s, none left for the pause this trace exists for).
@@ -380,8 +404,10 @@ void player_trace_eos() {
 }
 
 void stall_watch() {
+    int64_t last_dump_ns = 0;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (!media_film_active()) continue;
         const int64_t last = g_last_movie_frame_ns.load(std::memory_order_relaxed);
         // 12, not 3: a session can play several films and the first three dumps were used up by the start-up stall of the
         // first one, leaving nothing for the film that actually broke (2026-11-21).
@@ -390,7 +416,8 @@ void stall_watch() {
         const int64_t now = now_ns();
         // One dump a second, not four: a 1.5 s start-up stall used to write six dumps and the film that broke later found the
         // budget spent. A second apart still brackets every stall, and 12 of them cover a lot of stalling (2026-11-21).
-        if (now - last < 1'000'000'000ll) continue;
+        if (now - last < 1'000'000'000ll || now - last_dump_ns < 1'000'000'000ll) continue;
+        last_dump_ns = now;
         // Only this thread writes the counter (a reset is a plain store), so load-then-store is enough; fetch_add used to
         // tick past the budget on the calls that bailed out.
         g_stall_dumps.store(dump_no + 1, std::memory_order_relaxed);

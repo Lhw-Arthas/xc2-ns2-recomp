@@ -99,8 +99,9 @@ void diag_frame_tick_nolisten();       // the same without calling the frame lis
 void diag_set_frame_listener(void (*fn)());   // called by diag_frame_tick after counting (test tooling's frame source "tick"); null removes it
 uint64_t diag_frame_count();
 uint32_t watchdog_fire_count();
-// Extra sections of the freeze dump: each function returns text (it must never block: the process may be frozen). Registered once at start-up.
+// Extra sections of the freeze/crash/device-lost dump: each function returns text (must never block). Registered once at start-up.
 void diag_add_report(std::string (*fn)());
+std::string diag_extra_reports();
 void diag_set_exiting();               // the process is on its way out: a stopped frame tick is not a freeze
 std::string diag_thread_dump();        // the dump text the watchdog produces, on demand (also used by the SIGUSR-style "dump_threads" file)
 

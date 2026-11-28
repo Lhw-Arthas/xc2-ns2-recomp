@@ -24,6 +24,7 @@
 // Layouts and enum values are those of the NVN header (third_party/nvn/nvn.h). Event signal mode WRITE is the header's
 // NVN_EVENT_SIGNAL_MODE_WRITE. Constants used by the device info table: nvn_device_info.inc.
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -40,6 +41,7 @@
 #include "nxrt/log.h"
 
 namespace nxrt::nvn {
+namespace be::gpu { bool mirror_capture_on(); }
 namespace {
 
 constexpr const char* kTag = "nvn";
@@ -259,10 +261,31 @@ void nvnQueueFinalize(NVNqueue* queue) {
     be::unbind_guest(queue);
 }
 
+// Lightweight 10-second breakdown of the presenting guest thread's NVN wall time (~100 ns/frame overhead).
+struct GuestNvnProf {
+    using clk = std::chrono::steady_clock;
+    clk::time_point win_start{};
+    clk::time_point last_present{};
+    uint64_t frames = 0, submits = 0, syncs = 0, rec_lists = 0, rec_cmds = 0;
+    int64_t frame_ns = 0, submit_ns = 0, present_ns = 0, acquire_ns = 0, sync_ns = 0, rec_ns = 0;
+};
+thread_local GuestNvnProf t_gprof;
+
+}  // namespace
+
+void gprof_note_recording(int64_t elapsed_ns, uint32_t cmds) {
+    t_gprof.rec_ns += elapsed_ns;
+    ++t_gprof.rec_lists;
+    t_gprof.rec_cmds += cmds;
+}
+
+namespace {
+
 void nvnQueueSetDebugLabel(NVNqueue*, const char*) {}
 
 void nvnQueueSubmitCommands(NVNqueue* queue, int count, const NVNcommandHandle* handles) {
     if (!be::host_of<be::Queue>(queue)) return;
+    const auto t0 = GuestNvnProf::clk::now();
     std::vector<be::Ref<be::CmdList>> lists;
     if (handles && count > 0) {
         lists.reserve(static_cast<size_t>(count));
@@ -273,6 +296,8 @@ void nvnQueueSubmitCommands(NVNqueue* queue, int count, const NVNcommandHandle* 
         }
     }
     be::host_of<be::Queue>(queue)->last_serial.store(be::gpu::submit(lists));
+    t_gprof.submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(GuestNvnProf::clk::now() - t0).count();
+    ++t_gprof.submits;
 }
 
 void nvnQueueFlush(NVNqueue* queue) {
@@ -298,6 +323,7 @@ bool nvn2_sync_scope() {
 // Shared by nvnWindowAcquireTexture and nvnQueueAcquireTexture (the queue variant passes no sync object).
 NVNwindowAcquireTextureResult acquire_texture(be::Window* w, NVNsync* sync, int* index) {
     if (!w) return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_NATIVE_ERROR;
+    const auto t0 = GuestNvnProf::clk::now();
     int slot = 0;
     uint64_t slot_serial = 0;
     {
@@ -330,6 +356,7 @@ NVNwindowAcquireTextureResult acquire_texture(be::Window* w, NVNsync* sync, int*
         s->serial.store(ser);
         s->armed.store(true);
     }
+    t_gprof.acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(GuestNvnProf::clk::now() - t0).count();
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
 
@@ -341,11 +368,40 @@ void nvnQueuePresentTexture(NVNqueue* queue, NVNwindow* window, int index) {
         NXLOG_W(kTag, "nvnQueuePresentTexture: index %d is not one of the %zu window textures; not presented", index, w->textures.size());
         return;
     }
+    const auto t0 = GuestNvnProf::clk::now();
     if (index < 4) w->present_serial[index].store(be::gpu::last_serial());
     // A movie's pictures are handed over here, on the presenting guest thread, so the player's events are signalled from guest code
     // as the console does (media::movie_tick_guest).
     media::movie_tick_guest(abi::current_ctx());
     be::gpu::present(w, index);
+    const auto t1 = GuestNvnProf::clk::now();
+    t_gprof.present_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    if (t_gprof.last_present != GuestNvnProf::clk::time_point{}) {
+        t_gprof.frame_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t_gprof.last_present).count();
+        ++t_gprof.frames;
+    } else {
+        t_gprof.win_start = t1;
+    }
+    t_gprof.last_present = t1;
+    if (t_gprof.frames >= 10 && t1 - t_gprof.win_start >= std::chrono::seconds(10)) {
+        const double inv = 1.0 / (static_cast<double>(t_gprof.frames) * 1e6);
+        const double fms = t_gprof.frame_ns * inv;
+        const double sms = t_gprof.submit_ns * inv;
+        const double pms = t_gprof.present_ns * inv;
+        const double ams = t_gprof.acquire_ns * inv;
+        const double yms = t_gprof.sync_ns * inv;
+        const double rms = t_gprof.rec_ns * inv;
+        const double oms = fms - sms - pms - ams - yms;
+        NXLOG_I("nvn.gprof", "%llu frames (mean %.2f ms = %.1f fps): submit %.2f (%.1f/f), present %.2f, acquire %.2f, sync %.2f (%.1f/f), rec %.2f (%.1f lists, %.0f cmds/f), guest_other %.2f ms/frame",
+                static_cast<unsigned long long>(t_gprof.frames), fms, fms > 0.0 ? 1000.0 / fms : 0.0,
+                sms, static_cast<double>(t_gprof.submits) / static_cast<double>(t_gprof.frames),
+                pms, ams, yms, static_cast<double>(t_gprof.syncs) / static_cast<double>(t_gprof.frames),
+                rms, static_cast<double>(t_gprof.rec_lists) / static_cast<double>(t_gprof.frames),
+                static_cast<double>(t_gprof.rec_cmds) / static_cast<double>(t_gprof.frames), oms);
+        t_gprof.win_start = t1;
+        t_gprof.frames = t_gprof.submits = t_gprof.syncs = t_gprof.rec_lists = t_gprof.rec_cmds = 0;
+        t_gprof.frame_ns = t_gprof.submit_ns = t_gprof.present_ns = t_gprof.acquire_ns = t_gprof.sync_ns = t_gprof.rec_ns = 0;
+    }
 }
 
 NVNqueueAcquireTextureResult nvnQueueAcquireTexture(NVNqueue* queue, NVNwindow* window, int* index) {
@@ -407,8 +463,11 @@ NVNsyncWaitResult nvnSyncWait(const NVNsync* sync, uint64_t timeout_ns) {
     if (!s || !s->armed.load()) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
     const uint64_t serial = s->serial.load();
     if (serial == 0 || be::gpu::serial_done(serial)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    return be::gpu::wait_serial(serial, timeout_ns) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED
-                                                    : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    const auto t0 = GuestNvnProf::clk::now();
+    const bool ok = be::gpu::wait_serial(serial, timeout_ns);
+    t_gprof.sync_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(GuestNvnProf::clk::now() - t0).count();
+    ++t_gprof.syncs;
+    return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 
 // ---- event --------------------------------------------------------------------------------------------------------------

@@ -120,6 +120,8 @@ constexpr uint64_t kMapRegionBase = 0x0008000000ull, kMapRegionSize = 0x7FF80000
 // The guest layout owns [kMainBase, kKernelBase + kKernelSize) (images, HLE thunks, heap view, stacks, kernel region): only the alias
 // region of that span and everything below the main image is open for map calls.
 bool in_map_region(uint64_t addr, uint64_t size) {
+    // Drop init()'s placeholder alias guard before any host view or MapPhysicalMemory granule checks MEM_FREE.
+    mem::release_alias_guard();
     // The HLE thunk slots are placeholders that are never mapped, so a map call must not take them (VirtualAlloc would succeed).
     if (within(addr, size, mem::kHleBase, mem::kHleSize)) return false;
     // Everything from the ASLR region up to the SDK modules is open, not only what lies below the main image: the retail 3.0.1

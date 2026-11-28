@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Make a test install from a release zip, and hold it to the same checks a shipped tree gets.
 #
-#   pwsh tools\build\new-test-install.ps1 -Zip E:\XC2\out\XC2-package-dist-0.1.3.zip
+#   pwsh tools\build\new-test-install.ps1 -Zip D:\dist\XC2-package-dist-0.1.3.zip
 #   pwsh tools\build\new-test-install.ps1 -Zip ... -Nup "D:\dump\xc2 3.0.1.nup"     # runs the setup too (~12 min)
 #
 # Without -Nup the tree is only unpacked and checked as a package (no game data, no exe): that is what a player
@@ -10,12 +10,14 @@
 param(
     [Parameter(Mandatory = $true)][string]$Zip,
     [string]$Version = '',
-    [string]$Root = 'E:\XC2\test',
+    [string]$Root = '',
     [string]$Nup = '',
     [int]$ExpectedSpirv = 12137,
     [switch]$Force
 )
 $ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+if (-not $Root) { $Root = Join-Path (Split-Path -Parent $repoRoot) 'test' }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 if (-not (Test-Path -LiteralPath $Zip)) { throw "no zip at $Zip" }
 if (-not $Version) {

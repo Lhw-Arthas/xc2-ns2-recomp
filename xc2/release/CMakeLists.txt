@@ -17,6 +17,17 @@ if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
 endif()
 
 get_filename_component(XC2_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+# The build stamp the runtime logs (xc2/src/xc2_boot.cpp): the nearest tag plus the commit, so a player's log says
+# which build ran. Outside a git checkout (a source tarball) it says "unknown" rather than a stale literal.
+if(NOT DEFINED XC2_BUILD_STAMP)
+    execute_process(COMMAND git -C "${XC2_ROOT}" describe --tags --always --dirty
+                    OUTPUT_VARIABLE XC2_BUILD_STAMP OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET RESULT_VARIABLE _stamp_rc)
+    if(_stamp_rc OR NOT XC2_BUILD_STAMP)
+        set(XC2_BUILD_STAMP "unknown")
+    endif()
+endif()
+message(STATUS "xc2 build stamp: ${XC2_BUILD_STAMP}")
 set(FEFW "${XC2_ROOT}/third_party/fefw-recomp")
 # The headers of the pinned third-party libraries live in the runtime's own build tree (FetchContent).
 set(GFX "${FEFW}/build/runtime-gfx")
@@ -53,16 +64,26 @@ add_library(xc2_rt SHARED
     "${XC2_ROOT}/xc2/src/xc2_boot.cpp"
     "${XC2_ROOT}/xc2/src/x2_opus301.cpp"
     "${XC2_ROOT}/xc2/src/x2_audio301.cpp"
+    "${XC2_ROOT}/xc2/src/xc2_nav_overlay.cpp"
+    "${XC2_ROOT}/xc2/src/xc2_nav_mesh.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_db.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_director.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_renderer.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_hooks.cpp"
+    "${XC2_ROOT}/xc2/src/voice/xc2_voice_overlay.cpp"
     src/xc2_rt.def)
 target_include_directories(xc2_rt PRIVATE
     "${XC2_ROOT}/third_party/nxrecomp/recomp/include"
     "${FEFW}/runtime/include"
     "${FEFW}/runtime/games"
+    # play_types.h (the binding engine's vocabulary) lives beside the play sources, not in include/: xc2_boot.cpp
+    # registers the game's factory bindings, so it needs this one directory.
+    "${FEFW}/runtime/src/gfx/play"
     "${GFX}/_deps/volk-src"
     "${GFX}/_deps/vulkan_headers-src/include"
     "${GFX}/_deps/vma-src/include"
     "${GFX}/_deps/sdl3-src/include")
-target_compile_definitions(xc2_rt PRIVATE XC2_RT_DLL=1 XC2_MODULES_7=1)
+target_compile_definitions(xc2_rt PRIVATE XC2_RT_DLL=1 XC2_MODULES_7=1 XC2_BUILD_STAMP="${XC2_BUILD_STAMP}")
 if(NXRT_VORBIS_ROOT)
     target_link_libraries(xc2_rt PRIVATE "${NXRT_VORBIS_ROOT}/lib/vorbis.lib" "${NXRT_VORBIS_ROOT}/lib/ogg.lib")
 endif()
