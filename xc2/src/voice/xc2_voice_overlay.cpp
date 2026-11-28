@@ -29,8 +29,15 @@ constexpr const char* kTag = "voice";
 
 // Verified retail 3.0.1 main-relative read-only offsets (shared with xc2_nav_overlay.cpp).
 namespace off301 {
-constexpr uint64_t kBattleSingleton = 0x10708e8;  // ptr -> +0x148 u8 bit 1 = GfGameBattle::isBattle()
-constexpr uint64_t kEventSingleton  = 0x11a8db8;  // ptr -> +0x78  u32 bit 1 = GfGameEvent::isEvent()
+constexpr uint64_t kBattleSingleton      = 0x10708e8;  // ptr -> +0x148 u8 bit 1 = GfGameBattle::isBattle()
+constexpr uint64_t kEventSingleton       = 0x11a8db8;  // ptr -> +0x78  u32 bit 1 = GfGameEvent::isEvent()
+// Verified 3.0.1 disassembly (0x272ca0 getGameData + 0x2a5b4c getGameFlag(16, id)) & common.bdat
+// CHR_Dr[1].Condition=2099 -> FLD_ConditionScenario[142] (ScenarioMin=7060, ScenarioMax=10048):
+constexpr uint64_t kGameDataSingleton    = 0x0f2d2c0;  // ptr -> +0x20 GameData
+constexpr uint64_t kGameDataOffset       = 0x20;
+constexpr uint64_t kFlag16ScenarioOffset = 0x104bc6;   // Flag16[1] = 0x104bc4 + 1*2 (main scenario progress)
+constexpr uint16_t kScenarioMasterDriver = 7060;       // Ch.7 climax Master Driver awakening (pc000103)
+constexpr uint16_t kScenarioBaseMax      = 10048;      // Ch.10 finale cap (matches FLD_ConditionScenario[142])
 }  // namespace off301
 
 template <typename T>
@@ -51,6 +58,7 @@ struct VoiceRuntime {
     std::atomic<bool>     enabled{true};
     std::atomic<bool>     debug{false};
     std::atomic<bool>     log_open{false};
+    VoiceUILang           ui_lang{VoiceUILang::Zh};
     std::atomic<int>      mock_mode_override{0};  // 0 = auto live game state, 1 = force Exploration, 2 = force Combat
     std::atomic<int>      mock_banter_step{0};
     std::atomic<int>      mock_combat_step{0};
@@ -79,6 +87,25 @@ GameStateSnapshot read_game_state(uint64_t mb) {
     GameStateSnapshot gs;
     // Hide cleanly whenever F1 settings overlay or on-screen keyboard is up
     gs.in_menu_or_pause = nxrt::play::overlay_blocks_game();
+    // Read Rex Master Driver progression (Scenario Flag16[1] in [7060, 10048]) even during mock testing
+    if (mb) {
+        uint64_t save_mgr = 0;
+        if (safe_read(mb + off301::kGameDataSingleton, save_mgr) && save_mgr >= 0x10000ull) {
+            uint16_t scenario = 0;
+            if (safe_read(save_mgr + off301::kGameDataOffset + off301::kFlag16ScenarioOffset, scenario)) {
+                gs.rex_master_driver = (scenario >= off301::kScenarioMasterDriver &&
+                                        scenario <= off301::kScenarioBaseMax);
+                static int last_rex_state = -1;
+                const int cur_state = gs.rex_master_driver ? 1 : 0;
+                if (scenario > 0 && cur_state != last_rex_state) {
+                    last_rex_state = cur_state;
+                    NXLOG_I(kTag, "Rex portrait -> %s (scenario=%u)",
+                            gs.rex_master_driver ? "Master Driver (btl_face#8)" : "Salvager (face#8)",
+                            static_cast<unsigned>(scenario));
+                }
+            }
+        }
+    }
     const int ov = rt().mock_mode_override.load(std::memory_order_relaxed);
     if (ov == 1) {
         gs.in_combat = false;
@@ -130,16 +157,32 @@ void init(uint64_t main_base) {
 
     r.db.clear();
     // Search next to executable first, then current working directory
-    const std::string lang = nxrt::config_get_str("xc2", "voice_lang", "zh_cn");
+    const std::string lang = nxrt::config_get_str("xc2", "voice_lang", "zh_hans");
+    VoiceUILang ui_lang = VoiceUILang::Zh;
+    if (lang == "en" || lang.rfind("en_", 0) == 0 || lang.rfind("en-", 0) == 0) {
+        ui_lang = VoiceUILang::En;
+    } else if (lang == "ja" || lang == "jp" || lang.rfind("ja_", 0) == 0) {
+        ui_lang = VoiceUILang::Ja;
+    }
+    r.ui_lang = ui_lang;
+    std::vector<std::string> lang_stems = {lang};
+    if (lang == "zh_hans") lang_stems.push_back("zh_cn");
+    else if (lang == "zh_cn") lang_stems.push_back("zh_hans");
+    else if (lang == "zh_hant") lang_stems.push_back("zh_tw");
+    else if (lang == "zh_tw") lang_stems.push_back("zh_hant");
+
     std::vector<std::string> candidates;
     char exe_buf[MAX_PATH] = {};
-    if (GetModuleFileNameA(nullptr, exe_buf, MAX_PATH) > 0) {
-        const std::filesystem::path exe_dir = std::filesystem::path(exe_buf).parent_path();
-        candidates.push_back((exe_dir / "voice_subtitles" / (lang + ".json")).string());
-        candidates.push_back((exe_dir / "assets" / "voice_subtitles" / (lang + ".json")).string());
+    const bool has_exe = GetModuleFileNameA(nullptr, exe_buf, MAX_PATH) > 0;
+    const std::filesystem::path exe_dir = has_exe ? std::filesystem::path(exe_buf).parent_path() : std::filesystem::path();
+    for (const auto& stem : lang_stems) {
+        if (has_exe) {
+            candidates.push_back((exe_dir / "voice_subtitles" / (stem + ".json")).string());
+            candidates.push_back((exe_dir / "assets" / "voice_subtitles" / (stem + ".json")).string());
+        }
+        candidates.push_back("voice_subtitles\\" + stem + ".json");
+        candidates.push_back("assets\\voice_subtitles\\" + stem + ".json");
     }
-    candidates.push_back("voice_subtitles\\" + lang + ".json");
-    candidates.push_back("assets\\voice_subtitles\\" + lang + ".json");
     bool loaded_ext = false;
     for (const auto& p : candidates) {
         std::error_code ec;
@@ -158,6 +201,7 @@ void init(uint64_t main_base) {
     r.db.seed_mock_entries();
     r.director.set_database(&r.db);
     r.director.set_density(density);
+    r.director.set_ui_lang(ui_lang);
     r.director.set_debug_log_missing(r.debug.load(std::memory_order_relaxed));
     r.poller.reset();
     std::string dump_path = "voice_capture.jsonl";
@@ -178,10 +222,17 @@ void shutdown() {
 }
 
 void toggle() {
-    const bool next = !rt().enabled.load(std::memory_order_relaxed);
-    rt().enabled.store(next, std::memory_order_relaxed);
-    if (!next) rt().director.clear_active();
-    set_toast(next ? "队友语音字幕：开启 (F5)" : "队友语音字幕：关闭 (F5)");
+    auto& r = rt();
+    const bool next = !r.enabled.load(std::memory_order_relaxed);
+    r.enabled.store(next, std::memory_order_relaxed);
+    if (!next) r.director.clear_active();
+    if (r.ui_lang == VoiceUILang::En) {
+        set_toast(next ? "Party Voice Subtitles: ON (F5)" : "Party Voice Subtitles: OFF (F5)");
+    } else if (r.ui_lang == VoiceUILang::Ja) {
+        set_toast(next ? "パーティボイス字幕：オン (F5)" : "パーティボイス字幕：オフ (F5)");
+    } else {
+        set_toast(next ? "队友语音字幕：开启 (F5)" : "队友语音字幕：关闭 (F5)");
+    }
     NXLOG_I(kTag, "F5 toggle -> %s", next ? "ON" : "OFF");
 }
 
@@ -192,15 +243,28 @@ void toggle_log() {
 }
 
 void cycle_density() {
-    auto& d = rt().director;
+    auto& r = rt();
+    auto& d = r.director;
     const int next = (static_cast<int>(d.density()) + 1) % 3;
     d.set_density(static_cast<VoiceDensity>(next));
-    static const char* const kLabels[] = {
+    static const char* const kLabelsZh[] = {
         "语音字幕密度：精简 Minimal (仅剧情/战后 P0)",
         "语音字幕密度：平衡 Balanced (P0 + 战术 P1)",
         "语音字幕密度：完整 Full (P0 + P1 + 氛围 P2)",
     };
-    set_toast(kLabels[next]);
+    static const char* const kLabelsEn[] = {
+        "Voice Subtitles Density: Minimal (Banter P0)",
+        "Voice Subtitles Density: Balanced (P0 + Tactical P1)",
+        "Voice Subtitles Density: Full (P0 + P1 + Ambient P2)",
+    };
+    static const char* const kLabelsJa[] = {
+        "ボイス字幕密度：最小 Minimal (掛け合い P0)",
+        "ボイス字幕密度：標準 Balanced (P0 + 戦術 P1)",
+        "ボイス字幕密度：完全 Full (P0 + P1 + 雰囲気 P2)",
+    };
+    const char* const* labels = (r.ui_lang == VoiceUILang::En) ? kLabelsEn
+                                : (r.ui_lang == VoiceUILang::Ja ? kLabelsJa : kLabelsZh);
+    set_toast(labels[next]);
     NXLOG_I(kTag, "Shift+F5 density -> %d", next);
 }
 
@@ -281,7 +345,7 @@ void draw(const nxrt::gfx::HudCanvas& c) {
     r.director.update(dt, gs);
     r.renderer.render(c, r.director.render_state());
     if (r.log_open.load(std::memory_order_relaxed)) {
-        r.renderer.render_voice_log(c, r.director.history());
+        r.renderer.render_voice_log(c, r.director.history(), r.ui_lang);
     }
 }
 

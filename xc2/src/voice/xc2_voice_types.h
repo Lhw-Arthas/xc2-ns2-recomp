@@ -15,8 +15,14 @@ enum class VoicePriority : uint8_t {
 
 enum class VoiceDensity : uint8_t {
     Minimal  = 0,  // P0 only
-    Balanced = 1,  // P0 + P1 (default)
-    Full     = 2,  // P0 + P1 + P2
+    Balanced = 1,  // P0 + P1
+    Full     = 2,  // P0 + P1 + P2 (default)
+};
+
+enum class VoiceUILang : uint8_t {
+    Zh = 0,  // zh_cn / zh_tw
+    En = 1,  // en
+    Ja = 2,  // ja
 };
 
 enum class SemanticTag : uint8_t {
@@ -55,8 +61,9 @@ struct GameStateSnapshot {
     bool  in_chain_attack  = false;
     bool  in_special_cam   = false;
     float hud_global_alpha = 1.0f;
-    bool  affinity_gold[3] = {false, false, false};
-    bool  nav_bottom_busy  = false;  // True when 3D nav banner occupies bottom area
+    bool  affinity_gold[3]  = {false, false, false};
+    bool  nav_bottom_busy   = false;  // True when 3D nav banner occupies bottom area
+    bool  rex_master_driver = false;  // True when Scenario >= 7060 (Ch.7 awakening / Ch.8+ Master Driver Rex)
 };
 
 struct SpeakerInfo {

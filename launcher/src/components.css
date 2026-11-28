@@ -120,6 +120,14 @@ input[type="checkbox"] { accent-color: var(--color-accent); width: 16px; height:
 .banner.ok { border-color: var(--color-ok); }
 .banner.ok [data-lucide], .banner.ok svg { color: var(--color-ok); }
 .banner.info [data-lucide], .banner.info svg { color: var(--color-focus); }
+.banner.love {
+  align-items: center;
+  border-color: color-mix(in srgb, var(--color-accent) 45%, var(--color-border-strong));
+  background: color-mix(in srgb, var(--color-accent) 9%, var(--color-surface-sunken));
+  color: var(--color-text);
+  font-weight: var(--font-weight-medium);
+}
+.banner.love [data-lucide], .banner.love svg { color: var(--color-accent); }
 
 .hero { text-align: left; display: flex; flex-direction: column; gap: var(--space-3); }
 .hero h1 { font-size: var(--font-size-hero); line-height: 1.1; }

@@ -941,7 +941,9 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
 
     NXLOG_I(kTag, "device ready: %s, queue family %u, validation %s, %s", props_.deviceName, queue_family_, validation_ ? "on" : "off",
             headless ? "headless" : "window surface");
-    if (!headless) prewarm_hwdec_async();
+    // Do NOT call prewarm_hwdec_async() here: creating a second FFmpeg Vulkan device concurrently with
+    // initial swapchain / NVN pipeline bring-up deadlocks nvoglv64.dll / amdvlk64.dll on boot (#91, #42).
+    // Hardware video decode initializes lazily on the decoder worker thread when the first cutscene opens.
     return true;
 }
 

@@ -4,6 +4,15 @@ import { statusText, stepTitle } from '../rusttext.js';
 
 const hex = (c) => '0x' + (c >>> 0).toString(16).toUpperCase().padStart(8, '0');
 
+function voicePackLabel(stem) {
+  const s = String(stem).trim().toLowerCase();
+  if (s === 'zh_hans' || s === 'zh_cn') return t('settings.voiceLang.zhHans');
+  if (s === 'zh_hant' || s === 'zh_tw') return t('settings.voiceLang.zhHant');
+  if (s === 'en') return t('settings.voiceLang.en');
+  if (s === 'ja') return t('settings.voiceLang.ja');
+  return stem;
+}
+
 function statusChip(s) {
   if (s.state === 'running') return `<span class="chip warn">${icon('loader-circle', 'spin')}${esc(t('play.running'))}</span>`;
   if (s.state === 'exited') {
@@ -39,6 +48,7 @@ export async function render(el, ctx) {
   const report = cfg.dump_dir && ov.repo_ok ? await api('validate_dump', { path: cfg.dump_dir }) : null;
   const chosen = report && report.chosen;
   const modsSnap = ov.repo_ok ? await api('list_mods').catch(() => null) : null;
+  let voiceStatus = ov.repo_ok ? await api('voice_subtitles_status').catch(() => null) : null;
   let status = await api('game_status');
   // Linux: fefw.exe as a non-Steam game (steam.rs)
   let steam = await api('steam_status').catch(() => ({ available: false }));
@@ -68,6 +78,7 @@ export async function render(el, ctx) {
           <button class="btn primary big" id="play" ${ready && !running ? '' : 'disabled'}>${icon('play')}${esc(t(running ? 'play.running' : 'play.title'))}</button>
           ${statusChip(status)}
         </div>
+        <div class="banner love">${icon('heart')}<div>${esc(t('play.supportOfficial'))}</div></div>
         ${reportHtml(status)}
 
         <div class="card">
@@ -102,6 +113,28 @@ export async function render(el, ctx) {
             ${steam.available ? `<button class="btn" id="add-steam" title="${esc(t('play.addToSteamHint'))}" ${ov.exe_exists && !addingSteam ? '' : 'disabled'}>${icon(addingSteam ? 'loader-circle' : 'gamepad-2', addingSteam ? 'spin' : '')}${esc(t(steam.added ? 'play.updateSteam' : 'play.addToSteam'))}</button>` : ''}
           </div>
         </div>
+
+        <div class="card">
+          <h2>${icon('sparkles')}${esc(t('play.features'))}</h2>
+          <dl class="kv">
+            <dt>${esc(t('play.featureNav'))}</dt>
+            <dd>${esc(t('play.featureNavDesc'))}</dd>
+            <dt>${esc(t('play.featureVoice'))}</dt>
+            <dd>
+              <div>${esc(t('play.featureVoiceDesc'))}</div>
+              <div class="faint" style="margin-top: var(--space-1)">${
+                voiceStatus && voiceStatus.packs && voiceStatus.packs.length
+                  ? esc(t('play.voicePacksInstalled', { packs: voiceStatus.packs.map(voicePackLabel).join(', ') }))
+                  : esc(t('play.voicePacksNone'))
+              }</div>
+              ${voiceStatus && voiceStatus.dir ? `<div class="path">${esc(voiceStatus.dir)}</div>` : ''}
+            </dd>
+          </dl>
+          <div class="row wrap" style="margin-top: var(--space-4)">
+            <button class="btn" id="import-voice" ${ov.repo_ok ? '' : 'disabled'} title="${esc(t('play.importVoiceHint'))}">${icon('file-up')}${esc(t('play.importVoice'))}</button>
+            <button class="btn" id="open-voice-dir" ${ov.repo_ok ? '' : 'disabled'}>${icon('folder-open')}${esc(t('play.openVoiceDir'))}</button>
+          </div>
+        </div>
       </div>`;
     refreshIcons();
     el.querySelector('#play')?.addEventListener('click', () => api('play').catch((e) => toast(errText(e), 'error')));
@@ -126,6 +159,21 @@ export async function render(el, ctx) {
         toast(errText(e), 'error');
       }
     });
+    el.querySelector('#import-voice')?.addEventListener('click', async () => {
+      const file = await api('pick_voice_subtitle_file', { title: t('play.importVoiceTitle') });
+      if (!file) return;
+      try {
+        const res = await api('import_voice_subtitles', { path: file });
+        voiceStatus = res.status;
+        toast(t('play.importVoiceDone', { packs: res.installed.map(voicePackLabel).join(', ') }), 'ok');
+        draw();
+      } catch (e) {
+        toast(errText(e), 'error');
+      }
+    });
+    el.querySelector('#open-voice-dir')?.addEventListener('click', () =>
+      api('open_voice_subtitles_dir').catch((e) => toast(errText(e), 'error')),
+    );
     el.querySelector('#add-steam')?.addEventListener('click', async () => {
       addingSteam = true;
       draw();

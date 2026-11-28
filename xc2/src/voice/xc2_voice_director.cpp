@@ -161,7 +161,8 @@ void VoiceDirector::enqueue_combat(const CueEntry& cue, const SpeakerInfo* sp, f
     // Always display the character's actual spoken line (text_full) rather than the generic tactical summary
     // (text_compact); semantic tactical tags (必杀就绪 / 破防 / 倒地 / 危机) are already shown as header badges.
     const std::string& raw_text = !cue.text_full.empty() ? cue.text_full : cue.text_compact;
-    const std::string text = truncate_utf8(raw_text, 28);
+    const size_t max_chars = (state_.ui_lang == VoiceUILang::En) ? 56 : 28;
+    const std::string text = truncate_utf8(raw_text, max_chars);
     const float target_dur = std::max(dur_hint, 2.2f);
 
     // Check Driver + Blade partner merge within 2.0s
@@ -230,7 +231,8 @@ void VoiceDirector::enqueue_combat(const CueEntry& cue, const SpeakerInfo* sp, f
 
 void VoiceDirector::enqueue_exploration(const CueEntry& cue, const SpeakerInfo* sp, float dur_hint) {
     const std::string& text = !cue.text_full.empty() ? cue.text_full : cue.text_compact;
-    const float est = static_cast<float>(count_utf8_codepoints(text)) * 0.16f + 1.4f;
+    const float sec_per_cp = (state_.ui_lang == VoiceUILang::En) ? 0.075f : 0.16f;
+    const float est = std::min(6.5f, static_cast<float>(count_utf8_codepoints(text)) * sec_per_cp + 1.4f);
     const float target_dur = std::max(dur_hint, est);
 
     ActiveVoiceCard line;
@@ -272,6 +274,7 @@ void VoiceDirector::update(float dt_sec, const GameStateSnapshot& gs) {
                                              : (gs.in_combat ? UIVisibilityMode::Combat
                                                              : UIVisibilityMode::Exploration);
     state_.nav_bottom_busy = gs.nav_bottom_busy;
+    state_.rex_master_driver = gs.rex_master_driver;
 
     if (target_mode != UIVisibilityMode::Hidden) {
         // Mode transition between Combat and Exploration

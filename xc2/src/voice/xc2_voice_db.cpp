@@ -343,7 +343,7 @@ void VoiceDatabase::seed_mock_entries() {
     // Story Blades (11..21)
     add_sp(11, "焰",     true, 1, 1, 0xEF4444FFu);
     add_sp(12, "光",     true, 1, 7, 0xFACC15FFu);
-    add_sp(13, "灵魂之剑", true, 1, 7, 0x34D399FFu);
+    add_sp(13, "灵魂", true, 1, 7, 0x34D399FFu);
     add_sp(14, "白虎",   true, 2, 2, 0x38BDF8FFu);
     add_sp(15, "花JS",   true, 3, 4, 0xEC4899FFu);
     add_sp(16, "花JK",   true, 3, 4, 0xF472B6FFu);

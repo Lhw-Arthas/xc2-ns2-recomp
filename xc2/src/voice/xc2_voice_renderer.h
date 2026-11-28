@@ -10,7 +10,8 @@ namespace xc2::voice {
 class VoiceRenderer {
 public:
     void render(const nxrt::gfx::HudCanvas& c, const DirectorRenderState& st) const;
-    void render_voice_log(const nxrt::gfx::HudCanvas& c, const std::deque<VoiceLogEntry>& history) const;
+    void render_voice_log(const nxrt::gfx::HudCanvas& c, const std::deque<VoiceLogEntry>& history,
+                          VoiceUILang ui_lang = VoiceUILang::Zh) const;
 
 private:
     struct SafeRect {

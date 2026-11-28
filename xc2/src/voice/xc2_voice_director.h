@@ -14,10 +14,12 @@
 namespace xc2::voice {
 
 struct DirectorRenderState {
-    UIVisibilityMode             mode            = UIVisibilityMode::Exploration;
-    float                        global_alpha    = 1.0f;
-    bool                         nav_bottom_busy = false;
-    std::vector<ActiveVoiceCard> combat_cards;       // Up to 2 active + exiting cards
+    UIVisibilityMode             mode              = UIVisibilityMode::Exploration;
+    VoiceUILang                  ui_lang           = VoiceUILang::Zh;
+    float                        global_alpha      = 1.0f;
+    bool                         nav_bottom_busy   = false;
+    bool                         rex_master_driver = false;
+    std::vector<ActiveVoiceCard> combat_cards;       // Up to 3 active + exiting cards
     std::vector<ActiveVoiceCard> exploration_lines;  // Up to 2 lines (prev + current)
 };
 
@@ -26,6 +28,8 @@ public:
     void set_database(const VoiceDatabase* db) { db_ = db; }
     void set_density(VoiceDensity d) { density_ = d; }
     VoiceDensity density() const { return density_; }
+    void set_ui_lang(VoiceUILang lang) { state_.ui_lang = lang; }
+    VoiceUILang ui_lang() const { return state_.ui_lang; }
     void set_debug_log_missing(bool v) { debug_log_missing_ = v; }
 
     // Thread-safe producer entry (callable from any thread).

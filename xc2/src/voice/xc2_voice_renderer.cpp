@@ -29,6 +29,9 @@ struct PortraitAtlas {
     uint64_t face_tex = 0;        // /menu/image/face.wilay (2048x6656, 8x26 cells of 256x256)
     uint32_t face_cols = 8;
     uint32_t face_rows = 26;
+    uint64_t btl_face_tex = 0;    // /menu/image/btl_face.wilay (2048x2048, 8x8 cells of 256x256; cell 8 = Master Driver Rex)
+    uint32_t btl_face_cols = 8;
+    uint32_t btl_face_rows = 8;
     uint64_t torna_tex = 0;       // /menu/image/dlc3_btl_face.wilay (2048x512, 8x2 cells of 256x256)
     uint32_t torna_cols = 8;
     uint32_t torna_rows = 2;
@@ -99,11 +102,27 @@ struct PortraitAtlas {
         if (tried) return;
         tried = true;
         untile_and_upload_wilay("/menu/image/face.wilay", face_tex, face_cols, face_rows);
+        untile_and_upload_wilay("/menu/image/btl_face.wilay", btl_face_tex, btl_face_cols, btl_face_rows);
         untile_and_upload_wilay("/menu/image/dlc3_btl_face.wilay", torna_tex, torna_cols, torna_rows);
     }
 
-    bool lookup(uint16_t speaker_id, PortraitUV& out) {
+    bool lookup(uint16_t speaker_id, bool rex_master_driver, PortraitUV& out) {
         ensure_loaded();
+        // Auto-switch Rex (VoiceID=1) to Master Driver outfit portrait (btl_face.wilay cell 8)
+        // once main scenario reaches >= 7060 (Ch.7 climax awakening / Ch.8+); zero spoilers before Ch.8.
+        if (speaker_id == 1 && rex_master_driver && btl_face_tex && btl_face_cols > 0 && btl_face_rows > 0) {
+            constexpr uint32_t kMasterRexCell = 8;
+            const uint32_t col = kMasterRexCell % btl_face_cols;
+            const uint32_t row = kMasterRexCell / btl_face_cols;
+            const float pad_u = 0.03f / static_cast<float>(btl_face_cols);
+            const float pad_v = 0.03f / static_cast<float>(btl_face_rows);
+            out.tex_id = btl_face_tex;
+            out.u0 = static_cast<float>(col) / static_cast<float>(btl_face_cols) + pad_u;
+            out.v0 = static_cast<float>(row) / static_cast<float>(btl_face_rows) + pad_v;
+            out.u1 = static_cast<float>(col + 1) / static_cast<float>(btl_face_cols) - pad_u;
+            out.v1 = static_cast<float>(row + 1) / static_cast<float>(btl_face_rows) - pad_v;
+            return true;
+        }
         // Torna: The Golden Country (701..709) -> dlc3_btl_face.wilay (8x2 grid)
         if (speaker_id >= 701 && speaker_id <= 709 && torna_tex && torna_cols > 0 && torna_rows > 0) {
             const uint32_t idx = static_cast<uint32_t>(speaker_id - 701);
@@ -135,7 +154,7 @@ struct PortraitAtlas {
             // Story Blades (Row 0 & Row 3)
             case 11: cell = 0;  break;  // 焰 Pyra
             case 12: cell = 1;  break;  // 光 Mythra
-            case 13: cell = 2;  break;  // 灵魂之声 Pneuma
+            case 13: cell = 2;  break;  // 灵魂 Pneuma
             case 14: cell = 4;  break;  // 白虎 Dromarch
             case 15: cell = 5;  break;  // 花JS Poppi α
             case 16: cell = 6;  break;  // 花JK Poppi QT
@@ -175,7 +194,33 @@ PortraitAtlas& portraits() {
     return s;
 }
 
-const char* tag_label(SemanticTag t) {
+const char* tag_label(SemanticTag t, VoiceUILang lang) {
+    if (lang == VoiceUILang::En) {
+        switch (t) {
+            case SemanticTag::Break:        return "BREAK";
+            case SemanticTag::Topple:       return "TOPPLE";
+            case SemanticTag::Launch:       return "LAUNCH";
+            case SemanticTag::Smash:        return "SMASH";
+            case SemanticTag::SpecialReady: return "SPECIAL";
+            case SemanticTag::AggroWarning: return "AGGRO";
+            case SemanticTag::LowHPHelp:    return "LOW HP";
+            case SemanticTag::HealPotion:   return "POTION";
+            default:                        return nullptr;
+        }
+    }
+    if (lang == VoiceUILang::Ja) {
+        switch (t) {
+            case SemanticTag::Break:        return "ブレイク";
+            case SemanticTag::Topple:       return "ダウン";
+            case SemanticTag::Launch:       return "ライジング";
+            case SemanticTag::Smash:        return "スマッシュ";
+            case SemanticTag::SpecialReady: return "必殺技";
+            case SemanticTag::AggroWarning: return "ヘイト警告";
+            case SemanticTag::LowHPHelp:    return "ピンチ";
+            case SemanticTag::HealPotion:   return "回復ポット";
+            default:                        return nullptr;
+        }
+    }
     switch (t) {
         case SemanticTag::Break:        return "破防";
         case SemanticTag::Topple:       return "倒地";
@@ -206,10 +251,11 @@ uint32_t tag_badge_color(SemanticTag t) {
 // Draw an authentic XC2 circular portrait medallion using the player's own in-game face atlas,
 // falling back to a stylized Core-Crystal diamond monogram for speakers without a portrait cell.
 void draw_portrait_medallion(const nxrt::gfx::HudCanvas& c, float cx, float cy, float radius,
-                             uint16_t speaker_id, uint32_t fill_rgba, uint32_t ring_rgba,
+                             uint16_t speaker_id, bool rex_master_driver,
+                             uint32_t fill_rgba, uint32_t ring_rgba,
                              const std::string& glyph, float alpha) {
     PortraitUV uv;
-    if (portraits().lookup(speaker_id, uv)) {
+    if (portraits().lookup(speaker_id, rex_master_driver, uv)) {
         // Outer dark drop shadow + obsidian backing plate
         c.circle_filled(cx, cy, radius + 3.0f, with_alpha(0x040A12D8u, alpha), 32);
         c.circle_filled(cx, cy, radius, with_alpha(0x0A1624F0u, alpha), 32);
@@ -277,7 +323,7 @@ VoiceRenderer::SafeRect VoiceRenderer::compute_safe_rect(uint32_t vp_w, uint32_t
 void VoiceRenderer::draw_diamond_avatar(const nxrt::gfx::HudCanvas& c, float cx, float cy,
                                         float half_diag, uint32_t fill_rgba, uint32_t border_rgba,
                                         const std::string& glyph, float alpha) {
-    draw_portrait_medallion(c, cx, cy, half_diag, 0, fill_rgba, border_rgba, glyph, alpha);
+    draw_portrait_medallion(c, cx, cy, half_diag, 0, false, fill_rgba, border_rgba, glyph, alpha);
 }
 
 void VoiceRenderer::render_combat_strip(const nxrt::gfx::HudCanvas& c, const SafeRect& sr,
@@ -364,12 +410,14 @@ void VoiceRenderer::render_combat_strip(const nxrt::gfx::HudCanvas& c, const Saf
         const float av_cx = x0 + 26.0f * sr.scale;
         const float av_cy = (y0 + y1) * 0.5f - (merged ? 6.0f * sr.scale : 2.0f * sr.scale);
         draw_portrait_medallion(c, av_cx, av_cy, av_r, card.primary_speaker_id,
+                                st.rex_master_driver,
                                 card.primary_color_rgba, stroke_col, card.primary_glyph, a);
 
         if (merged) {
             const float sub_r = 18.0f * sr.scale;
             draw_portrait_medallion(c, av_cx + av_r * 0.76f, av_cy + av_r * 0.64f, sub_r,
-                                    card.partner_speaker_id, card.partner_color_rgba,
+                                    card.partner_speaker_id, st.rex_master_driver,
+                                    card.partner_color_rgba,
                                     0xF5C542F2u, card.partner_glyph, a);
         }
 
@@ -386,7 +434,7 @@ void VoiceRenderer::render_combat_strip(const nxrt::gfx::HudCanvas& c, const Saf
                         with_alpha(0x000000E0u, a),
                         header.c_str());
 
-        if (const char* tl = tag_label(card.semantic_tag)) {
+        if (const char* tl = tag_label(card.semantic_tag, st.ui_lang)) {
             float nw = 0.f, nh = 0.f;
             c.measure_text(name_sz, header.c_str(), &nw, &nh);
             const float px = tx + nw + 10.0f * sr.scale;
@@ -500,6 +548,7 @@ void VoiceRenderer::render_exploration_bar(const nxrt::gfx::HudCanvas& c, const 
     const float av_cx = x0 + 44.0f * sr.scale;
     const float av_cy = y0 + box_h * 0.44f;
     draw_portrait_medallion(c, av_cx, av_cy, av_r, cur_line.primary_speaker_id,
+                            st.rex_master_driver,
                             cur_line.primary_color_rgba,
                             cur_line.primary_color_rgba, cur_line.primary_glyph, cur_a);
 
@@ -527,7 +576,7 @@ void VoiceRenderer::render_exploration_bar(const nxrt::gfx::HudCanvas& c, const 
         const float pa = prev.alpha * st.global_alpha * 0.68f;
         if (pa > 0.01f) {
             const float prev_sz = body_sz * 0.78f;
-            const std::string p_name = prev.primary_name + "：";
+            const std::string p_name = prev.primary_name + (st.ui_lang == VoiceUILang::En ? ": " : "：");
             float pnw = 0.f, pnh = 0.f, pbw = 0.f, pbh = 0.f;
             c.measure_text(prev_sz, p_name.c_str(), &pnw, &pnh);
             c.measure_text(prev_sz, prev.text_line1.c_str(), &pbw, &pbh);
@@ -565,7 +614,8 @@ void VoiceRenderer::render(const nxrt::gfx::HudCanvas& c, const DirectorRenderSt
 }
 
 void VoiceRenderer::render_voice_log(const nxrt::gfx::HudCanvas& c,
-                                     const std::deque<VoiceLogEntry>& history) const {
+                                     const std::deque<VoiceLogEntry>& history,
+                                     VoiceUILang ui_lang) const {
     if (c.width == 0 || c.height == 0 || !c.draw_list) return;
     const SafeRect sr = compute_safe_rect(c.width, c.height);
 
@@ -592,8 +642,14 @@ void VoiceRenderer::render_voice_log(const nxrt::gfx::HudCanvas& c,
     const float hdr_sz = std::max(15.0f, 18.0f * sr.scale);
     const float pad_x = 16.0f * sr.scale;
     const float hdr_y = y0 + 12.0f * sr.scale;
-    char hdr[64];
-    std::snprintf(hdr, sizeof(hdr), "语音记录 Voice Log (%zu/30)  [Ctrl+F5 关闭]", history.size());
+    char hdr[96];
+    if (ui_lang == VoiceUILang::En) {
+        std::snprintf(hdr, sizeof(hdr), "Voice Log (%zu/30)  [Ctrl+F5 Close]", history.size());
+    } else if (ui_lang == VoiceUILang::Ja) {
+        std::snprintf(hdr, sizeof(hdr), "ボイス履歴 (%zu/30)  [Ctrl+F5 閉じる]", history.size());
+    } else {
+        std::snprintf(hdr, sizeof(hdr), "语音记录 Voice Log (%zu/30)  [Ctrl+F5 关闭]", history.size());
+    }
     c.text_outlined(x0 + pad_x, hdr_y, hdr_sz, 0xF5C542FFu, 0x000000E0u, hdr);
 
     const float div_y = hdr_y + 26.0f * sr.scale;
@@ -605,15 +661,20 @@ void VoiceRenderer::render_voice_log(const nxrt::gfx::HudCanvas& c,
     float cur_y = div_y + 10.0f * sr.scale;
 
     if (history.empty()) {
-        c.text(x0 + pad_x, cur_y, row_sz, 0x94A3B8CCu, "暂无已记录的队友语音。");
+        const char* empty_msg = (ui_lang == VoiceUILang::En)
+                                    ? "No party voice lines recorded yet."
+                                    : (ui_lang == VoiceUILang::Ja ? "記録されたパーティボイスはまだありません。"
+                                                                  : "暂无已记录的队友语音。");
+        c.text(x0 + pad_x, cur_y, row_sz, 0x94A3B8CCu, empty_msg);
         return;
     }
 
+    const char* colon = (ui_lang == VoiceUILang::En) ? ": " : "：";
     const size_t max_rows = static_cast<size_t>(std::max(1.0f, (y1 - cur_y - 12.0f * sr.scale) / row_h));
     const size_t start = (history.size() > max_rows) ? (history.size() - max_rows) : 0;
     for (size_t i = start; i < history.size(); ++i) {
         const auto& e = history[i];
-        const std::string sp = e.speaker_name + "：";
+        const std::string sp = e.speaker_name + colon;
         float sw = 0.f, sh = 0.f;
         c.measure_text(row_sz, sp.c_str(), &sw, &sh);
         c.text_outlined(x0 + pad_x, cur_y, row_sz, e.color_rgba, 0x000000D0u, sp.c_str());

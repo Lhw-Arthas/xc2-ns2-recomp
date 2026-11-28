@@ -114,6 +114,26 @@ const SECTIONS = [
     ],
   },
   {
+    title: 'settings.sec.enhancements', icon: 'sparkles', file: 'game',
+    fields: [
+      { id: 'voice_subtitles', type: 'toggle', label: 'settings.voiceSubtitles.label', sec: 'xc2', key: 'voice_subtitles', def: '1',
+        hint: 'settings.voiceSubtitles.hint' },
+      { id: 'voice_density', type: 'select', label: 'settings.voiceDensity.label', sec: 'xc2', key: 'voice_density', def: 'full',
+        options: [['full', 'settings.voiceDensity.full'], ['balanced', 'settings.voiceDensity.balanced'], ['minimal', 'settings.voiceDensity.minimal']],
+        hint: 'settings.voiceDensity.hint' },
+      { id: 'voice_lang', type: 'select', label: 'settings.voiceLang.label', sec: 'xc2', key: 'voice_lang', def: 'zh_hans',
+        options: [['zh_hans', 'settings.voiceLang.zhHans'], ['zh_hant', 'settings.voiceLang.zhHant'], ['en', 'settings.voiceLang.en'], ['ja', 'settings.voiceLang.ja']],
+        normalize: (v) => {
+          const s = String(v).trim().toLowerCase();
+          if (s === 'zh_cn' || s === 'zh-cn' || s === 'zh_hans') return 'zh_hans';
+          if (s === 'zh_tw' || s === 'zh-tw' || s === 'zh_hant') return 'zh_hant';
+          if (s === 'en' || s === 'ja') return s;
+          return 'zh_hans';
+        },
+        hint: 'settings.voiceLang.hint' },
+    ],
+  },
+  {
     title: 'settings.sec.launcher', icon: 'wrench', file: 'config',
     fields: [
       { id: 'lang', type: 'language', label: 'settings.lang.label', hint: 'settings.lang.hint' },

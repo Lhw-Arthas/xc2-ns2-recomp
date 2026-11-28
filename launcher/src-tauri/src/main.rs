@@ -670,6 +670,174 @@ fn delete_mod(app: AppHandle, state: State<play::PlayState>, name: String) -> Re
     mods::delete_mod(&game_dir, &target, vanilla_romfs.as_deref(), &name, running)
 }
 
+#[derive(Serialize, Clone)]
+struct VoiceSubtitlesStatus {
+    dir: String,
+    packs: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct VoiceSubtitlesImportResult {
+    installed: Vec<String>,
+    status: VoiceSubtitlesStatus,
+}
+
+fn list_voice_subtitles(dir: &Path) -> VoiceSubtitlesStatus {
+    let mut packs: Vec<String> = fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if !p.is_file() {
+                return None;
+            }
+            let ext = p.extension()?.to_str()?;
+            if !ext.eq_ignore_ascii_case("json") {
+                return None;
+            }
+            let stem = p.file_stem()?.to_str()?.trim();
+            if stem.is_empty() {
+                return None;
+            }
+            Some(stem.to_string())
+        })
+        .collect();
+    packs.sort();
+    packs.dedup();
+    VoiceSubtitlesStatus { dir: dump::fwd(dir), packs }
+}
+
+fn sanitize_voice_lang_stem(raw: &str) -> Option<String> {
+    let s: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    (!s.is_empty() && s.len() <= 32).then_some(s)
+}
+
+fn validate_and_copy_voice_json(src: &Path, dst_dir: &Path) -> Result<Option<String>, String> {
+    let Some(ext) = src.extension().and_then(|s| s.to_str()) else {
+        return Ok(None);
+    };
+    if !ext.eq_ignore_ascii_case("json") {
+        return Ok(None);
+    }
+    let Some(raw_stem) = src.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(None);
+    };
+    let Some(stem) = sanitize_voice_lang_stem(raw_stem) else {
+        return Ok(None);
+    };
+    let bytes = fs::read(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(None);
+    };
+    let valid_cues = val
+        .as_object()
+        .and_then(|o| o.get("cues"))
+        .and_then(|c| c.as_object())
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+    if !valid_cues {
+        return Ok(None);
+    }
+    fs::create_dir_all(dst_dir).map_err(|e| format!("cannot create {}: {e}", dst_dir.display()))?;
+    let dest = dst_dir.join(format!("{stem}.json"));
+    fs::write(&dest, &bytes).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+    Ok(Some(stem))
+}
+
+fn import_voice_subtitles_from(src: &Path, dst_dir: &Path) -> Result<Vec<String>, String> {
+    if !src.is_file() {
+        return Err(format!("File not found: {}", src.display()));
+    }
+    let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    let mut installed = Vec::new();
+    if ext == "json" {
+        if let Some(stem) = validate_and_copy_voice_json(src, dst_dir)? {
+            installed.push(stem);
+        }
+    } else if ext == "zip" {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!("xc2-voice-import-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&tmp).map_err(|e| format!("cannot create temp dir: {e}"))?;
+        let extract_res = mod_import::extract_zip(src, &tmp);
+        if let Err(e) = extract_res {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+        let mut stack = vec![(tmp.clone(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > 4 {
+                continue;
+            }
+            if let Ok(rd) = fs::read_dir(&dir) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if p.is_dir() {
+                        stack.push((p, depth + 1));
+                    } else if p.is_file() {
+                        if let Ok(Some(stem)) = validate_and_copy_voice_json(&p, dst_dir) {
+                            installed.push(stem);
+                        }
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    } else {
+        return Err("Unsupported file type. Select a .zip or .json voice subtitle pack.".into());
+    }
+    installed.sort();
+    installed.dedup();
+    if installed.is_empty() {
+        return Err("No valid voice subtitle JSON files (with a non-empty 'cues' table) were found.".into());
+    }
+    Ok(installed)
+}
+
+#[tauri::command]
+fn voice_subtitles_status(app: AppHandle) -> Result<VoiceSubtitlesStatus, String> {
+    let cfg = load_config(&app);
+    let dir = game_dir_of(&cfg, &need_repo(&cfg)?).join("voice_subtitles");
+    Ok(list_voice_subtitles(&dir))
+}
+
+#[tauri::command]
+async fn pick_voice_subtitle_file(app: AppHandle, title: String) -> Option<String> {
+    app.dialog()
+        .file()
+        .set_title(title)
+        .add_filter("Voice Subtitle Pack (.zip, .json)", &["zip", "json"])
+        .blocking_pick_file()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| dump::fwd(&p))
+}
+
+#[tauri::command]
+fn import_voice_subtitles(app: AppHandle, path: String) -> Result<VoiceSubtitlesImportResult, String> {
+    let cfg = load_config(&app);
+    let dir = game_dir_of(&cfg, &need_repo(&cfg)?).join("voice_subtitles");
+    let installed = import_voice_subtitles_from(Path::new(path.trim()), &dir)?;
+    let status = list_voice_subtitles(&dir);
+    Ok(VoiceSubtitlesImportResult { installed, status })
+}
+
+#[tauri::command]
+fn open_voice_subtitles_dir(app: AppHandle) -> Result<(), String> {
+    let cfg = load_config(&app);
+    let dir = game_dir_of(&cfg, &need_repo(&cfg)?).join("voice_subtitles");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    play::open_with_shell(&dir)
+}
+
 #[tauri::command]
 fn read_mod_log(app: AppHandle) -> Result<mods::ModLogView, String> {
     let cfg = load_config(&app);
@@ -976,6 +1144,10 @@ fn main() {
             install_mod_folder,
             delete_mod,
             read_mod_log,
+            voice_subtitles_status,
+            pick_voice_subtitle_file,
+            import_voice_subtitles,
+            open_voice_subtitles_dir,
             open_setup_log,
             start_report,
             open_reports_dir,
@@ -1022,6 +1194,27 @@ mod tests {
         // a second import into the same install lands in the folder that is already there
         let (again, _) = copy_saves(&account, &src).unwrap();
         assert_eq!(again, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_voice_subtitles_validates_and_copies_json() {
+        let root = std::env::temp_dir().join(format!("xc2-voice-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let good = root.join("en.json");
+        fs::write(&good, br#"{"speakers":{},"cues":{"voice_01010101_Play":{"text_full":"Hi"}}}"#).unwrap();
+        let bad = root.join("not_voice.json");
+        fs::write(&bad, br#"{"hello":"world"}"#).unwrap();
+        let dst = root.join("voice_subtitles");
+
+        let ok = import_voice_subtitles_from(&good, &dst).unwrap();
+        assert_eq!(ok, vec!["en".to_string()]);
+        assert!(dst.join("en.json").is_file());
+        assert!(import_voice_subtitles_from(&bad, &dst).is_err());
+
+        let st = list_voice_subtitles(&dst);
+        assert_eq!(st.packs, vec!["en".to_string()]);
         let _ = fs::remove_dir_all(&root);
     }
 }
