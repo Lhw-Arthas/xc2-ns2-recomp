@@ -1056,13 +1056,43 @@ void draw_edge_arrow(const nxrt::gfx::HudCanvas& c, float sx, float sy, float sc
     }
 }
 
+enum class NavUILang : uint8_t { Zh = 0, En = 1, Ja = 2 };
+
+NavUILang nav_ui_lang() {
+    static const NavUILang s_lang = []() -> NavUILang {
+        const std::string sys = nxrt::config_get_str("system", "language", "auto");
+        if (sys == "SimplifiedChinese" || sys == "TraditionalChinese" || sys == "Chinese" || sys == "Taiwanese") {
+            return NavUILang::Zh;
+        }
+        if (sys == "Japanese") return NavUILang::Ja;
+        if (!sys.empty() && sys != "auto") return NavUILang::En;
+        const std::string ui = nxrt::config_get_str("gfx", "ui_language", "en");
+        if (ui == "zh" || ui.rfind("zh_", 0) == 0 || ui.rfind("zh-", 0) == 0) return NavUILang::Zh;
+        if (ui == "ja" || ui == "jp") return NavUILang::Ja;
+        return NavUILang::En;
+    }();
+    return s_lang;
+}
+
 void draw_toast(const nxrt::gfx::HudCanvas& c, float scale) {
     const int64_t until = g_toast_until_ms.load(std::memory_order_relaxed);
     if (until <= 0 || now_ms() > until) return;
     const int mode = g_mode.load(std::memory_order_relaxed);
-    const char* msg = (mode == 2) ? "3D 导航：信标 + 地面引导带   [F3 / ZL+L3]"
-                    : (mode == 1) ? "3D 导航：仅 3D 信标   [F3 / ZL+L3]"
-                                  : "3D 导航：已关闭   [F3 / ZL+L3]";
+    const NavUILang lang = nav_ui_lang();
+    const char* msg = nullptr;
+    if (lang == NavUILang::En) {
+        msg = (mode == 2) ? "3D Navigation: Beacon + Ground Ribbon   [F3 / ZL+L3]"
+            : (mode == 1) ? "3D Navigation: 3D Beacon Only   [F3 / ZL+L3]"
+                          : "3D Navigation: OFF   [F3 / ZL+L3]";
+    } else if (lang == NavUILang::Ja) {
+        msg = (mode == 2) ? "3D ナビ：ビーコン + 地面ガイド   [F3 / ZL+L3]"
+            : (mode == 1) ? "3D ナビ：3D ビーコンのみ   [F3 / ZL+L3]"
+                          : "3D ナビ：オフ   [F3 / ZL+L3]";
+    } else {
+        msg = (mode == 2) ? "3D 导航：信标 + 地面引导带   [F3 / ZL+L3]"
+            : (mode == 1) ? "3D 导航：仅 3D 信标   [F3 / ZL+L3]"
+                          : "3D 导航：已关闭   [F3 / ZL+L3]";
+    }
     const float sz = 16.0f * scale;
     float tw = 0.f, th = 0.f;
     c.measure_text(sz, msg, &tw, &th);
@@ -1413,28 +1443,44 @@ void draw(const nxrt::gfx::HudCanvas& c) {
         s_hint_map_id = map_id;
         s_hint_start_ms = cur_ms;
     }
-    constexpr const char* kNavKeyHint = "F3 / ZL+L3 切换  ·  F4 / ZL+R3 选点";
+    const NavUILang lang = nav_ui_lang();
+    const char* nav_key_hint = (lang == NavUILang::En) ? "F3 / ZL+L3 Mode  ·  F4 / ZL+R3 Pick"
+                             : (lang == NavUILang::Ja) ? "F3 / ZL+L3 切替  ·  F4 / ZL+R3 選択"
+                                                       : "F3 / ZL+L3 切换  ·  F4 / ZL+R3 选点";
+    const char* lbl_custom = (lang == NavUILang::En) ? "Custom Pin"
+                           : (lang == NavUILang::Ja) ? "カスタム案内" : "自定义导航";
+    const char* lbl_skip   = (lang == NavUILang::En) ? "Skip Travel"
+                           : (lang == NavUILang::Ja) ? "スキップトラベル" : "跨图传送";
+    const char* lbl_nav    = (lang == NavUILang::En) ? "3D Navigation"
+                           : (lang == NavUILang::Ja) ? "3D ナビ" : "3D 导航";
     char cross_map_name[96] = {};
     char cross_sub_name[96] = {};
     char cross_lm_name[96] = {};
     if (using_custom_pin && s_vis_alpha > 0.02f) {
-        draw_cross_map_banner(c, scale, s_vis_alpha, "自定义导航",
-                              custom_pin_name.c_str(), "", "", kNavKeyHint, 0x56C8FA00u);
+        draw_cross_map_banner(c, scale, s_vis_alpha, lbl_custom,
+                              custom_pin_name.c_str(), "", "", nav_key_hint, 0x56C8FA00u);
     } else if (markers.empty() && offmap.valid && s_vis_alpha > 0.02f) {
         resolve_cross_map_hint(mb, offmap,
                                cross_map_name, sizeof cross_map_name,
                                cross_sub_name, sizeof cross_sub_name,
                                cross_lm_name, sizeof cross_lm_name);
-        draw_cross_map_banner(c, scale, s_vis_alpha, "跨图传送",
+        draw_cross_map_banner(c, scale, s_vis_alpha, lbl_skip,
                               cross_map_name, cross_sub_name, cross_lm_name,
-                              kNavKeyHint, 0x56C8FA00u);
+                              nav_key_hint, 0x56C8FA00u);
     } else if (s_vis_alpha > 0.02f && s_hint_start_ms > 0) {
         const float elapsed_s = static_cast<float>(cur_ms - s_hint_start_ms) * 0.001f;
         if (elapsed_s < 12.0f) {
             const float fade = (elapsed_s <= 10.0f) ? 1.0f : std::clamp((12.0f - elapsed_s) * 0.5f, 0.f, 1.f);
-            const char* status_txt = (mode >= 2) ? "已开启信标与地面引导带" : "仅显示 3D 信标";
-            draw_cross_map_banner(c, scale, s_vis_alpha * fade, "3D 导航",
-                                  status_txt, "", "", kNavKeyHint, 0x56C8FA00u);
+            const char* status_txt = nullptr;
+            if (lang == NavUILang::En) {
+                status_txt = (mode >= 2) ? "Beacon & Ground Ribbon active" : "3D Beacon active";
+            } else if (lang == NavUILang::Ja) {
+                status_txt = (mode >= 2) ? "ビーコン・地面ガイド有効" : "3D ビーコンのみ有効";
+            } else {
+                status_txt = (mode >= 2) ? "已开启信标与地面引导带" : "仅显示 3D 信标";
+            }
+            draw_cross_map_banner(c, scale, s_vis_alpha * fade, lbl_nav,
+                                  status_txt, "", "", nav_key_hint, 0x56C8FA00u);
         }
     }
 
